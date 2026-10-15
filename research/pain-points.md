@@ -434,3 +434,55 @@ Covered by the unit tests `retry_survives_a_blip_and_gives_up_eventually` and
 **Verdict: SOLVED** for speed after the first clone and for short network blips. Outages
 longer than the ~3.5 s of retries fail the run (the merge queue waits them out, P7). The
 first clone on a new worker is still a full clone; there are no partial or sparse clones yet.
+
+## P9. Every push runs to completion, even when a newer push replaced it
+
+**Pain.** Without a `concurrency` block, pushing twice runs both commits to the end; the fix
+is boilerplate every repo has to remember (`group: ${{ github.workflow }}-${{ github.ref }}`,
+`cancel-in-progress: true`), plus exceptions so main and deploys are not cancelled
+([RunsOn](https://runs-on.com/github-actions/concurrency/),
+[Stéphane Robert](https://blog.stephane-robert.info/en/docs/pipeline-cicd/github/optimiser/concurrency/),
+[GitSpider](https://gitspider.com/guides/github-actions-concurrency-cancel-in-progress),
+[nwos](https://www.nwos.com/daily/the-github-actions-concurrency-key-everyone-skips),
+[StarSling](https://starsling.dev/best-practices/github-actions/cancel-superseded-runs),
+[oneuptime](https://oneuptime.com/blog/post/2026-01-25-github-actions-concurrency-control/view),
+[yellowduck](https://www.yellowduck.be/posts/cancel-in-progress-jobs-using-github-actions),
+[adhdecode](https://adhdecode.com/articles/github-actions/workflow-run-canceled-by-newer-run/),
+[ittrip](https://en.ittrip.xyz/windows/troubleshooting/github-actions-concurrency)). Agents
+that push after every small change make it worse; no source measured that yet.
+
+**Reproduction** (`/tmp/painhunt/p9`): three pushes to `feature`, one second apart, each
+starting a run (as push webhooks would) of an 8 s task.
+
+**Before** (research/pain-hunt at P8): all three ran to the end; 24.5 s of worker time for one
+useful result. The dashboard's Cancel also only skipped unclaimed groups; running work kept
+going.
+
+```
+run_8ef9ecbebaf7 passed task passed 8008 ms
+run_acca5a6a47b7 passed task passed 8024 ms
+run_c71291138f5b passed task passed 8439 ms
+```
+
+**Fix** (research/pain-hunt), on by default with no config:
+- A new run supersedes older active runs with the same repo, trigger and ref, for pull
+  requests, local `pit run`, and pushes to branches other than `main`/`master`/`trunk`. Merge
+  queue, post-merge and main-branch runs always finish.
+- Cancelling (superseding, the Cancel button, the merge queue dropping a candidate) revokes the
+  leases of running groups. The worker's heartbeat, now every 2 s, is refused, and it kills the
+  task's process group (and Docker container); nothing new starts in that group.
+
+```
+run_32b693c08dbf failed task skipped ran 863 ms  | superseded by run_39fb129c0fad
+run_39fb129c0fad failed task skipped ran 1113 ms | superseded by run_5a6a20ed9b3a
+run_5a6a20ed9b3a passed task passed  ran 8018 ms |
+```
+
+About 10 s of worker time instead of 24.5 s. Covered by the e2e test
+`newer_pushes_supersede_and_stop_older_runs` (each superseded task would have written a marker
+file had it run to the end; none did) and the unit test
+`cancellation_stops_the_task_and_its_children`.
+
+**Verdict: SOLVED.** Caveats: a stopped task can run up to one heartbeat (2 s) after the
+cancel, and superseding is keyed on the branch name, so two people running `pit run` locally on
+identically named branches of the same repo would cancel each other.

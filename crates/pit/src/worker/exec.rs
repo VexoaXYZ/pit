@@ -19,6 +19,8 @@ pub struct Outcome {
     pub log: String,
     pub duration: Duration,
     pub timed_out: bool,
+    /// Stopped because the run was cancelled or superseded.
+    pub cancelled: bool,
 }
 
 /// Which isolation backends work on this host.
@@ -161,6 +163,7 @@ pub async fn run(
     task: TaskCommand,
     timeout: Option<Duration>,
     live: mpsc::UnboundedSender<String>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Outcome> {
     let TaskCommand { mut cmd, container } = task;
     let started = Instant::now();
@@ -202,27 +205,53 @@ pub async fn run(
         log
     });
 
-    let wait = child.wait();
-    let (status, timed_out) = match timeout {
-        Some(t) => match tokio::time::timeout(t, wait).await {
-            Ok(s) => (Some(s?), false),
-            Err(_) => {
-                kill_tree(pid);
-                let _ = child.kill().await;
-                // Killing the docker client leaves the container running.
-                if let Some(name) = &container {
-                    let _ = Command::new("docker")
-                        .args(["rm", "-f", name])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .await;
-                }
-                (None, true)
+    enum Ended {
+        Exited(std::process::ExitStatus),
+        TimedOut,
+        Cancelled,
+    }
+    let deadline = async {
+        match timeout {
+            Some(t) => tokio::time::sleep(t).await,
+            None => std::future::pending().await,
+        }
+    };
+    let cancelled = async {
+        loop {
+            if *cancel.borrow_and_update() {
+                return;
             }
-        },
-        None => (Some(wait.await?), false),
+            if cancel.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    let ended = tokio::select! {
+        s = child.wait() => Ended::Exited(s?),
+        _ = deadline => Ended::TimedOut,
+        _ = cancelled => Ended::Cancelled,
+    };
+    let (status, timed_out, was_cancelled) = match ended {
+        Ended::Exited(s) => (Some(s), false, false),
+        other => {
+            kill_tree(pid);
+            let _ = child.kill().await;
+            // Killing the docker client leaves the container running.
+            if let Some(name) = &container {
+                let _ = Command::new("docker")
+                    .args(["rm", "-f", name])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            }
+            (
+                None,
+                matches!(other, Ended::TimedOut),
+                matches!(other, Ended::Cancelled),
+            )
+        }
     };
     // A backgrounded grandchild can hold the pipes open; do not wait forever.
     for mut h in [out, err].into_iter().flatten() {
@@ -238,11 +267,15 @@ pub async fn run(
     if timed_out {
         log.push_str("\n[pit: task timed out]\n");
     }
+    if was_cancelled {
+        log.push_str("\n[pit: run cancelled; task stopped]\n");
+    }
     Ok(Outcome {
         exit_code: status.and_then(|s| s.code()),
         log,
         duration: started.elapsed(),
         timed_out,
+        cancelled: was_cancelled,
     })
 }
 
@@ -285,6 +318,39 @@ extern "C" {
 mod tests {
     use super::*;
 
+    fn never() -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(tx);
+        rx
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_stops_the_task_and_its_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskDef {
+            run: "sleep 30 & sleep 30".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = cancel_tx.send(true);
+        });
+        let started = Instant::now();
+        let out = run(
+            command(&task, Backend::Host, dir.path(), &[]),
+            None,
+            tx,
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+        assert!(out.cancelled && !out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[tokio::test]
     async fn streams_output_and_reports_exit_codes() {
         let dir = tempfile::tempdir().unwrap();
@@ -297,9 +363,14 @@ mod tests {
             ..Default::default()
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let out = run(command(&task, Backend::Host, dir.path(), &[]), None, tx)
-            .await
-            .unwrap();
+        let out = run(
+            command(&task, Backend::Host, dir.path(), &[]),
+            None,
+            tx,
+            never(),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.exit_code, Some(3));
         assert!(out.log.contains("hi"));
         let mut live = String::new();
@@ -323,6 +394,7 @@ mod tests {
             command(&task, Backend::Host, dir.path(), &[]),
             Some(Duration::from_millis(300)),
             tx,
+            never(),
         )
         .await
         .unwrap();

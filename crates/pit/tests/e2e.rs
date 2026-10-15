@@ -1003,3 +1003,58 @@ async fn merge_queue_waits_out_an_origin_outage() {
     assert!(landed.landed_sha.is_some());
     assert!(sh(&origin, "git ls-tree -r --name-only main").contains("src/b.txt"));
 }
+
+/// A newer push to the same branch supersedes older runs, and their running
+/// tasks are actually stopped, not left to finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn newer_pushes_supersede_and_stop_older_runs() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let marks = tmp.path().join("marks");
+    std::fs::create_dir_all(&marks).unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let task = format!("sleep 4 && touch {}/$PIT_RUN_ID", marks.display());
+    write(
+        &repo,
+        "pit.config.json",
+        &serde_json::json!({ "tasks": { "slow": { "run": task, "cache": false } } }).to_string(),
+    );
+    sh(
+        &repo,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let url = repo.to_string_lossy().to_string();
+    let mut runs = vec![];
+    for i in 0..3 {
+        write(&repo, "v.txt", &i.to_string());
+        sh(&repo, &format!("git add -A && git commit -qm push{i}"));
+        let sha = sh(&repo, "git rev-parse HEAD").trim().to_string();
+        let created: serde_json::Value = pit
+            .client
+            .post("/api/runs", &serde_json::json!({ "repo": "sup", "url": url, "sha": sha, "trigger": "push", "ref": "feature" }))
+            .await
+            .unwrap();
+        runs.push(created["id"].as_str().unwrap().to_string());
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    let last = pit::cli::wait(&pit.client, &runs[2], |_| {}).await.unwrap();
+    assert_eq!(last.status, Status::Passed);
+    // Each push supersedes the run before it.
+    for (old, newer) in runs.iter().zip(runs.iter().skip(1)) {
+        let v: RunView = pit.client.get(&format!("/api/runs/{old}")).await.unwrap();
+        assert_eq!(v.status, Status::Failed);
+        assert_eq!(v.message, Some(format!("superseded by {newer}")));
+    }
+    // Long enough for an unstopped old task to have finished.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(marks.join(&runs[2]).exists());
+    for old in &runs[..2] {
+        assert!(
+            !marks.join(old).exists(),
+            "superseded run {old} kept running to the end"
+        );
+    }
+    // Pushes to main are never superseded.
+    assert!(!pit::server::App::supersedes_for_test("push", "main"));
+}

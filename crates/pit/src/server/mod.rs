@@ -195,6 +195,22 @@ impl App {
             None,
             serde_json::json!({ "repo": repo.name, "sha": req.sha, "trigger": trigger }),
         );
+        // A newer push to a branch, PR update or local run makes the older
+        // ones pointless: stop them instead of finishing them. Main-branch
+        // pushes, merge queue and post-merge runs always finish.
+        if let Some(git_ref) = req.git_ref.as_deref().filter(|r| supersedes(&trigger, r)) {
+            for old in self
+                .db
+                .superseded_runs(&repo.id, &trigger, git_ref, &run_id)?
+            {
+                if self
+                    .db
+                    .cancel_run_because(&old, &format!("superseded by {run_id}"))?
+                {
+                    self.run_finished(&old).await;
+                }
+            }
+        }
         let app = self.clone();
         let id = run_id.clone();
         tokio::spawn(async move {
@@ -330,6 +346,22 @@ impl App {
             })
             .unwrap_or(false);
         bearer == Some(token.as_str()) || query_token == Some(token.as_str()) || basic_ok
+    }
+}
+
+impl App {
+    #[doc(hidden)]
+    pub fn supersedes_for_test(trigger: &str, git_ref: &str) -> bool {
+        supersedes(trigger, git_ref)
+    }
+}
+
+/// Whether a new run with this trigger and ref replaces older ones.
+fn supersedes(trigger: &str, git_ref: &str) -> bool {
+    match trigger {
+        "pr" | "local" => true,
+        "push" => !matches!(git_ref, "main" | "master" | "trunk"),
+        _ => false,
     }
 }
 

@@ -747,23 +747,52 @@ impl Db {
     /// their workers, but their results no longer change the run. Returns
     /// whether the run was still active.
     pub fn cancel_run(&self, run_id: &str) -> Result<bool> {
+        self.cancel_run_because(run_id, "cancelled")
+    }
+
+    /// Cancels a run with a message (`cancelled`, `superseded by run_…`).
+    /// Running groups lose their lease, so their worker's next heartbeat is
+    /// refused and it stops the tasks.
+    pub fn cancel_run_because(&self, run_id: &str, message: &str) -> Result<bool> {
         let c = self.conn.lock();
         let now = now_ms();
-        c.execute(
-            "UPDATE groups_ SET status = 'skipped', finished_at = ?1 WHERE run_id = ?2 AND status = 'queued'",
-            params![now, run_id],
-        )?;
-        c.execute(
-            "UPDATE tasks SET status = 'skipped', finished_at = ?1 WHERE run_id = ?2 AND status = 'queued'
-               AND group_id IN (SELECT id FROM groups_ WHERE run_id = ?2 AND status = 'skipped')",
-            params![now, run_id],
-        )?;
         let changed = c.execute(
-            "UPDATE runs SET status = 'failed', message = 'cancelled', finished_at = ?1
+            "UPDATE runs SET status = 'failed', message = ?3, finished_at = ?1
              WHERE id = ?2 AND status IN ('queued', 'running')",
+            params![now, run_id, message],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        c.execute(
+            "UPDATE groups_ SET status = 'skipped', finished_at = ?1, lease = NULL
+             WHERE run_id = ?2 AND status IN ('queued', 'running')",
             params![now, run_id],
         )?;
-        Ok(changed > 0)
+        c.execute(
+            "UPDATE tasks SET status = 'skipped', finished_at = ?1 WHERE run_id = ?2 AND status IN ('queued', 'running')",
+            params![now, run_id],
+        )?;
+        Ok(true)
+    }
+
+    /// Active runs that a new run of the same repo, trigger and ref replaces.
+    pub fn superseded_runs(
+        &self,
+        repo_id: &str,
+        trigger: &str,
+        git_ref: &str,
+        newer: &str,
+    ) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT id FROM runs WHERE repo_id = ?1 AND trigger = ?2 AND ref = ?3 AND id != ?4
+               AND status IN ('queued', 'running')",
+        )?;
+        let ids = st
+            .query_map(params![repo_id, trigger, git_ref, newer], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
     }
 
     pub fn task_group(&self, task_id: &str) -> Result<(String, String, String)> {

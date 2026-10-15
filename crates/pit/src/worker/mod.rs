@@ -238,15 +238,25 @@ impl Worker {
         // Every update for this job carries its lease, so a worker that lost
         // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
         let client = self.client.with_lease(&job.lease);
+        // A heartbeat refused with 409 means the group is no longer ours: the
+        // run was cancelled or superseded (or we were presumed dead). Then the
+        // running tasks are stopped.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let hb = {
             let client = client.clone();
             let gid = job.group_id.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    let _ = client
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if let Err(e) = client
                         .post_empty(&format!("/api/groups/{gid}/heartbeat"), &())
-                        .await;
+                        .await
+                    {
+                        if e.to_string().contains("409") {
+                            let _ = cancel_tx.send(true);
+                            return;
+                        }
+                    }
                 }
             })
         };
@@ -262,7 +272,10 @@ impl Worker {
                 prepare_ms,
             },
             Ok(files) => {
-                let status = self.clone().run_tasks(&job, &ws, Arc::new(files)).await;
+                let status = self
+                    .clone()
+                    .run_tasks(&job, &ws, Arc::new(files), cancel_rx)
+                    .await;
                 GroupResult {
                     status,
                     message: None,
@@ -362,6 +375,7 @@ impl Worker {
         job: &Job,
         ws: &Path,
         files: Arc<Vec<(String, String)>>,
+        cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Status {
         // Every update for this job carries its lease, so a worker that lost
         // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
@@ -378,7 +392,8 @@ impl Worker {
         let mut running: JoinSet<(String, Status, Option<String>)> = JoinSet::new();
         loop {
             for t in &job.tasks {
-                if started.contains(&t.name) {
+                // Cancelled: start nothing new, let running tasks stop.
+                if started.contains(&t.name) || *cancel.borrow() {
                     continue;
                 }
                 let deps: Vec<Option<&(Status, Option<String>)>> =
@@ -406,34 +421,37 @@ impl Worker {
                         .filter_map(|d| d.and_then(|(_, k)| k.clone()))
                         .collect();
                     let w = self.clone();
-                    let (task, job, ws, files, warm) = (
+                    let (task, job, ws, files, warm, cancel) = (
                         t.clone(),
                         job.clone(),
                         ws.to_path_buf(),
                         files.clone(),
                         warm.clone(),
+                        cancel.clone(),
                     );
                     running.spawn(async move {
-                        let (status, key) =
-                            match w.run_task(&job, &task, &ws, &files, &dep_keys, &warm).await {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    let r = TaskResult {
-                                        status: Status::Error,
-                                        exit_code: None,
-                                        action_key: None,
-                                        duration_ms: 0,
-                                        log_digest: None,
-                                        message: Some(format!("{e:#}")),
-                                    };
-                                    let _ = w
-                                        .client
-                                        .with_lease(&job.lease)
-                                        .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
-                                        .await;
-                                    (Status::Error, None)
-                                }
-                            };
+                        let (status, key) = match w
+                            .run_task(&job, &task, &ws, &files, &dep_keys, &warm, cancel)
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let r = TaskResult {
+                                    status: Status::Error,
+                                    exit_code: None,
+                                    action_key: None,
+                                    duration_ms: 0,
+                                    log_digest: None,
+                                    message: Some(format!("{e:#}")),
+                                };
+                                let _ = w
+                                    .client
+                                    .with_lease(&job.lease)
+                                    .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
+                                    .await;
+                                (Status::Error, None)
+                            }
+                        };
                         (task.name, status, key)
                     });
                 }
@@ -457,6 +475,7 @@ impl Worker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_task(
         &self,
         job: &Job,
@@ -465,6 +484,7 @@ impl Worker {
         files: &[(String, String)],
         dep_keys: &[String],
         warm: &Mutex<HashMap<String, String>>,
+        cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(Status, Option<String>)> {
         // Every update for this job carries its lease, so a worker that lost
         // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
@@ -606,11 +626,21 @@ impl Worker {
             let (tx, rx) = mpsc::unbounded_channel::<String>();
             let forwarder = tokio::spawn(forward_logs(client.clone(), task.id.clone(), rx));
             let cmd = exec::command(def, backend, ws, &env);
-            let result = exec::run(cmd, def.timeout.map(Duration::from_secs), tx).await;
+            let result = exec::run(
+                cmd,
+                def.timeout.map(Duration::from_secs),
+                tx,
+                cancel.clone(),
+            )
+            .await;
             let _ = forwarder.await;
             let outcome = result?;
             duration_ms += outcome.duration.as_millis() as u64;
             log.push_str(&outcome.log);
+            if outcome.cancelled {
+                // The group is no longer ours; nothing to report or cache.
+                return Ok((Status::Skipped, None));
+            }
             if (outcome.exit_code == Some(0) && !outcome.timed_out) || attempt >= attempts {
                 break outcome;
             }
