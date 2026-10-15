@@ -19,6 +19,8 @@ pub struct Outcome {
     pub log: String,
     pub duration: Duration,
     pub timed_out: bool,
+    /// Stopped for printing nothing for the idle limit (`timed_out` is set too).
+    pub idle: bool,
     /// Stopped because the run was cancelled or superseded.
     pub cancelled: bool,
 }
@@ -161,9 +163,18 @@ pub fn command(
 }
 
 /// Runs a command, sending log text to `live` as it arrives.
+/// When to give up on a task.
+#[derive(Clone, Copy, Default)]
+pub struct Limits {
+    /// Total run time.
+    pub timeout: Option<Duration>,
+    /// Time without any output.
+    pub idle: Option<Duration>,
+}
+
 pub async fn run(
     task: TaskCommand,
-    timeout: Option<Duration>,
+    limits: Limits,
     live: mpsc::UnboundedSender<String>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Outcome> {
@@ -188,10 +199,17 @@ pub async fn run(
         .map(|s| tokio::spawn(pump(s, tx.clone())));
     drop(tx);
 
+    // Milliseconds since start of the last output, for the idle limit.
+    let last_output = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen = last_output.clone();
     let collector = tokio::spawn(async move {
         let mut log = String::new();
         let mut dropped = 0usize;
         while let Some(line) = rx.recv().await {
+            seen.store(
+                started.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if log.len() + line.len() <= MAX_LOG {
                 log.push_str(&line);
             } else {
@@ -210,10 +228,11 @@ pub async fn run(
     enum Ended {
         Exited(std::process::ExitStatus),
         TimedOut,
+        Idle,
         Cancelled,
     }
     let deadline = async {
-        match timeout {
+        match limits.timeout {
             Some(t) => tokio::time::sleep(t).await,
             None => std::future::pending().await,
         }
@@ -228,11 +247,27 @@ pub async fn run(
             }
         }
     };
+    let idle = async {
+        let Some(limit) = limits.idle else {
+            return std::future::pending().await;
+        };
+        loop {
+            let last =
+                Duration::from_millis(last_output.load(std::sync::atomic::Ordering::Relaxed));
+            let quiet_until = started + last + limit;
+            if Instant::now() >= quiet_until {
+                return;
+            }
+            tokio::time::sleep_until(quiet_until.into()).await;
+        }
+    };
     let ended = tokio::select! {
         s = child.wait() => Ended::Exited(s?),
         _ = deadline => Ended::TimedOut,
+        _ = idle => Ended::Idle,
         _ = cancelled => Ended::Cancelled,
     };
+    let went_idle = matches!(ended, Ended::Idle);
     let (status, timed_out, was_cancelled) = match ended {
         Ended::Exited(s) => (Some(s), false, false),
         other => {
@@ -250,7 +285,7 @@ pub async fn run(
             }
             (
                 None,
-                matches!(other, Ended::TimedOut),
+                matches!(other, Ended::TimedOut | Ended::Idle),
                 matches!(other, Ended::Cancelled),
             )
         }
@@ -266,8 +301,16 @@ pub async fn run(
     }
     kill_tree(pid);
     let mut log = collector.await.unwrap_or_default();
-    if timed_out {
-        log.push_str("\n[pit: task timed out]\n");
+    if went_idle {
+        let secs = limits.idle.map(|d| d.as_secs()).unwrap_or_default();
+        log.push_str(&format!(
+            "\n[pit: no output for {secs}s; task stopped (idleTimeout)]\n"
+        ));
+    } else if timed_out {
+        let secs = limits.timeout.map(|d| d.as_secs()).unwrap_or_default();
+        log.push_str(&format!(
+            "\n[pit: task ran longer than {secs}s; stopped (timeout)]\n"
+        ));
     }
     if was_cancelled {
         log.push_str("\n[pit: run cancelled; task stopped]\n");
@@ -277,6 +320,7 @@ pub async fn run(
         log,
         duration: started.elapsed(),
         timed_out,
+        idle: went_idle,
         cancelled: was_cancelled,
     })
 }
@@ -328,6 +372,34 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_silent_task_is_stopped_by_the_idle_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // Prints, then goes quiet: the idle clock starts at the last line.
+        let task = TaskDef {
+            run: "echo working; sleep 30".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let started = Instant::now();
+        let limits = Limits {
+            timeout: None,
+            idle: Some(Duration::from_millis(500)),
+        };
+        let out = run(
+            command(&task, Backend::Host, dir.path(), &[]),
+            limits,
+            tx,
+            never(),
+        )
+        .await
+        .unwrap();
+        assert!(out.idle && out.timed_out);
+        assert!(out.log.contains("no output for"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn cancellation_stops_the_task_and_its_children() {
         let dir = tempfile::tempdir().unwrap();
         let task = TaskDef {
@@ -343,7 +415,7 @@ mod tests {
         let started = Instant::now();
         let out = run(
             command(&task, Backend::Host, dir.path(), &[]),
-            None,
+            Limits::default(),
             tx,
             cancel_rx,
         )
@@ -367,7 +439,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let out = run(
             command(&task, Backend::Host, dir.path(), &[]),
-            None,
+            Limits::default(),
             tx,
             never(),
         )
@@ -394,7 +466,10 @@ mod tests {
         let started = Instant::now();
         let out = run(
             command(&task, Backend::Host, dir.path(), &[]),
-            Some(Duration::from_millis(300)),
+            Limits {
+                timeout: Some(Duration::from_millis(300)),
+                idle: None,
+            },
             tx,
             never(),
         )

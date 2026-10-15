@@ -46,8 +46,13 @@ export interface TaskDef {
   image?: string;
   /** Network access for `sandbox` and `docker`. Defaults to true. */
   network?: boolean;
-  /** Timeout in seconds. */
+  /** Timeout in seconds. Defaults to 3600 (an hour); 0 disables it. */
   timeout?: number;
+  /**
+   * Seconds without any output before the task is treated as hung and
+   * stopped. Defaults to 900 (15 minutes); 0 disables it.
+   */
+  idleTimeout?: number;
   /**
    * Extra attempts after a failure. A task that only passes on a retry is
    * reported as flaky. Merge queue runs always get one automatic retry, so a

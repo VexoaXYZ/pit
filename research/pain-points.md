@@ -875,3 +875,56 @@ Covered by the unit test `runtime_outputs_are_part_of_the_key`.
 **Verdict: SOLVED** when the task declares its toolchain. Pit does not guess: without `runtime`
 (or the version in an `env` variable or a pinned version file listed in `inputs`), a toolchain
 upgrade is still invisible to the key. `pit init` does not add `runtime` yet.
+
+## P18. A hung task holds a runner for six hours
+
+**Pain.** A test that waits on a database that never comes up, a prompt waiting for input, or a
+deadlock prints nothing and never exits. GitHub Actions' `timeout-minutes` defaults to 360, so
+the job sits for six hours, burning paid minutes and a runner, before failing
+([SO4-Markets/so4-oracle#1037](https://github.com/SO4-Markets/so4-oracle/issues/1037),
+[community#26679](https://github.com/orgs/community/discussions/26679),
+[WarpBuild](https://www.warpbuild.com/answers/how-do-i-set-a-timeout-on-a-github-actions-job),
+[compiler.dev](https://compiler.dev/guides/github-actions-time-limits),
+[StarSling](https://starsling.dev/github-actions/problems/github-actions-timeouts),
+[DevOpsBoys](https://devopsboys.com/blog/github-actions-job-timeout-fix-2026),
+[suzukishunsuke](https://dev.to/suzukishunsuke/set-github-actions-timeout-minutes-1jkk),
+[st-hakky](https://book.st-hakky.com/en/hakky/github-actions-timeout)). The usual advice is to
+remember `timeout-minutes` on every job. CircleCI instead stops a step after 10 minutes without
+output (`no_output_timeout`;
+[config reference](https://circleci.com/docs/reference/configuration-reference/),
+[support](https://support.circleci.com/hc/en-us/articles/360045268074-Build-Fails-with-Too-long-with-no-output-exceeded-10m0s-context-deadline-exceeded)),
+and people ask GitHub for the same
+([community#125394](https://github.com/orgs/community/discussions/125394)). The idle limit has
+its own pain: quiet but healthy steps get killed and need it raised
+([cypress-io/circleci-orb#430](https://github.com/cypress-io/circleci-orb/issues/430),
+[aws-ecs-orb#115](https://github.com/CircleCI-Public/aws-ecs-orb/issues/115),
+[YetAnotherCyclingSim#100](https://github.com/karnalooch/YetAnotherCyclingSim/pull/100)).
+
+**Reproduction** (`/tmp/painhunt/p18/hang18`): `integration` runs
+`echo connecting to test database...; sleep 100000`.
+
+**Before** (research/pain-hunt at P17): tasks had no limit unless `timeout` was set. After 22s the
+task was still running and holding the local worker's slot; it only ended when cancelled by hand.
+
+**Fix** (research/pain-hunt): every task now has limits by default. `timeout` defaults to an hour,
+and a new `idleTimeout` (default 15 minutes) stops a task that has printed nothing for that long,
+counting from its last line, so a slow task that keeps printing is not touched. `0` turns either
+off. The message names the limit that fired and how to change it. The whole process tree is
+killed (and the container, for Docker), freeing the slot.
+
+```
+    ✗ integration              3.3s exit ?
+    ✓ slow-but-alive           6.1s        (prints every 1s for 6s, idleTimeout: 3)
+  ✗ default.integration: no output for 3s; stopped (set idleTimeout to change, 0 to disable)
+    │ connecting to test database...
+    │ [pit: no output for 3s; task stopped (idleTimeout)]
+failed in 6.2s
+```
+
+Afterwards no `sleep 100000` process remained and the next run started at once. Covered by the
+unit test `a_silent_task_is_stopped_by_the_idle_limit`.
+
+**Verdict: SOLVED** for hung tasks: the default cap is 15 minutes of silence instead of six
+hours. The CircleCI trade-off still applies: a task that is legitimately quiet for over 15
+minutes (a long silent link or upload) must set `idleTimeout`, and Pit cannot tell a deadlock
+from a task that is busy without printing.

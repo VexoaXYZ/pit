@@ -72,9 +72,13 @@ pub struct TaskDef {
     /// Allow network access in isolated backends. Defaults to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<bool>,
-    /// Timeout in seconds.
+    /// Timeout in seconds. Defaults to an hour; 0 means no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// Stop the task after this many seconds without output. Defaults to 15
+    /// minutes; 0 means no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<u64>,
     /// Extra attempts after a failure. A task that passes on a retry is
     /// reported as flaky.
     #[serde(default, skip_serializing_if = "Option::is_none")]

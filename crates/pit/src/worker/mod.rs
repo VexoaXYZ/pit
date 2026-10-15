@@ -656,13 +656,7 @@ impl Worker {
                 masker.clone(),
             ));
             let cmd = exec::command(def, backend, ws, &env);
-            let result = exec::run(
-                cmd,
-                def.timeout.map(Duration::from_secs),
-                tx,
-                cancel.clone(),
-            )
-            .await;
+            let result = exec::run(cmd, limits(def), tx, cancel.clone()).await;
             let _ = forwarder.await;
             let outcome = result?;
             duration_ms += outcome.duration.as_millis() as u64;
@@ -675,6 +669,7 @@ impl Worker {
                 break outcome;
             }
             let why = match (outcome.timed_out, outcome.exit_code) {
+                (true, _) if outcome.idle => "no output for too long".to_string(),
                 (true, _) => "timed out".to_string(),
                 (_, Some(code)) => format!("exit {code}"),
                 _ => "killed by a signal".to_string(),
@@ -699,7 +694,20 @@ impl Worker {
             .await?;
 
         let ok = outcome.exit_code == Some(0) && !outcome.timed_out;
-        let mut message = outcome.timed_out.then(|| "timed out".to_string());
+        let lim = limits(def);
+        let mut message = if outcome.idle {
+            Some(format!(
+                "no output for {}s; stopped (set idleTimeout to change, 0 to disable)",
+                lim.idle.map(|d| d.as_secs()).unwrap_or_default()
+            ))
+        } else {
+            outcome.timed_out.then(|| {
+                format!(
+                    "ran longer than {}s; stopped (set timeout to change, 0 to disable)",
+                    lim.timeout.map(|d| d.as_secs()).unwrap_or_default()
+                )
+            })
+        };
         if ok && !failures.is_empty() {
             // Passed only on a retry: say so loudly so the flake gets fixed.
             message = Some(format!(
@@ -872,6 +880,20 @@ impl Worker {
             return Some("Pit's cache format changed".into());
         }
         Some(crate::graph::explain_miss(&prev, inputs, deps))
+    }
+}
+
+/// A task's time limits: its own settings, or an hour in total and fifteen
+/// minutes without output, so a hung task never holds a worker forever.
+/// `0` turns a limit off.
+fn limits(def: &TaskDef) -> exec::Limits {
+    let pick = |v: Option<u64>, default: u64| match v.unwrap_or(default) {
+        0 => None,
+        n => Some(Duration::from_secs(n)),
+    };
+    exec::Limits {
+        timeout: pick(def.timeout, 60 * 60),
+        idle: pick(def.idle_timeout, 15 * 60),
     }
 }
 
