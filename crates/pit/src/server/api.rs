@@ -65,6 +65,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/cache/{key}", get(cache_get).put(cache_put))
         .route("/api/cache/last/{scope}", get(cache_last))
         .route("/api/cache/failed/{key}", get(cache_failed))
+        .route("/api/cache/{key}/claim", post(cache_claim))
         .route("/api/gc", post(gc_now))
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
@@ -545,6 +546,10 @@ async fn cache_put(
     }
     let trusted = cache_trust(&app, &headers)?;
     let stored = app.db.cache_put(&key, trusted, &entry)?;
+    // Whoever was waiting on this key finds the result now.
+    app.inflight
+        .lock()
+        .remove(&format!("{}:{key}", u8::from(trusted)));
     if let Some(scope) = q.scope.filter(|s| crate::cas::is_digest(s)) {
         app.db.kv_put("last", &scope, &stored)?;
     }
@@ -567,6 +572,35 @@ async fn cache_last(
             anyhow::anyhow!("previous result was evicted"),
         )
     })
+}
+
+#[derive(Deserialize)]
+struct ClaimBody {
+    task: String,
+}
+
+/// Single flight for cache misses. Shards that start together, or two runs
+/// of the same commit, would each compute the same action. The first task to
+/// claim a key computes it. Others are told to wait for its result, for as
+/// long as that task is still running; if it fails or dies, the next claim
+/// takes over. Keys are scoped by trust, since untrusted results are never
+/// served to trusted runs (P20).
+async fn cache_claim(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let trusted = cache_trust(&app, &headers)?;
+    let slot = format!("{}:{key}", u8::from(trusted));
+    let holder = app.inflight.lock().get(&slot).cloned();
+    if let Some(holder) = holder.filter(|h| *h != body.task) {
+        if let Some(run) = app.db.running_task_run(&holder)? {
+            return Ok(Json(serde_json::json!({ "wait": true, "run": run })));
+        }
+    }
+    app.inflight.lock().insert(slot, body.task);
+    Ok(Json(serde_json::json!({ "wait": false })))
 }
 
 /// The run where a task with these exact inputs last failed. Failures are

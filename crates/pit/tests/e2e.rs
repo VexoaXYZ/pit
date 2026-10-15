@@ -1570,3 +1570,67 @@ async fn a_rerun_reruns_only_what_failed_and_says_why() {
     let msg = task("test").message.unwrap_or_default();
     assert!(msg.contains("failed with these same inputs"), "{msg}");
 }
+
+/// Shards that start together need the same build. It runs once; the other
+/// shards wait for it and restore its outputs. If the first builder fails,
+/// a waiter takes over instead of waiting forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_identical_tasks_run_once() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let log = dir
+        .join("..")
+        .join(format!("builds-{}", std::process::id()));
+    let config = |fail_first: bool| {
+        let fail = if fail_first {
+            // Fails on the first attempt only.
+            format!(
+                "if [ $(wc -l < {0}) -eq 1 ]; then exit 1; fi; ",
+                log.display()
+            )
+        } else {
+            String::new()
+        };
+        serde_json::json!({ "tasks": {
+            "build": {
+                "run": format!("echo b >> {}; sleep 2; {fail}mkdir -p dist && echo x > dist/x", log.display()),
+                "inputs": ["src/**"],
+                "outputs": ["dist/**"],
+            },
+            "test": { "run": "test -f dist/x", "deps": ["build"], "shards": 3, "cache": false },
+        } })
+        .to_string()
+    };
+    write(dir, "pit.config.json", &config(false));
+    write(dir, "src/a", "1\n");
+    write(dir, ".gitignore", "dist/\n");
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    std::fs::write(&log, "").unwrap();
+    let view = run(&pit, dir).await;
+    assert_eq!(view.status, Status::Passed);
+    let builds = || std::fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(builds(), 1, "the build ran once for three shards");
+    let waited = view
+        .groups
+        .iter()
+        .flat_map(|g| &g.tasks)
+        .filter(|t| t.message.as_deref().unwrap_or_default().contains("waited"))
+        .count();
+    assert!(waited >= 1, "{view:?}");
+
+    // The first builder fails: a waiter must take over, not hang.
+    write(dir, "pit.config.json", &config(true));
+    write(dir, "src/a", "2\n");
+    sh(dir, "git commit -qam two");
+    std::fs::write(&log, "").unwrap();
+    let view = run(&pit, dir).await;
+    assert!(
+        builds() >= 2,
+        "a waiter took over after the first build failed"
+    );
+    assert!(view.status.is_done());
+}

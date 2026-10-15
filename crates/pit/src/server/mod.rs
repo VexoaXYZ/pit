@@ -50,6 +50,9 @@ pub struct App {
     pub worker_token: parking_lot::Mutex<Option<String>>,
     /// See `ServerOpts::notify_url`.
     pub notify_url: parking_lot::Mutex<Option<String>>,
+    /// Action keys being computed right now: trust scope and key to the
+    /// task doing it. See `api::cache_claim`.
+    pub inflight: parking_lot::Mutex<HashMap<String, String>>,
 }
 
 pub struct ServerOpts {
@@ -98,6 +101,7 @@ impl App {
             cache_max_bytes: AtomicU64::new(0),
             worker_token: Default::default(),
             notify_url: Default::default(),
+            inflight: Default::default(),
             gc_grace_ms: AtomicU64::new(2 * 60 * 1000),
             evicted_entries: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),

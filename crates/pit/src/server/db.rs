@@ -1337,6 +1337,19 @@ impl Db {
         Ok(())
     }
 
+    /// The run of a task, if the task is running now.
+    pub fn running_task_run(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT run_id FROM tasks WHERE id = ?1 AND status = 'running'",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// The run in which a task with this action key last failed, if any.
     pub fn last_failure(&self, key: &str) -> Result<Option<String>> {
         Ok(self

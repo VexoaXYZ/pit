@@ -666,10 +666,37 @@ impl Worker {
         if !job.no_cache {
             match def.cache {
                 CacheMode::Remote => {
-                    if let Some(entry) = client
-                        .get_opt::<CacheEntry>(&format!("/api/cache/{key}"))
-                        .await?
-                    {
+                    // The same action may be running right now elsewhere (a
+                    // sibling shard, another run of this commit). Wait for
+                    // its result rather than doing the work twice.
+                    let mut waited: Option<(Instant, String)> = None;
+                    let found = loop {
+                        let entry = client
+                            .get_opt::<CacheEntry>(&format!("/api/cache/{key}"))
+                            .await?;
+                        if entry.is_some() || *cancel.borrow() {
+                            break entry;
+                        }
+                        let claim: serde_json::Value = match client
+                            .post(
+                                &format!("/api/cache/{key}/claim"),
+                                &serde_json::json!({ "task": task.id }),
+                            )
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(_) => break None,
+                        };
+                        if claim["wait"].as_bool() != Some(true) {
+                            break None;
+                        }
+                        if waited.is_none() {
+                            let run = claim["run"].as_str().unwrap_or("another run");
+                            waited = Some((Instant::now(), run.to_string()));
+                        }
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    };
+                    if let Some(entry) = found {
                         let t = Instant::now();
                         // The server may evict the outputs between the lookup
                         // and the restore. Then the task just runs.
@@ -677,12 +704,18 @@ impl Worker {
                             restore_failed =
                                 Some(format!("its cached outputs could not be restored ({e:#})"));
                         } else {
-                            let msg = format!(
+                            let mut msg = format!(
                                 "cache hit, saved {:.1}s ({} output file(s) restored in {}ms)",
                                 entry.duration_ms as f64 / 1000.0,
                                 entry.outputs.len(),
                                 t.elapsed().as_millis()
                             );
+                            if let Some((since, run)) = &waited {
+                                msg.push_str(&format!(
+                                    "; waited {:.1}s for the same task in {run} instead of running it again",
+                                    since.elapsed().as_secs_f64()
+                                ));
+                            }
                             let r = finish(
                                 Status::Cached,
                                 Some(0),

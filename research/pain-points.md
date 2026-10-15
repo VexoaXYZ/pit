@@ -1559,3 +1559,58 @@ queue cap, and the wait is explained. Not done:
 - **No counting locks.** A lock admits one group at a time; "at most N at once" is not supported.
 - **Not tied to supersede.** A run superseded while it waits is cancelled as usual (P9), which is
   what a newer push wants.
+
+## P30. Parallel jobs each redo the same build
+
+**Pain.** Fanning tests out over parallel jobs (a matrix, or shards) means every job needs the
+build. The standard answer is a separate build job that uploads an artifact; the test jobs wait
+for it with `needs:` and download it. That adds a serial stage, upload and download time, and
+YAML plumbing. Some steps cannot move between jobs that way at all, because they depend on local
+caches or side effects
+([community#14484](https://github.com/orgs/community/discussions/14484),
+[pmunhoz](https://blog.pmunhoz.com/blog/github-actions/github-actions-matrix-builds/),
+[OneUptime artifacts](https://oneuptime.com/blog/post/2026-01-25-github-actions-artifacts/view),
+[OneUptime parallel tests](https://oneuptime.com/blog/post/2025-12-20-github-actions-parallel-tests/view),
+[eastondev](https://eastondev.com/blog/en/posts/dev/20260428-github-actions-matrix/)).
+
+Pit already shares outputs through the cache (P14: "setup is repeated per shard, and shared
+through the cache"). But that only helps once something is cached. Shards that start together
+all miss.
+
+**Reproduction** (`/tmp/painhunt/p30`): `build` (5s, outputs `dist/`) feeds a `test` with
+`shards: 3`, on the 2-slot worker. Each build execution appends a line to `builds.log`.
+
+**Before** (research/pain-hunt at P29):
+
+```
+✓ build 5.6s  ran because nothing was cached for it yet
+✓ build 5.4s  ran because nothing was cached for it yet
+◆ build cached
+wall 9.07s; build executed 2 times
+```
+
+With N workers the build would run N times, on a box where CPU is already the bottleneck (P21).
+
+**Fix** (research/pain-hunt): single flight for cache misses. Before running a missed remote-cached
+task, the worker claims its action key (`POST /api/cache/{key}/claim`). The first claimant runs
+it. Later claimants are told to wait while that task is still running. They poll the cache and
+restore the result when it lands, and say they waited. If the holder fails or dies, the next
+claim takes over, so nothing waits forever. Keys are scoped by trust (P20), and a claim ends
+when the result is stored.
+
+```
+default#1  ✓ build 5.0s  ran because src/a changed
+default#2  ◆ build  cache hit, saved 5.0s; waited 5.2s for the same task in run_ed6caa159ffc instead of running it again
+default#3  ◆ build  cache hit, saved 5.0s
+wall 7.54s; build executed 1 time
+```
+
+Covered by the e2e test `concurrent_identical_tasks_run_once`: three shards, one build, and the
+case where the first build fails and a waiter takes over.
+
+**Verdict: SOLVED** for duplicate work on identical actions, across shards and across runs of the
+same inputs. Not done:
+- **A waiting shard keeps its slot.** The CPU is free but the slot is busy, so on a small fleet
+  waiting can delay other groups.
+- **Workspace-cached tasks are not single-flighted.** `install` is per workspace, so each shard
+  still installs (or finds its warm workspace already installed).
