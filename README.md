@@ -8,15 +8,22 @@ with warm workers, content-addressed caching, and grouped execution. One Rust bi
 Whoever runs it hosts it.
 
 ```
-$ pit run
-pit run_386e11c57204 t3code@339179f50a +1 changed file(s) http://127.0.0.1:7070/runs/run_386e11c57204
+$ pit run install electron check knip typecheck build test-web     # in T3 Code, warm
+pit run_be9e34b3d173 t3code@339179f50a +2 changed file(s) http://127.0.0.1:7070/runs/run_be9e34b3d173
   ci on local
     ◆ install                  cached
     ◆ electron                 cached
+    ◆ test-web                 cached
+    ◆ knip                     cached
+    ◆ check                    cached
+    ◆ build                    cached
     ◆ typecheck                cached
-    ✓ test-web                 41.2s
-    ...
+  ci workspace ready in 348ms
+passed in 1.0s · 0 ran, 7 cached
 ```
+
+The same pipeline takes ~190s (p50) on GitHub Actions with Blacksmith runners. See
+[bench/](bench/README.md) for the full numbers, including where a single machine loses.
 
 ## Why
 

@@ -458,12 +458,6 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
             let r = repo_payload()?;
             let pr = &payload["pull_request"];
             let number = pr["number"].as_u64().context("pull_request.number")?;
-            // A fork's code (including its pit.config.ts) is untrusted: Pit
-            // does not run it automatically.
-            let head_repo = pr["head"]["repo"]["full_name"].as_str();
-            if head_repo.is_some_and(|h| h != r.full_name) {
-                return Ok(serde_json::json!({ "ignored": "pull request from a fork" }));
-            }
             let sha = pr["head"]["sha"]
                 .as_str()
                 .context("pull_request.head.sha")?
@@ -485,6 +479,12 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
             }
             if !matches!(action, "opened" | "synchronize" | "reopened") {
                 return Ok(serde_json::json!({ "ignored": action }));
+            }
+            // A fork's code (including its pit.config.ts) is untrusted: Pit does
+            // not run it on its own. A maintainer can still queue it with the
+            // merge label. A deleted fork shows up as a missing head repo.
+            if pr["head"]["repo"]["full_name"].as_str() != Some(r.full_name.as_str()) {
+                return Ok(serde_json::json!({ "ignored": "pull request from a fork" }));
             }
             let id = app
                 .create_run(

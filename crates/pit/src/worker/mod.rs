@@ -538,7 +538,9 @@ impl Worker {
             save_warm(ws, &warm.lock());
         }
         // Outputs left by an older run must not be stored under this key.
-        files::clear_outputs(ws, &def.outputs)?;
+        if def.cache == CacheMode::Remote && !job.no_cache {
+            files::clear_outputs(ws, &def.outputs)?;
+        }
 
         let backend = def.backend.unwrap_or_default();
         let mut env: Vec<(String, String)> = vec![

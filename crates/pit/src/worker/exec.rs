@@ -126,6 +126,8 @@ pub fn command(
             if let Ok(meta) = std::fs::metadata(workdir) {
                 use std::os::unix::fs::MetadataExt;
                 a.extend(["--user".into(), format!("{}:{}", meta.uid(), meta.gid())]);
+                // That user has no home in the image; tools need a writable one.
+                a.extend(["-e".into(), "HOME=/tmp".into()]);
             }
             container = Some(name);
             for (k, v) in env {
