@@ -820,12 +820,12 @@ async fn merge_queue_retries_flakes_once_and_flags_them() {
         entry.status, "landed",
         "a flake ejected an innocent change: {entry:?}"
     );
-    let run: RunView = pit
+    let queued: RunView = pit
         .client
         .get(&format!("/api/runs/{}", entry.run_id.unwrap()))
         .await
         .unwrap();
-    let task = &run.groups[0].tasks[0];
+    let task = &queued.groups[0].tasks[0];
     assert!(
         task.message
             .as_deref()
