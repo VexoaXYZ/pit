@@ -166,6 +166,15 @@ pub struct RunRow {
     pub trusted: bool,
 }
 
+pub struct WaitingGroup {
+    pub id: String,
+    pub run_id: String,
+    pub name: String,
+    pub os: String,
+    pub needs: Vec<Backend>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GroupRow {
     pub id: String,
@@ -1246,6 +1255,40 @@ impl Db {
             .into_iter()
             .filter_map(|(i, s, run)| serde_json::from_str(&i).ok().map(|i| (i, s, run)))
             .collect())
+    }
+
+    /// Queued groups of active runs created before `before`.
+    pub fn waiting_groups(&self, before: i64) -> Result<Vec<WaitingGroup>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT groups_.id, groups_.run_id, groups_.name, groups_.os, groups_.backends, groups_.message
+             FROM groups_ JOIN runs ON runs.id = groups_.run_id
+             WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
+               AND groups_.created_at < ?1",
+        )?;
+        let rows = st
+            .query_map(params![before], |r| {
+                let backends: String = r.get(4)?;
+                Ok(WaitingGroup {
+                    id: r.get(0)?,
+                    run_id: r.get(1)?,
+                    name: r.get(2)?,
+                    os: r.get(3)?,
+                    needs: serde_json::from_str(&backends).unwrap_or_default(),
+                    message: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Sets the message of a group that is still queued.
+    pub fn set_queued_group_message(&self, id: &str, message: Option<&str>) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE groups_ SET message = ?1 WHERE id = ?2 AND status = 'queued'",
+            params![message, id],
+        )?;
+        Ok(())
     }
 
     // ---- merge queue ----

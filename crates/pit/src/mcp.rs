@@ -256,6 +256,9 @@ async fn summarize(client: &Client, view: &RunView, elapsed_ms: u64, url: &str) 
     let mut failed = Vec::new();
     for g in &view.groups {
         s.push_str(&format!("{} ({}):\n", g.name, g.os));
+        if let Some(m) = &g.message {
+            s.push_str(&format!("  {m}\n"));
+        }
         for t in &g.tasks {
             let time = t
                 .duration_ms

@@ -278,6 +278,18 @@ pub async fn run(
                     style.dim(&format!("on {worker}"))
                 );
             }
+            "group.waiting" if !json => {
+                if let Some(msg) = e.data["message"].as_str() {
+                    let name = e.data["name"].as_str().unwrap_or_default();
+                    let os = e.data["os"].as_str().unwrap_or_default();
+                    let _ = writeln!(
+                        stderr,
+                        "  {} {}",
+                        style.paint("1", name),
+                        style.dim(&format!("({os}) {msg}"))
+                    );
+                }
+            }
             "group.finished" if !json => {
                 let name = e.data["name"].as_str().unwrap_or_default();
                 let prep = e.data["prepareMs"].as_u64().unwrap_or(0);

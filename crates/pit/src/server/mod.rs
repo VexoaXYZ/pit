@@ -514,6 +514,74 @@ pub async fn serve_app(app: Arc<App>, addr: SocketAddr) -> Result<()> {
     serve_listener(app, listener).await
 }
 
+/// Why no online worker can take a group, if none can: the GitHub "Waiting
+/// for a runner to pick up this job" that never says what is missing.
+pub fn waiting_reason(os: &str, needs: &[Backend], online: &[WorkerInfo]) -> Option<String> {
+    let fits = |w: &WorkerInfo| {
+        (os == "any" || w.os == os) && needs.iter().all(|b| w.backends.contains(b))
+    };
+    if online.iter().any(fits) {
+        return None;
+    }
+    let mut need = vec![format!("os {os}")];
+    need.extend(
+        needs
+            .iter()
+            .filter(|b| **b != Backend::Host)
+            .map(|b| format!("backend {}", b.as_str())),
+    );
+    let have = if online.is_empty() {
+        "no workers are online".to_string()
+    } else {
+        let list: Vec<String> = online
+            .iter()
+            .map(|w| {
+                let b: Vec<&str> = w.backends.iter().map(|b| b.as_str()).collect();
+                format!("{} ({}; {})", w.name, w.os, b.join(", "))
+            })
+            .collect();
+        format!("online: {}", list.join(", "))
+    };
+    Some(format!(
+        "waiting: no online worker can run it (needs {}); {have}. Start a matching `pit worker`.",
+        need.join(", ")
+    ))
+}
+
+impl App {
+    /// Marks queued groups that no online worker can run, and clears the
+    /// mark once one can. They keep waiting: a worker may still join.
+    pub fn explain_waiting(&self) -> Result<()> {
+        let now = now_ms();
+        let online: Vec<WorkerInfo> = self
+            .db
+            .workers()?
+            .into_iter()
+            .filter(|(_, seen, _)| now - seen < 30_000)
+            .map(|(w, _, _)| w)
+            .collect();
+        for g in self.db.waiting_groups(now - 3_000)? {
+            let reason = waiting_reason(&g.os, &g.needs, &online);
+            let ours = g
+                .message
+                .as_deref()
+                .is_some_and(|m| m.starts_with("waiting:"));
+            if (reason.is_none() && !ours) || reason == g.message {
+                continue;
+            }
+            self.db.set_queued_group_message(&g.id, reason.as_deref())?;
+            self.emit(
+                "group.waiting",
+                Some(&g.run_id),
+                Some(&g.id),
+                None,
+                serde_json::json!({ "name": g.name, "os": g.os, "message": reason }),
+            );
+        }
+        Ok(())
+    }
+}
+
 pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) -> Result<()> {
     // Requeue work from workers that went away.
     let reaper = app.clone();
@@ -527,6 +595,16 @@ pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) ->
                 }
                 Err(e) => tracing::warn!("reaper: {e:#}"),
                 _ => {}
+            }
+        }
+    });
+    // Say so when a group has no worker that can run it.
+    let waiting = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if let Err(e) = waiting.explain_waiting() {
+                tracing::warn!("checking waiting groups: {e:#}");
             }
         }
     });
@@ -576,5 +654,40 @@ mod trust_tests {
         assert!(!trusted_branch("trunk", Some("main")));
         assert!(trusted_branch("main", None));
         assert!(!trusted_branch("feature", None));
+    }
+}
+
+#[cfg(test)]
+mod waiting_tests {
+    use super::*;
+
+    #[test]
+    fn says_what_no_online_worker_provides() {
+        let linux = WorkerInfo {
+            name: "local".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cpus: 8,
+            backends: vec![Backend::Host, Backend::Sandbox],
+            kvm: false,
+        };
+        assert_eq!(
+            waiting_reason("linux", &[Backend::Host], std::slice::from_ref(&linux)),
+            None
+        );
+        assert_eq!(
+            waiting_reason("any", &[], std::slice::from_ref(&linux)),
+            None
+        );
+        let mac = waiting_reason("macos", &[Backend::Host], std::slice::from_ref(&linux)).unwrap();
+        assert!(
+            mac.contains("needs os macos") && mac.contains("local (linux; host, sandbox)"),
+            "{mac}"
+        );
+        let docker = waiting_reason("linux", &[Backend::Docker], &[linux]).unwrap();
+        assert!(docker.contains("backend docker"), "{docker}");
+        assert!(waiting_reason("linux", &[], &[])
+            .unwrap()
+            .contains("no workers are online"));
     }
 }

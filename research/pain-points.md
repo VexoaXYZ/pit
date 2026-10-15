@@ -1218,3 +1218,49 @@ Not done:
   duration.
 - **Starvation.** A constant stream of queue and main runs can keep PR runs waiting. Nothing
   ages them up yet.
+
+## P23. "Waiting for a runner to pick up this job…" without saying why
+
+**Pain.** A job whose labels no online runner matches sits in "Queued" with no explanation. The
+cause can be a typo in `runs-on`, an offline or busy self-hosted runner, a runner group that
+does not allow the repo, or an unknown third-party label (one report had
+`blacksmith-4vcpu-ubuntu-2204`). People debug it by comparing labels by hand
+([community#62365](https://github.com/orgs/community/discussions/62365),
+[#31587](https://github.com/orgs/community/discussions/31587),
+[#199085](https://github.com/orgs/community/discussions/199085),
+[actions/runner#3609](https://github.com/actions/runner/issues/3609),
+[OpenHands#7362](https://github.com/OpenHands/OpenHands/issues/7362),
+[sengi](https://sengi.run/blog/github-actions-jobs-stuck),
+[devopsil](https://devopsil.com/articles/2026-03-30-github-actions-workflow-stuck-queued-fix)).
+Self-hosted jobs are cancelled only after 24 hours in the queue
+([GitHub docs](https://docs.github.com/en/enterprise-server@3.14/actions/reference/usage-limits-for-self-hosted-runners)).
+
+**Reproduction** (`/tmp/painhunt/p23`): a config with three groups, `mac` (`os: ["macos"]`),
+`img` (Docker) and `lin`, run on this machine's only worker (Linux; host, sandbox, docker).
+
+**Before** (research/pain-hunt at P22): `img` and `lin` passed. `mac` stayed `queued` with no
+message, and `pit run` waited silently until it was killed after 20s:
+
+```
+running [('img', 'passed', None), ('lin', 'passed', None), ('mac', 'queued', None)]
+```
+
+**Fix** (research/pain-hunt): every 2 seconds the server compares queued groups older than 3s
+with the workers seen in the last 30s. A group that none of them can run (wrong OS, or a missing
+`sandbox`/`docker` backend) gets a message naming what it needs and what is online. The message
+is streamed as an event, shown by the CLI and the dashboard, and included in the MCP summary
+for agents. It is cleared once a worker that fits comes online. The group keeps waiting,
+because a worker may still join.
+
+```
+  mac (macos) waiting: no online worker can run it (needs os macos); online: local (linux; host, sandbox, docker). Start a matching `pit worker`.
+```
+
+That line appeared within a few seconds of the run starting. Covered by the unit test
+`says_what_no_online_worker_provides`.
+
+**Verdict: SOLVED** for explaining the wait. Not done:
+- **No timeout.** A group nobody can run waits until the run is cancelled. GitHub cancels after
+  24 hours; Pit never does.
+- **Untested path.** Clearing the message when a matching worker comes online has no automated
+  test.
