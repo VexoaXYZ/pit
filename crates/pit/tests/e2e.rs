@@ -200,7 +200,7 @@ async fn merge_queue_lands_disjoint_lanes_in_parallel_and_ejects_failures() {
         &work,
         "pit.config.json",
         r#"{"tasks":{
-            "a":{"run":"sleep 1 && ! grep -rq FAIL a","inputs":["a/**"]},
+            "a":{"run":"sleep 3 && ! grep -rq FAIL a","inputs":["a/**"]},
             "b":{"run":"sleep 1 && ! grep -rq FAIL b","inputs":["b/**"]}
         }}"#,
     );

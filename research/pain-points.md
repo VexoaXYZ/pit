@@ -264,11 +264,10 @@ With the cache-mount step moved after `COPY` so it reruns on every change:
   worker's daemon. Documented in the README ("Docker builds"): use `cache: "workspace"` or
   `false` for image builds.
 
-**Verdict: SOLVED on one box, PARTIAL for a fleet.** On a single worker, layers and cache
-mounts persist with no setup: 29.9 s → 5–7 s per rebuild. With several workers each has its
-own Docker cache, and Pit's scheduler does not yet route a group back to the worker that ran
-it last, so a fleet only stays warm per worker. Worker affinity in the scheduler is the
-follow-up.
+**Verdict: SOLVED** (updated after P11). On a single worker, layers and cache mounts persist
+with no setup: 29.9 s → 5–7 s per rebuild. With several workers each has its own Docker
+cache; since P11 the scheduler sends a group back to the worker that ran it last, so a fleet
+stays warm the same way. Docker caches are still not shared between workers.
 
 ## P6. Push and pray: "try fix CI" commits, and no way to test CI config locally
 
@@ -527,3 +526,48 @@ filter, gate job or mirror workflow needed, and the check names never change.
 **Verdict: SOLVED.** One gap: if the config itself fails to load, Pit reports a single
 `pit / plan` failure, and the per-group required checks stay at "Expected" (the PR is still
 blocked, which is the safe direction, but the reason is on a different check).
+
+## P11. Jobs land on cold machines
+
+**Pain.** On a fleet of self-hosted runners, a job lands on whichever runner is free, often
+one that has never seen the repo, so its caches start cold; hosted-runner vendors sell
+"sticky" disks and cache volumes to keep a job's state on the machine it lands on
+([Blacksmith](https://www.blacksmith.sh/blog/cache-is-king-a-guide-for-docker-layer-caching-in-github-actions),
+[RunsOn](https://runs-on.com/github-actions/docker-layer-caching/)). The same gap was the open
+half of P5.
+
+**Reproduction** (`/tmp/painhunt/p11`): a second worker (`w2`) next to the built-in one; a
+repo whose `install` (3 s, `cache: "workspace"`) is remembered per warm workspace; ten runs
+with a small change each.
+
+**Before** (research/pain-hunt at P10): runs went to whichever worker asked first, so each
+worker paid the cold install once (in an N-worker fleet: up to N times per repo, and N times
+again after every lockfile change).
+
+```
+run  1 on w2     install=passed  total= 3615ms
+run  2 on w2     install=cached  total=  420ms
+run  3 on w2     install=cached  total=  191ms
+run  4 on local  install=passed  total= 3398ms
+run  5–7 on local, run 8–10 on w2: install=cached
+```
+
+**Fix** (research/pain-hunt): soft affinity in the scheduler. A queued group waits up to 2 s
+for the worker that last ran the same group of the same repo, if that worker polled in the
+last 30 s; after that any worker may take it. A waiting worker rechecks every 250 ms so the
+hold never stalls the queue.
+
+After a lockfile change (every workspace must reinstall once):
+
+```
+run 11 on w2     install=passed  total= 3363ms
+run 12–20 on w2  install=cached  total= 114–419ms
+```
+
+One cold install instead of one per worker. Covered by the unit test
+`a_group_waits_briefly_for_its_warm_worker` (held for the warm worker, taken by it, free for
+anyone after the hold).
+
+**Verdict: SOLVED.** Trade-off: affinity concentrates a repo's runs on one worker; when that
+worker is busy it stops polling and other workers take the group after the 2 s hold. Caches
+are still per worker, not shared.

@@ -433,7 +433,8 @@ async fn claim(
         let notified = app.work.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if let Some(job) = app.db.claim_group(&info)? {
+        let (job, held) = app.db.claim_group(&info)?;
+        if let Some(job) = job {
             app.db.set_run_status(&job.run_id, Status::Running, None)?;
             app.emit(
                 "group.started",
@@ -453,7 +454,16 @@ async fn claim(
             }
             return Ok(Json(ClaimResponse::Job(Box::new(job))));
         }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+        // A group held for its warm worker becomes ours after a short wait,
+        // and no event announces that, so look again soon.
+        let wake = if held {
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(250))
+        } else {
+            deadline
+        };
+        if tokio::time::timeout_at(wake, notified).await.is_err()
+            && tokio::time::Instant::now() >= deadline
+        {
             app.db.touch_worker(&info)?;
             return Ok(Json(ClaimResponse::Idle));
         }

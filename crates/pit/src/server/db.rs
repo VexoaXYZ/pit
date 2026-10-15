@@ -190,6 +190,12 @@ pub struct QueueRow {
     pub updated_at: i64,
 }
 
+/// How long a queued group waits for the worker that ran it last.
+pub const AFFINITY_MS: i64 = 2_000;
+/// A worker that polled within this window counts as online. Idle workers
+/// long-poll every 20 s.
+const WORKER_ONLINE_MS: i64 = 30_000;
+
 /// Columns added after the first release of a table.
 fn migrate(conn: &Connection) -> Result<()> {
     let has_lease: bool = conn
@@ -551,15 +557,35 @@ impl Db {
     }
 
     /// Atomically claims the oldest queued group this worker can run.
-    pub fn claim_group(&self, worker: &WorkerInfo) -> Result<Option<Job>> {
+    /// Claims the oldest queued group this worker can run. Returns the job,
+    /// and whether some group was held back for another worker (see below),
+    /// so the caller knows to look again shortly.
+    ///
+    /// Affinity: a group waits up to `AFFINITY_MS` for the worker that last
+    /// ran the same group of the same repo, if that worker is online, because
+    /// that worker's workspace is warm (dependencies, build output, Docker
+    /// layers). After that any worker may take it.
+    pub fn claim_group(&self, worker: &WorkerInfo) -> Result<(Option<Job>, bool)> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
+        let now = now_ms();
+        let mut held = false;
         // OS is filtered in SQL; backends (JSON) are checked row by row. The
         // scan is lazy and unbounded, so incompatible groups at the head of
         // the queue cannot hide a compatible one behind them.
         let pick = {
             let mut st = tx.prepare(
-                "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends FROM groups_
+                "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends, groups_.created_at,
+                   (SELECT prev.worker FROM groups_ prev JOIN runs pr ON pr.id = prev.run_id
+                     WHERE pr.repo_id = runs.repo_id AND prev.name = groups_.name
+                       AND prev.worker IS NOT NULL AND prev.status IN ('passed', 'failed')
+                     ORDER BY prev.finished_at DESC LIMIT 1) AS preferred,
+                   (SELECT w.last_seen FROM workers w WHERE w.name = (
+                     SELECT prev.worker FROM groups_ prev JOIN runs pr ON pr.id = prev.run_id
+                     WHERE pr.repo_id = runs.repo_id AND prev.name = groups_.name
+                       AND prev.worker IS NOT NULL AND prev.status IN ('passed', 'failed')
+                     ORDER BY prev.finished_at DESC LIMIT 1)) AS preferred_seen
+                 FROM groups_
                  JOIN runs ON runs.id = groups_.run_id
                  WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                    AND (groups_.os = 'any' OR groups_.os = ?1)
@@ -571,23 +597,33 @@ impl Db {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
                 ))
             })?;
             let mut pick = None;
             for row in rows.by_ref() {
-                let row = row?;
-                let needs: Vec<Backend> = serde_json::from_str(&row.3).unwrap_or_default();
-                if needs.iter().all(|b| worker.backends.contains(b)) {
-                    pick = Some(row);
-                    break;
+                let (gid, run_id, os, backends, created, preferred, preferred_seen) = row?;
+                let needs: Vec<Backend> = serde_json::from_str(&backends).unwrap_or_default();
+                if !needs.iter().all(|b| worker.backends.contains(b)) {
+                    continue;
                 }
+                let warm_elsewhere = preferred.as_deref().is_some_and(|p| p != worker.name)
+                    && preferred_seen.is_some_and(|seen| now - seen < WORKER_ONLINE_MS)
+                    && now - created < AFFINITY_MS;
+                if warm_elsewhere {
+                    held = true;
+                    continue;
+                }
+                pick = Some((gid, run_id, os));
+                break;
             }
             pick
         };
-        let Some((gid, run_id, os, _)) = pick else {
-            return Ok(None);
+        let Some((gid, run_id, os)) = pick else {
+            return Ok((None, held));
         };
-        let now = now_ms();
         let lease = new_id("lease");
         tx.execute(
             "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2, lease = ?4 WHERE id = ?3",
@@ -616,7 +652,7 @@ impl Db {
             rows
         };
         tx.commit()?;
-        Ok(Some(Job {
+        let job = Job {
             group_id: gid,
             lease,
             run_id,
@@ -629,7 +665,8 @@ impl Db {
             no_cache: run.no_cache,
             flake_retries: u32::from(run.trigger == "queue"),
             tasks,
-        }))
+        };
+        Ok((Some(job), held))
     }
 
     pub fn group(&self, id: &str) -> Result<GroupRow> {
@@ -1207,6 +1244,7 @@ mod tests {
         let job = db
             .claim_group(&worker)
             .unwrap()
+            .0
             .expect("linux group was starved");
         assert_eq!(job.group_id, linux);
         assert!(db.heartbeat_group(&job.group_id, Some(&job.lease)).unwrap());
@@ -1243,5 +1281,78 @@ mod repo_identity_tests {
         assert_eq!(db.repo("/tmp/b/origin.git").unwrap().id, b.id);
         // Without a URL, the name is enough.
         assert_eq!(db.upsert_repo("work", None, None).unwrap().id, a.id);
+    }
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    fn worker(name: &str) -> WorkerInfo {
+        WorkerInfo {
+            name: name.into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+        }
+    }
+
+    #[test]
+    fn a_group_waits_briefly_for_its_warm_worker() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        // `warm` ran this group last.
+        let (warm, cold) = (worker("warm"), worker("cold"));
+        db.touch_worker(&warm).unwrap();
+        db.touch_worker(&cold).unwrap();
+        let run1 = db
+            .insert_run(&repo.id, "a", None, None, 0, "t", false, None)
+            .unwrap();
+        db.insert_group(&run1, "ci", "linux", &[], &task).unwrap();
+        let job = db.claim_group(&warm).unwrap().0.unwrap();
+        let done = GroupResult {
+            status: Status::Passed,
+            message: None,
+            prepare_ms: 0,
+        };
+        assert!(db
+            .finish_group(&job.group_id, Some(&job.lease), &done)
+            .unwrap());
+
+        // The next run of that group is held for `warm`...
+        let run2 = db
+            .insert_run(&repo.id, "b", None, None, 0, "t", false, None)
+            .unwrap();
+        db.insert_group(&run2, "ci", "linux", &[], &task).unwrap();
+        let (job, held) = db.claim_group(&cold).unwrap();
+        assert!(
+            job.is_none() && held,
+            "a cold worker took a group its warm worker could run"
+        );
+        // ...which gets it.
+        assert_eq!(db.claim_group(&warm).unwrap().0.unwrap().run_id, run2);
+
+        // Once the hold expires, any worker may take it.
+        let run3 = db
+            .insert_run(&repo.id, "c", None, None, 0, "t", false, None)
+            .unwrap();
+        db.insert_group(&run3, "ci", "linux", &[], &task).unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE groups_ SET created_at = created_at - ?1 WHERE run_id = ?2",
+                params![AFFINITY_MS + 1, run3],
+            )
+            .unwrap();
+        assert_eq!(db.claim_group(&cold).unwrap().0.unwrap().run_id, run3);
     }
 }
