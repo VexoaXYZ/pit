@@ -8,7 +8,6 @@ against Pit on one machine, and a verdict backed by what was measured. Verdicts:
 
 | # | Pain point | Sources |
 | --- | --- | --- |
-| B1 | Push-and-pray dev loop: `git commit -m "try fix"`, wait 10 minutes, repeat; no way to run CI config locally | [HN 46908491](https://news.ycombinator.com/item?id=46908491), [Lobsters](https://lobste.rs/s/hkqnro/github_actions_is_slowly_killing_your) |
 | B5 | `actions/checkout` fails intermittently; release jobs scheduled twice | [HN 46614558](https://news.ycombinator.com/item?id=46614558) |
 | B6 | Bills keep climbing; teams move CI to one box for a warm cache | [HN 49612772](https://news.ycombinator.com/item?id=49612772) |
 | B7 | GitHub outages stop all CI (4 hours in Feb 2026, 7.5 hours in Aug 2026) | [NERVICO](https://nervico.com/en/blog/github-actions-alternatives-ci-cd/) |
@@ -272,3 +271,63 @@ mounts persist with no setup: 29.9 s → 5–7 s per rebuild. With several worke
 own Docker cache, and Pit's scheduler does not yet route a group back to the worker that ran
 it last, so a fleet only stays warm per worker. Worker affinity in the scheduler is the
 follow-up.
+
+## P6. Push and pray: "try fix CI" commits, and no way to test CI config locally
+
+**Pain.** "We've somehow normalized a dev loop that involves `git commit -m "try fix"`, waiting
+10 minutes, and repeating" ([HN 46908491](https://news.ycombinator.com/item?id=46908491)); there
+is no sensible way to test or even lint the CI config locally
+([Lobsters](https://lobste.rs/s/hkqnro/github_actions_is_slowly_killing_your)). The usual answer,
+nektos/act, shortens the loop but runs an approximation: different images (up to 18 GB for the
+closest one), no GitHub API, partial `actions/cache`, manual secrets, limited macOS and Windows,
+so guides still say to confirm on real runners
+([Better Stack](https://betterstack.com/community/guides/scaling-docker/act-github-actions-tutorial/),
+[Stéphane Robert](https://blog.stephane-robert.info/en/docs/pipeline-cicd/github/act/),
+[Earthly](https://earthly.dev/blog/using-github-actions-locally/),
+[codewithahsan](https://blog.codewithahsan.dev/run-your-github-actions-locally-with-act-faster-feedback-better-debugging/),
+[Jordan Marcelino](https://jordan-marcelino.vercel.app/blog/stop-waiting-on-ci-run-github-actions-locally-with-act)).
+
+**Reproduction** (`/tmp/painhunt/p6`): a repo with a bare origin; tasks `lint` (no
+`console.log`) and `test` (`sum(2,2) === 4`). Introduce a bug, fix it in two steps, add a task
+to the pipeline config, all uncommitted, then commit, push, and run CI on the pushed commit.
+
+**Result:**
+
+```
+== 1. introduce a bug (uncommitted)
+    ✗ lint   1.1s exit 1   │ 1:exports.sum = (a, b) => { console.log(a); return a - b; };
+    ✗ test   3.0s exit 1   │ sum(2,2) = 0
+== 2. fix the logic, forget the console.log
+    ✗ lint   1.0s exit 1
+    ✓ test   2.1s
+== 3. edit the pipeline itself (uncommitted): add a typecheck-ish task
+    ✓ syntax 85ms   ✓ lint 1.0s   ✓ test 2.1s  ran because src/sum.js changed
+loop: 8.8s, commits made: 0
+== 4. commit + push, then the CI run for the pushed commit
+push run passed in 206 ms
+   lint cached   syntax cached   test cached
+```
+
+Three iterations in 8.8 s with no commits, including a change to the pipeline. The run for the
+pushed commit was entirely cache hits: `pit run` and CI are the same pipeline on the same
+workers with the same action keys, not an emulation, so CI had nothing left to do.
+
+**A gap the reproduction found.** Broken configs failed fast and clearly (trailing comma: 87 ms;
+dep on a missing task: 143 ms), but a typo'd field was silently ignored:
+
+```
+== unknown field (typo: 'imputs')
+passed in 149ms · 1 ran, 0 cached          (inputs silently fell back to every file)
+```
+
+Fixed: config structs reject unknown fields.
+
+```
+error in 101ms · parsing pit.config.json: unknown field `imputs`, expected one of `run`, `deps`,
+`inputs`, `outputs`, `env`, `cache`, `backend`, `image`, `network`, `timeout`, `retries` at line 1 column 39
+```
+
+Covered by the unit test `typos_in_the_config_are_errors`.
+
+**Verdict: SOLVED**, with the caveat that `pit run` needs a reachable Pit server and workers
+for the target OS; it does not run anything on the laptop itself.

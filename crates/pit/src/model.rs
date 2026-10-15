@@ -5,9 +5,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// The evaluated `pit.config.ts`.
+/// The evaluated `pit.config.ts`. Unknown fields are errors, so a typo such
+/// as `imputs` fails loudly instead of silently meaning "every file".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PitConfig {
     /// Groups of tasks. A group is the unit a worker claims: every task in a
     /// group runs in the same warm workspace, so setup work is done once.
@@ -19,7 +20,7 @@ pub struct PitConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GroupDef {
     /// Operating systems to run this group on: `linux`, `macos`, `windows` or
     /// `any`. One group instance is planned per entry.
@@ -36,7 +37,7 @@ pub struct GroupDef {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskDef {
     /// Shell command.
     pub run: String,

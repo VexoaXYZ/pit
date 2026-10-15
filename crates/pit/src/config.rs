@@ -185,3 +185,23 @@ pub async fn load_dir(dir: &Path, scratch: &Path) -> Result<PitConfig> {
     }
     bail!("no {CONFIG_TS} or {CONFIG_JSON} in {}", dir.display())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn typos_in_the_config_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = br#"{"tasks":{"test":{"run":"true","imputs":["src/**"]}}}"#;
+        let err = format!(
+            "{:#}",
+            parse(CONFIG_JSON, bad, dir.path()).await.unwrap_err()
+        );
+        assert!(err.contains("unknown field `imputs`"), "{err}");
+        let bad_group = br#"{"groups":{"ci":{"oss":["linux"],"tasks":{}}}}"#;
+        assert!(parse(CONFIG_JSON, bad_group, dir.path()).await.is_err());
+        let good = br#"{"tasks":{"test":{"run":"true","inputs":["src/**"],"cache":false}}}"#;
+        assert!(parse(CONFIG_JSON, good, dir.path()).await.is_ok());
+    }
+}
