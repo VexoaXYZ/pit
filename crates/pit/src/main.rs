@@ -102,6 +102,10 @@ enum Command {
         /// Ignore cached results.
         #[arg(long)]
         no_cache: bool,
+        /// Run in a new, empty workspace, without files earlier runs left
+        /// behind (ignored build output, tool caches).
+        #[arg(long)]
+        fresh: bool,
         /// Stream every task's log, not just failures.
         #[arg(short, long)]
         verbose: bool,
@@ -112,7 +116,8 @@ enum Command {
         #[arg(short = 'C', long, default_value = ".")]
         dir: PathBuf,
     },
-    /// Same as `pit run --no-cache`: proves results do not depend on the cache.
+    /// `pit run --no-cache --fresh`: proves results depend neither on the
+    /// cache nor on files earlier runs left in a warm workspace.
     Verify {
         tasks: Vec<String>,
         #[command(flatten)]
@@ -312,6 +317,7 @@ async fn run(cli: Cli) -> Result<i32> {
             tasks,
             conn,
             no_cache,
+            fresh,
             verbose,
             json,
             dir,
@@ -320,18 +326,22 @@ async fn run(cli: Cli) -> Result<i32> {
                 &cli::client(&conn.server, conn.token)?,
                 &dir,
                 tasks,
-                no_cache,
+                cli::RunOpts { no_cache, fresh },
                 verbose,
                 json,
             )
             .await
         }
         Command::Verify { tasks, conn, dir } => {
+            // No cache and no warm state: the run a brand-new runner would do.
             cli::run(
                 &cli::client(&conn.server, conn.token)?,
                 &dir,
                 tasks,
-                true,
+                cli::RunOpts {
+                    no_cache: true,
+                    fresh: true,
+                },
                 false,
                 false,
             )

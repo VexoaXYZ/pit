@@ -182,6 +182,10 @@ pub struct CreateRun {
     pub git_ref: Option<String>,
     #[serde(default)]
     pub no_cache: bool,
+    /// Run in a new, empty workspace that is deleted afterwards, so nothing
+    /// left by earlier runs (ignored files, tool caches) can affect it.
+    #[serde(default)]
+    pub fresh: bool,
     /// Code that is, or is about to be, on a protected branch: main pushes,
     /// merge queue and post-merge runs. Only the server sets it; runs created
     /// through the API (`pit run`, scripts) are never trusted. See
@@ -226,6 +230,9 @@ pub struct Job {
     /// results from other trusted runs.
     #[serde(default)]
     pub trusted: bool,
+    /// See `CreateRun::fresh`.
+    #[serde(default)]
+    pub fresh: bool,
     pub tasks: Vec<JobTask>,
 }
 

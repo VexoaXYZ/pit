@@ -136,7 +136,16 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
                 .unwrap_or_default();
             let no_cache = args["noCache"].as_bool().unwrap_or(false);
             let started = std::time::Instant::now();
-            let sub = crate::cli::submit(client, &path_arg(args), tasks, no_cache).await?;
+            let sub = crate::cli::submit(
+                client,
+                &path_arg(args),
+                tasks,
+                crate::cli::RunOpts {
+                    no_cache,
+                    fresh: false,
+                },
+            )
+            .await?;
             let view = crate::cli::wait(client, &sub.run_id, |_| {}).await?;
             let text = summarize(
                 client,

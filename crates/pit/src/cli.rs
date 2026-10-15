@@ -82,11 +82,20 @@ pub struct Submitted {
 }
 
 /// Snapshots the working tree and starts a run on it.
+/// How a local run treats earlier state.
+#[derive(Clone, Copy, Default)]
+pub struct RunOpts {
+    /// Ignore cached results.
+    pub no_cache: bool,
+    /// Use a new, empty workspace instead of a warm one.
+    pub fresh: bool,
+}
+
 pub async fn submit(
     client: &Client,
     dir: &Path,
     tasks: Vec<String>,
-    no_cache: bool,
+    opts: RunOpts,
 ) -> Result<Submitted> {
     let snapshot = crate::snapshot::local(client, dir).await?;
     let created: serde_json::Value = client
@@ -100,7 +109,8 @@ pub async fn submit(
                 tasks,
                 trigger: Some("local".into()),
                 git_ref: snapshot.branch.clone(),
-                no_cache,
+                no_cache: opts.no_cache,
+                fresh: opts.fresh,
                 trusted: false,
             },
         )
@@ -204,12 +214,12 @@ pub async fn run(
     client: &Client,
     dir: &Path,
     tasks: Vec<String>,
-    no_cache: bool,
+    opts: RunOpts,
     verbose: bool,
     json: bool,
 ) -> Result<i32> {
     let started = Instant::now();
-    let sub = submit(client, dir, tasks, no_cache).await?;
+    let sub = submit(client, dir, tasks, opts).await?;
     let style = Style {
         color: std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     };

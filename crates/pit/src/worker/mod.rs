@@ -61,16 +61,22 @@ struct WorkspaceSlot {
     last_used: Instant,
 }
 
-/// Returns its workspace to the pool when the job ends.
+/// Returns its workspace to the pool when the job ends. A fresh workspace
+/// leaves the pool instead; the caller deletes it.
 struct WorkspaceLease<'a> {
     worker: &'a Worker,
     pool: String,
     path: PathBuf,
+    fresh: bool,
 }
 
 impl Drop for WorkspaceLease<'_> {
     fn drop(&mut self) {
         if let Some(slots) = self.worker.workspaces.lock().get_mut(&self.pool) {
+            if self.fresh {
+                slots.retain(|s| s.path != self.path);
+                return;
+            }
             if let Some(s) = slots.iter_mut().find(|s| s.path == self.path) {
                 s.busy = false;
                 s.last_used = Instant::now();
@@ -236,6 +242,35 @@ impl Worker {
             worker: self,
             pool: key,
             path,
+            fresh: false,
+        }
+    }
+
+    /// A new, empty workspace for one job (`pit run --fresh`, `pit verify`).
+    /// It is listed as busy, so workspace cleanup leaves it alone while the
+    /// job runs.
+    fn lease_fresh_workspace(&self, repo: &str, group: &str) -> WorkspaceLease<'_> {
+        let dir = self
+            .data_dir
+            .join("workspaces")
+            .join(safe_name(repo))
+            .join(format!("{}~fresh", safe_name(group)));
+        let key = dir.to_string_lossy().to_string();
+        let path = dir.join(uuid::Uuid::new_v4().simple().to_string());
+        self.workspaces
+            .lock()
+            .entry(key.clone())
+            .or_default()
+            .push(WorkspaceSlot {
+                path: path.clone(),
+                busy: true,
+                last_used: Instant::now(),
+            });
+        WorkspaceLease {
+            worker: self,
+            pool: key,
+            path,
+            fresh: true,
         }
     }
 
@@ -355,7 +390,11 @@ impl Worker {
                 }
             })
         };
-        let lease = self.lease_workspace(&job.repo, &job.group, job.trusted);
+        let lease = if job.fresh {
+            self.lease_fresh_workspace(&job.repo, &job.group)
+        } else {
+            self.lease_workspace(&job.repo, &job.group, job.trusted)
+        };
         let ws = lease.path.clone();
         let prep_start = Instant::now();
         let prepared = self.prepare(&job, &ws).await;
@@ -380,6 +419,10 @@ impl Worker {
         };
         hb.abort();
         drop(lease);
+        if job.fresh {
+            let ws = ws.clone();
+            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws));
+        }
         let prefix = format!("{}\0", job.group_id);
         self.runtime_memo
             .lock()

@@ -243,6 +243,9 @@ impl App {
             github_pr,
             trusted,
         )?;
+        if req.fresh {
+            self.db.set_run_fresh(&run_id)?;
+        }
         self.emit(
             "run.created",
             Some(&run_id),

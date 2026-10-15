@@ -1320,3 +1320,52 @@ before gating on it. Not solved, because it is not Pit's to solve:
   contents and is not affected.
 - **No `pit verify --fresh`.** `pit verify` skips Pit's cache, but it reuses the warm workspace
   and with it the tools' own caches. There is no command yet to run in a fresh workspace.
+
+## P25. Leftover files on a persistent runner make broken builds pass
+
+**Pain.** A reused runner keeps what earlier jobs left: generated code, build output, ignored
+directories. A build can then pass on the runner and fail from a clean checkout. cmux found
+"reload builds on reused self-hosted runners can compile source files removed from the requested
+ref" and added `git clean -ffdx`
+([manaflow-ai/cmux#12608](https://github.com/manaflow-ai/cmux/pull/12608)). Teams add cleanup
+steps or actions for this
+([community#51329](https://github.com/orgs/community/discussions/51329),
+[Vendic cleaner](https://github.com/Vendic/github-self-hosted-runner-workspace-cleaner),
+[rtCamp/action-cleanup](https://github.com/rtCamp/action-cleanup),
+[Rob Bos](https://dev.to/rob_bos/cleaning-up-files-changed-by-a-github-action-that-runs-in-a-container-57bc)),
+or delete their defensive cleanup code once they move to throwaway VMs
+([vouchington#554](https://github.com/vouchington/vouchington/issues/554)). Pit keeps ignored
+files on purpose (P8, P24), so it has this failure mode by design.
+
+**Reproduction** (`/tmp/painhunt/p25`): a workspace-cached `setup` runs `gen.sh`, which writes
+`gen/current.js` and `gen/legacy.js` (`gen/` is ignored), and `test` requires both. Commit 2
+stops generating `legacy.js` but the test still requires it: a real bug.
+
+**Before** (research/pain-hunt at P24):
+
+```
+commit 2, pit run      ✓ setup  ✓ test   passed       (stale gen/legacy.js from commit 1)
+commit 2, pit verify   ✓ setup  ✓ test   passed       (verify only skipped the cache)
+commit 2, clean clone  Error: Cannot find module './gen/legacy.js'
+```
+
+**Fix** (research/pain-hunt): `pit run --fresh` runs each group in a new, empty workspace. The
+workspace is registered as busy so workspace cleanup (P19) leaves it alone, then deleted when
+the group ends. The git mirror is still shared, so only the checkout is cold. `pit verify` is
+now `--no-cache --fresh`, the run a brand-new runner would do.
+
+```
+commit 2, pit run      ✓ setup  ✓ test             passed in 305ms
+commit 2, pit verify   ✓ setup  ✗ test exit 1      Error: Cannot find module './gen/legacy.js'
+```
+
+No `~fresh` workspace was left afterwards. Covered by the e2e test
+`fresh_runs_do_not_see_files_earlier_runs_left_behind`.
+
+**Verdict: PARTIAL.** Pit can now prove that a result does not depend on warm state, but only
+when someone runs `pit verify`.
+- **Not automatic.** Normal and post-merge runs stay warm because that is the speed (P8, P21),
+  so a bug hidden by warm state passes them.
+- **No scheduled fresh run.** The fix is a periodic `pit verify` (nightly cron, or before
+  releases), and Pit has no built-in schedule for it yet.
+- **It is slow.** A fresh run is cold. On T3 Code that means the 162s install, at least.

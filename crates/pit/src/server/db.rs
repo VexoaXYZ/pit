@@ -164,6 +164,7 @@ pub struct RunRow {
     pub no_cache: bool,
     pub github_pr: Option<u64>,
     pub trusted: bool,
+    pub fresh: bool,
 }
 
 pub struct WaitingGroup {
@@ -226,6 +227,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_kv_used {
         conn.execute_batch("ALTER TABLE kv ADD COLUMN last_used_at INTEGER")?;
     }
+    let has_fresh: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'fresh'")?
+        .exists([])?;
+    if !has_fresh {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0")?;
+    }
     let has_trusted: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'trusted'")?
         .exists([])?;
@@ -287,6 +294,7 @@ fn run_row(r: &Row) -> rusqlite::Result<RunRow> {
         no_cache: r.get::<_, i64>("no_cache")? != 0,
         github_pr: r.get::<_, Option<i64>>("github_pr")?.map(|v| v as u64),
         trusted: r.get::<_, i64>("trusted")? != 0,
+        fresh: r.get::<_, i64>("fresh")? != 0,
     })
 }
 
@@ -748,6 +756,7 @@ impl Db {
             no_cache: run.no_cache,
             flake_retries: u32::from(run.trigger == "queue"),
             trusted: run.trusted,
+            fresh: run.fresh,
             tasks,
         };
         Ok((Some(job), held))
@@ -1063,6 +1072,13 @@ impl Db {
 
     /// The row key a run may use for an action key: trusted runs only see
     /// trusted results, untrusted runs see both (trusted first).
+    pub fn set_run_fresh(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("UPDATE runs SET fresh = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     pub fn cache_find(&self, key: &str, trusted: bool) -> Result<Option<String>> {
         let c = self.conn.lock();
         let untrusted = format!("u:{key}");

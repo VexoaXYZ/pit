@@ -79,7 +79,11 @@ fn statuses(view: &RunView) -> Vec<(String, Status)> {
 }
 
 async fn run(pit: &Pit, dir: &Path) -> RunView {
-    let sub = pit::cli::submit(&pit.client, dir, vec![], false)
+    run_with(pit, dir, Default::default()).await
+}
+
+async fn run_with(pit: &Pit, dir: &Path, opts: pit::cli::RunOpts) -> RunView {
+    let sub = pit::cli::submit(&pit.client, dir, vec![], opts)
         .await
         .unwrap();
     tokio::time::timeout(
@@ -567,7 +571,7 @@ async fn cancelled_run_is_not_green() {
         repo.path(),
         "git init -q -b main && git add -A && git commit -qm init",
     );
-    let sub = pit::cli::submit(&client, repo.path(), vec![], false)
+    let sub = pit::cli::submit(&client, repo.path(), vec![], Default::default())
         .await
         .unwrap();
     // Wait for planning, then cancel.
@@ -712,7 +716,7 @@ async fn stale_claims_cannot_report() {
         repo.path(),
         "git init -q -b main && git add -A && git commit -qm init",
     );
-    let sub = pit::cli::submit(&client, repo.path(), vec![], false)
+    let sub = pit::cli::submit(&client, repo.path(), vec![], Default::default())
         .await
         .unwrap();
 
@@ -1328,4 +1332,72 @@ async fn trust_needs_a_worker_token_and_a_live_lease() {
         .await
         .unwrap();
     assert_eq!(dead.status(), 409);
+}
+
+/// A file an earlier commit generated (ignored, so it survives in a warm
+/// workspace) hides a bug: the warm run passes, a fresh run fails, and the
+/// fresh workspace is deleted afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_runs_do_not_see_files_earlier_runs_left_behind() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let config = serde_json::json!({ "tasks": {
+        "setup": { "run": "sh gen.sh", "inputs": ["gen.sh"], "cache": "workspace" },
+        "test": { "run": "test -f gen/legacy", "deps": ["setup"], "cache": false },
+    } });
+    write(dir, "pit.config.json", &config.to_string());
+    write(dir, ".gitignore", "gen/\n");
+    write(
+        dir,
+        "gen.sh",
+        "mkdir -p gen && touch gen/current gen/legacy\n",
+    );
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    assert_eq!(run(&pit, dir).await.status, Status::Passed);
+    // The generator stops producing gen/legacy; the test still needs it.
+    write(dir, "gen.sh", "mkdir -p gen && touch gen/current\n");
+    sh(dir, "git commit -qam 'stop generating legacy'");
+    assert_eq!(
+        run(&pit, dir).await.status,
+        Status::Passed,
+        "warm state hides the bug"
+    );
+    let fresh = run_with(
+        &pit,
+        dir,
+        pit::cli::RunOpts {
+            no_cache: true,
+            fresh: true,
+        },
+    )
+    .await;
+    assert_eq!(fresh.status, Status::Failed, "a fresh workspace exposes it");
+    // Deleted in the background once the group finished.
+    let root = pit._data.path().join("worker/workspaces");
+    let left = || {
+        std::fs::read_dir(&root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|repo| {
+                std::fs::read_dir(repo.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .filter(|g| g.file_name().to_string_lossy().ends_with("~fresh"))
+            .flat_map(|g| std::fs::read_dir(g.path()).into_iter().flatten().flatten())
+            .count()
+    };
+    for _ in 0..50 {
+        if left() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(left(), 0, "the fresh workspace was not deleted");
 }

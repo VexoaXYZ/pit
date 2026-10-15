@@ -131,7 +131,9 @@ with no extra setup: ESLint's `--cache`, `tsc --build`/`incremental`, and caches
 miss anyway, because a fresh checkout gives every file a new modification time. Pit's own
 cache does not depend on any of this: it keys on file contents. Check that a tool's cache gives
 the same answer as a clean run before relying on it. `knip --cache` did not, on T3 Code
-(research P24).
+(research P24). The same goes for anything an earlier run left in an ignored directory:
+`pit verify` runs in a new, empty workspace (deleted afterwards), the way a brand-new runner
+would, so a bug hidden by warm state shows up there. It is cold, so it costs a full install.
 
 ### Docker builds
 
@@ -260,8 +262,8 @@ seconds without pushing.
 | --- | --- |
 | `pit up` | Server, worker and dashboard in one process. |
 | `pit server` / `pit worker --server URL` | Run them separately, on as many machines as you like. |
-| `pit run [task…] [-v] [--json] [--no-cache]` | Run on the working tree. Exit code reflects the result. |
-| `pit verify` | `pit run --no-cache`: proves results do not depend on the cache. |
+| `pit run [task…] [-v] [--json] [--no-cache] [--fresh]` | Run on the working tree. Exit code reflects the result. `--fresh` uses a new, empty workspace. |
+| `pit verify` | `pit run --no-cache --fresh`: proves results depend neither on the cache nor on files earlier runs left in a warm workspace. |
 | `pit runs`, `pit logs RUN TASK`, `pit stats` | Inspect. |
 | `pit queue add BRANCH`, `pit queue list` | Merge queue. |
 | `pit init`, `pit import` | Write a config from the repo or from Actions workflows. |
