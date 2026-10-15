@@ -1264,3 +1264,59 @@ That line appeared within a few seconds of the run starting. Covered by the unit
   24 hours; Pit never does.
 - **Untested path.** Clearing the message when a matching worker comes online has no automated
   test.
+
+## P24. Lint and typecheck caches never hit on ephemeral CI runners
+
+**Pain.** ESLint `--cache`, `tsc --build`/`.tsbuildinfo` and knip `--cache` speed up repeat runs
+locally, but each CI job starts from a fresh checkout. The cache files are gone unless an
+`actions/cache` step saves and restores them, and even then they mostly miss. Git does not keep
+modification times, so after a checkout every file looks changed. The workarounds are
+`--cache-strategy content` for ESLint, actions that reset timestamps for `tsc`, and cache keys
+tuned by hand
+([eslint/eslint#16997](https://github.com/eslint/eslint/discussions/16997),
+[tldraw#7633](https://github.com/tldraw/tldraw/issues/7633),
+[renovate#16112](https://github.com/renovatebot/renovate/issues/16112),
+[Attest/typescript-cache-action](https://github.com/Attest/typescript-cache-action),
+[charpeni](https://charpeni.com/blog/speeding-up-eslint-even-on-ci),
+[enochchau](https://enochchau.com/blog/2022/eslint-cache-ci/),
+[branclon](https://branclon.com/blog/speeding-up-linting/)). Knip's CI guide just says to use
+`--cache` ([knip.dev](https://knip.dev/guides/using-knip-in-ci)). There are reports of knip
+taking 3–4 minutes in CI ([knip#1642](https://github.com/webpro-nl/knip/issues/1642)), and no
+published numbers for what the cache saves.
+
+**Reproduction 1, Pit's side** (`/tmp/painhunt/p24`): a task prints the modification times of
+`src/a.txt` and `src/b.txt` and writes into an ignored `.toolcache/`. It runs once, then again
+after a commit that changes only `b.txt`.
+
+```
+run 1  src/a.txt 1792100094   src/b.txt 1792100094
+run 2  src/a.txt 1792100094   src/b.txt 1792100097   .toolcache/stamp still there
+```
+
+Unchanged files keep their modification time and ignored directories survive. So
+metadata-based tool caches work in Pit as they do on a laptop, with no `actions/cache`.
+
+**Reproduction 2, a real tool:** T3 Code's `knip:check` (knip 6.34.0) in Pit's warm T3 Code
+workspace, on the idle box:
+
+| Run | Time | Result |
+| --- | --- | --- |
+| Without `--cache` | 213.8s | clean (exit 0) |
+| `--cache`, empty cache | 36.1s | clean (exit 0) |
+| `--cache`, warm | 7.7s | **2 false positives** (exit 1) |
+| `--cache`, warm, after a one-file edit | 6.5s | **same 2 false positives** |
+| Without `--cache`, after the edit | 202.4s | clean (exit 0) |
+
+The false positives are `apps/server/src/testUtils/gitConfig.setup.ts` reported as an unused
+file and `@shadcn/lint` as an unused devDependency. They repeat on every warm-cache run. I found
+no knip issue about it. Reporting it upstream is left to the user, since it means posting
+publicly.
+
+**Verdict: SOLVED** on Pit's side: tool caches persist with correct modification times and no
+configuration. The README now says so, and warns to check a tool's cache against a clean run
+before gating on it. Not solved, because it is not Pit's to solve:
+- **knip's cache.** Here it was 28× faster but wrong, so the T3 Code bench config still runs
+  knip without it, and knip stays its slowest task (P21). Pit's own task cache keys on file
+  contents and is not affected.
+- **No `pit verify --fresh`.** `pit verify` skips Pit's cache, but it reuses the warm workspace
+  and with it the tools' own caches. There is no command yet to run in a fresh workspace.

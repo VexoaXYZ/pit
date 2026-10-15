@@ -122,6 +122,17 @@ Inputs come from declared dependencies. A package that reads another without lis
 in `package.json` needs that directory added by hand, or a change there will be a cache hit.
 [`bench/t3code.packages.pit.config.ts`](bench/t3code.packages.pit.config.ts) is a full example.
 
+### Tool caches
+
+Workspaces stay warm between runs. Files a commit did not change keep their modification
+times, and ignored directories survive. So the incremental caches of the tools themselves work
+with no extra setup: ESLint's `--cache`, `tsc --build`/`incremental`, and caches under
+`node_modules/.cache`. On ephemeral runners these need an `actions/cache` step, and they often
+miss anyway, because a fresh checkout gives every file a new modification time. Pit's own
+cache does not depend on any of this: it keys on file contents. Check that a tool's cache gives
+the same answer as a clean run before relying on it. `knip --cache` did not, on T3 Code
+(research P24).
+
 ### Docker builds
 
 Workers are long-lived, so their Docker daemon keeps its layer cache and BuildKit
