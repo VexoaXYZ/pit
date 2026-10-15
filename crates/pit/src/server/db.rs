@@ -526,22 +526,36 @@ impl Db {
     pub fn claim_group(&self, worker: &WorkerInfo) -> Result<Option<Job>> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
-        let candidates: Vec<(String, String, String, String)> = {
+        // OS is filtered in SQL; backends (JSON) are checked row by row. The
+        // scan is lazy and unbounded, so incompatible groups at the head of
+        // the queue cannot hide a compatible one behind them.
+        let pick = {
             let mut st = tx.prepare(
                 "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends FROM groups_
                  JOIN runs ON runs.id = groups_.run_id
                  WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
-                 ORDER BY groups_.created_at LIMIT 200",
+                   AND (groups_.os = 'any' OR groups_.os = ?1)
+                 ORDER BY groups_.created_at",
             )?;
-            let rows = st
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            rows
+            let mut rows = st.query_map(params![worker.os], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut pick = None;
+            for row in rows.by_ref() {
+                let row = row?;
+                let needs: Vec<Backend> = serde_json::from_str(&row.3).unwrap_or_default();
+                if needs.iter().all(|b| worker.backends.contains(b)) {
+                    pick = Some(row);
+                    break;
+                }
+            }
+            pick
         };
-        let pick = candidates.into_iter().find(|(_, _, os, backends)| {
-            let needs: Vec<Backend> = serde_json::from_str(backends).unwrap_or_default();
-            (os == "any" || *os == worker.os) && needs.iter().all(|b| worker.backends.contains(b))
-        });
         let Some((gid, run_id, os, _)) = pick else {
             return Ok(None);
         };
@@ -669,22 +683,12 @@ impl Db {
         )?;
         Ok(true)
     }
-    /// Whether `lease` is the current claim of a running group.
-    pub fn lease_ok(&self, group_id: &str, lease: Option<&str>) -> Result<bool> {
-        let Some(lease) = lease else { return Ok(false) };
-        let c = self.conn.lock();
-        let mut st =
-            c.prepare("SELECT 1 FROM groups_ WHERE id = ?1 AND status = 'running' AND lease = ?2")?;
-        let ok = st.exists(params![group_id, lease])?;
-        Ok(ok)
-    }
-
-    pub fn heartbeat_group(&self, id: &str) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE groups_ SET heartbeat_at = ?1 WHERE id = ?2 AND status = 'running'",
-            params![now_ms(), id],
-        )?;
-        Ok(())
+    /// Records a heartbeat if `lease` is still the group's current claim.
+    pub fn heartbeat_group(&self, id: &str, lease: Option<&str>) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE groups_ SET heartbeat_at = ?1 WHERE id = ?2 AND status = 'running' AND lease = ?3",
+            params![now_ms(), id, lease],
+        )? > 0)
     }
 
     /// Requeues running groups whose worker stopped heartbeating.
@@ -996,5 +1000,45 @@ impl Db {
             queue_row,
         )
         .optional()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_finds_a_compatible_group_behind_many_incompatible_ones() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = db
+            .insert_run(&repo.id, "sha", None, None, 0, "test", false, None)
+            .unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        for _ in 0..250 {
+            db.insert_group(&run, "win", "windows", &[], &task).unwrap();
+        }
+        let linux = db.insert_group(&run, "lin", "linux", &[], &task).unwrap();
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+        };
+        let job = db
+            .claim_group(&worker)
+            .unwrap()
+            .expect("linux group was starved");
+        assert_eq!(job.group_id, linux);
+        assert!(db.heartbeat_group(&job.group_id, Some(&job.lease)).unwrap());
+        assert!(!db.heartbeat_group(&job.group_id, Some("stale")).unwrap());
     }
 }

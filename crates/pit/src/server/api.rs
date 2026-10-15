@@ -364,10 +364,9 @@ async fn heartbeat(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
-    if !app.db.lease_ok(&id, lease(&headers))? {
+    if !app.db.heartbeat_group(&id, lease(&headers))? {
         return Err(stale(&id));
     }
-    app.db.heartbeat_group(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
