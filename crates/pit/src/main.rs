@@ -51,6 +51,11 @@ enum Command {
         /// API token holders cannot act as workers and write trusted results.
         #[arg(long, env = "PIT_WORKER_TOKEN", hide_env_values = true)]
         worker_token: Option<String>,
+        /// `KEY=VALUE` secrets, given only to tasks that list them in
+        /// `secrets` and never to fork pull requests. Prefer it to the
+        /// worker's environment, which every task inherits.
+        #[arg(long, env = "PIT_SECRETS_FILE")]
+        secrets_file: Option<PathBuf>,
         /// Webhook told when main or a schedule breaks or is fixed (a Slack
         /// incoming webhook works as is).
         #[arg(long, env = "PIT_NOTIFY_URL")]
@@ -100,6 +105,11 @@ enum Command {
         /// API token holders cannot act as workers and write trusted results.
         #[arg(long, env = "PIT_WORKER_TOKEN", hide_env_values = true)]
         worker_token: Option<String>,
+        /// `KEY=VALUE` secrets, given only to tasks that list them in
+        /// `secrets` and never to fork pull requests. Prefer it to the
+        /// worker's environment, which every task inherits.
+        #[arg(long, env = "PIT_SECRETS_FILE")]
+        secrets_file: Option<PathBuf>,
     },
     /// Run tasks on the working tree, including uncommitted changes.
     Run {
@@ -272,6 +282,7 @@ async fn run(cli: Cli) -> Result<i32> {
             workspace_max_gb,
             worker_token,
             notify_url,
+            secrets_file,
         } => {
             let data = data.unwrap_or_else(default_data);
             cli::up(cli::UpOpts {
@@ -284,6 +295,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 workspace_max_bytes: gb_to_bytes(workspace_max_gb),
                 worker_token,
                 notify_url,
+                secrets_file,
             })
             .await?;
             Ok(0)
@@ -317,6 +329,7 @@ async fn run(cli: Cli) -> Result<i32> {
             parallelism,
             workspace_max_gb,
             worker_token,
+            secrets_file,
         } => {
             pit::worker::run(pit::worker::WorkerOpts {
                 server: conn.server,
@@ -327,6 +340,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 parallelism: parallelism.unwrap_or_else(default_parallelism),
                 workspace_max_bytes: gb_to_bytes(workspace_max_gb),
                 worker_token,
+                secrets_file,
             })
             .await?;
             Ok(0)

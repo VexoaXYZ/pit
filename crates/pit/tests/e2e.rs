@@ -28,6 +28,7 @@ async fn start() -> Pit {
         parallelism: 4,
         workspace_max_bytes: 0,
         worker_token: None,
+        secrets_file: None,
     }));
     let client = Client::new(&base, None).unwrap();
     for _ in 0..100 {
@@ -354,6 +355,7 @@ async fn github_webhook_runs_commit_and_reports_statuses() {
         parallelism: 2,
         workspace_max_bytes: 0,
         worker_token: None,
+        secrets_file: None,
     }));
 
     let repo = tempfile::tempdir().unwrap();
@@ -1641,4 +1643,112 @@ async fn concurrent_identical_tasks_run_once() {
         "a waiter took over after the first build failed"
     );
     assert!(view.status.is_done());
+}
+
+/// A pull request from a fork never runs on its own. A maintainer's
+/// `pit:run` label runs that commit, in a throwaway workspace, without the
+/// secrets or worker variables its config asks for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fork_pull_requests_run_on_a_label_without_secrets() {
+    use hmac::Mac;
+    std::env::set_var("FORK_E2E_WORKER_SECRET", "hunter2-very-secret");
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    // Statuses go to an address nobody listens on; reporting just fails.
+    let github =
+        pit::server::github::GitHub::with_token("http://127.0.0.1:9", "t", Some("s3cret".into()))
+            .unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("fork".into()),
+        data_dir: data.path().join("worker"),
+        slots: 2,
+        parallelism: 2,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let repo = tempfile::tempdir().unwrap();
+    // The fork's config asks for the worker's secret and tries to print it.
+    let config = serde_json::json!({ "tasks": { "steal": {
+        "run": "test -z \"$FORK_E2E_WORKER_SECRET\"",
+        "secrets": ["FORK_E2E_WORKER_SECRET"],
+        "env": ["FORK_E2E_WORKER_SECRET"],
+        "cache": false,
+    } } });
+    write(repo.path(), "pit.config.json", &config.to_string());
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm fork",
+    );
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    let send = |action: &str, label: Option<&str>| {
+        let mut payload = serde_json::json!({
+            "action": action,
+            "repository": { "full_name": "acme/widgets", "clone_url": repo.path().to_string_lossy(), "default_branch": "main" },
+            "pull_request": {
+                "number": 7,
+                "head": { "sha": sha, "repo": { "full_name": "mallory/widgets" } },
+                "base": { "ref": "main" },
+            },
+        });
+        if let Some(l) = label {
+            payload["label"] = serde_json::json!({ "name": l });
+        }
+        let body = payload.to_string();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+        mac.update(body.as_bytes());
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        reqwest::Client::new()
+            .post(format!("{base}/webhooks/github"))
+            .header("x-github-event", "pull_request")
+            .header("x-hub-signature-256", sig)
+            .body(body)
+            .send()
+    };
+    let opened: serde_json::Value = send("opened", None).await.unwrap().json().await.unwrap();
+    assert!(
+        opened["ignored"].as_str().unwrap().contains("pit:run"),
+        "{opened}"
+    );
+    let labeled: serde_json::Value = send("labeled", Some("pit:run"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = labeled["run"]
+        .as_str()
+        .expect("the label starts a run")
+        .to_string();
+    let client = Client::new(&base, None).unwrap();
+    let view = tokio::time::timeout(
+        Duration::from_secs(180),
+        pit::cli::wait(&client, &run_id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Fork code only runs in a container; without Docker it does not run.
+    let task = &view.groups[0].tasks[0];
+    if view.status == Status::Error {
+        let msg = task.message.as_deref().unwrap_or_default();
+        assert!(msg.contains("docker"), "{view:?}");
+    } else {
+        assert_eq!(
+            view.status,
+            Status::Passed,
+            "the fork saw the secret: {view:?}"
+        );
+    }
 }

@@ -1648,3 +1648,71 @@ afterwards: one build for three shards, and two locked runs one after the other,
 9. **The single-flight table grew forever.** Entries are now removed when their task finishes.
 10. **Stale "waiting:" messages stayed on running groups.** They are now cleared when the group
     is claimed.
+
+## P31. Fork pull requests: no CI, or CI that leaks secrets
+
+**Pain.** CI for outside contributors is a trade-off on GitHub.
+- `pull_request` from a fork runs without secrets, so anything that needs one fails, and
+  first-time contributors wait for "Approve and run".
+- `pull_request_target` has secrets but runs in the base repo's context. Checking out the fork's
+  code there is a "pwn request": remote code execution with every secret in the repo. The
+  AsyncAPI incident (37 malicious PRs, undetected for 58 days) is one example.
+- The approval gate does not even apply to `pull_request_target`.
+
+Sources: [GitHub docs](https://docs.github.com/en/enterprise-server@3.12/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/approving-workflow-runs-from-public-forks),
+[Orca](https://orca.security/resources/blog/pull-request-nightmare-part-2-exploits/),
+[appsecbrief](https://appsecbrief.com/articles/github-actions-pwn-request-pull-request-target-secrets-exfiltration-2026/),
+[Code With Karani](https://www.codewithkarani.com/blog/github-actions-pull-request-target-fork-checkout-pwn-request),
+[GitGuardian](https://blog.gitguardian.com/github-actions-security-cheat-sheet/),
+[Aikido](https://www.aikido.dev/blog/checklist-github-actions),
+[dev.to](https://dev.to/bdougieyo/running-github-actions-on-forks-16bd).
+
+**Before** (research/pain-hunt at P30):
+- **Forks got no CI at all.** Pit ignored fork pull requests. The only path was the `pit:merge`
+  label, which runs the fork as a trusted queue run.
+- **A worse finding.** Tasks inherit the worker's whole environment except `PIT_*`, so the
+  `secrets` field only *masked* values; it never gated them. In `/tmp/painhunt/p31` a task that
+  did not declare anything read the token the local server had in its environment, and printed
+  it reversed to get past masking:
+
+```
+leak │ token starts with tok_live
+leak │ a4b5c6d7e8f9_evil_kot
+```
+
+**Fix** (research/pain-hunt):
+- **`pit worker --secrets-file FILE`** (`KEY=VALUE`, `PIT_SECRETS_FILE`). Those values are
+  never inherited and reach only tasks that list them in `secrets`.
+- **`pit:run` label on a fork PR** runs that one commit as an untrusted run. A later push needs
+  the label again, so code cannot be swapped in after a review. The run:
+  - gets no `secrets` and no `env` values, and only a minimal inherited environment (`PATH`,
+    `HOME`, locale, temp dirs);
+  - uses a fresh workspace (P25);
+  - always uses the `docker` backend, which sees only its workspace, so it cannot read the
+    secrets file or other workspaces. A worker without Docker refuses it.
+- **An opened fork PR** is ignored with a message saying to add `pit:run`.
+
+Live, after moving the local server's token into a secrets file:
+
+```
+undeclared   leak │ token starts with            (nothing)
+declared     leak │ token starts with tok_live    (the task asked for it in `secrets`)
+```
+
+The declared case still shows that a task holding a secret can print it in a form masking does
+not catch. That is P13's limit, unchanged.
+
+Covered by the unit tests `hidden_and_minimal_environments` and `parses_dotenv_style_lines`, and
+the e2e test `fork_pull_requests_run_on_a_label_without_secrets`. That test sends signed
+webhooks: an opened fork PR is ignored, `pit:run` starts a run, and that run cannot see a worker
+secret its config asks for, as both `secrets` and `env`.
+
+**Verdict: PARTIAL.**
+- **Solved for forks.** CI runs on a maintainer's per-commit approval, sealed off from secrets
+  and the worker's files.
+- **Not solved for operators.** A worker that keeps secrets in its own environment still
+  exposes them to every task, and the default `pit up` does exactly that if you export a token
+  before starting it. The secrets file is the fix, and it is opt-in.
+- **Same-user reads.** On the `host` backend a same-repo task runs as the worker's user and can
+  read the secrets file directly. That is the same exposure as GitHub's same-repo PRs, which
+  get secrets.

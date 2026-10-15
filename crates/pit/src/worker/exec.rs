@@ -79,11 +79,61 @@ pub struct TaskCommand {
 }
 
 /// Builds the command for a task on the chosen backend.
+/// Which of the worker's own environment a task inherits.
+#[derive(Clone, Default)]
+pub struct EnvPolicy {
+    /// Names never inherited (the worker's secrets file).
+    pub hide: Vec<String>,
+    /// Inherit only `MINIMAL_ENV`, for code nobody trusts (fork PRs).
+    pub minimal: bool,
+}
+
+/// What a task gets under `EnvPolicy::minimal`: enough to find tools and a
+/// temp dir, nothing an operator would put a credential in.
+const MINIMAL_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "OS",
+];
+
 pub fn command(
     task: &TaskDef,
     backend: Backend,
     workdir: &Path,
     env: &[(String, String)],
+) -> TaskCommand {
+    command_with(task, backend, workdir, env, &EnvPolicy::default())
+}
+
+pub fn command_with(
+    task: &TaskDef,
+    backend: Backend,
+    workdir: &Path,
+    env: &[(String, String)],
+    policy: &EnvPolicy,
 ) -> TaskCommand {
     let network = task.network.unwrap_or(true);
     let mut container = None;
@@ -145,13 +195,22 @@ pub fn command(
         }
     };
     let mut cmd = Command::new(program);
+    if policy.minimal {
+        cmd.env_clear();
+        for (key, value) in std::env::vars_os() {
+            let upper = key.to_string_lossy().to_ascii_uppercase();
+            if MINIMAL_ENV.contains(&upper.as_str()) {
+                cmd.env(key, value);
+            }
+        }
+    }
     // Pit's own settings (server URL, API token, GitHub credentials) are not
     // the task's business: a task holding PIT_TOKEN could write to the cache.
+    // Nor are secrets the task did not ask for.
     for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("PIT_")
+        let name = key.to_string_lossy();
+        if name.to_ascii_uppercase().starts_with("PIT_")
+            || policy.hide.iter().any(|h| h.eq_ignore_ascii_case(&name))
         {
             cmd.env_remove(key);
         }
@@ -368,6 +427,35 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(false);
         std::mem::forget(tx);
         rx
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hidden_and_minimal_environments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("PIT_TEST_UNRELATED_SECRET_X", "s1");
+        std::env::set_var("SOME_TOKEN_FOR_TEST_X", "s2");
+        let task = TaskDef {
+            run: "echo \"[$SOME_TOKEN_FOR_TEST_X][$GIVEN][${PATH:+path}]\"".into(),
+            ..Default::default()
+        };
+        let given = [("GIVEN".to_string(), "g".to_string())];
+        let out = |policy: EnvPolicy| {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let cmd = command_with(&task, Backend::Host, dir.path(), &given, &policy);
+            async move { run(cmd, Limits::default(), tx, never()).await.unwrap().log }
+        };
+        assert!(out(EnvPolicy::default()).await.contains("[s2][g][path]"));
+        let hidden = EnvPolicy {
+            hide: vec!["some_token_for_test_x".into()],
+            minimal: false,
+        };
+        assert!(out(hidden).await.contains("[][g][path]"));
+        let minimal = EnvPolicy {
+            hide: vec![],
+            minimal: true,
+        };
+        assert!(out(minimal).await.contains("[][g][path]"));
     }
 
     #[cfg(unix)]

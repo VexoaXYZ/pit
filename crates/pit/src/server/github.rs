@@ -24,6 +24,9 @@ use super::App;
 use crate::model::*;
 
 pub const MERGE_LABEL: &str = "pit:merge";
+/// A maintainer's go-ahead to run a pull request's current commit, for
+/// pull requests from forks, which never run on their own.
+pub const RUN_LABEL: &str = "pit:run";
 
 enum Auth {
     App {
@@ -451,6 +454,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         git_ref,
                         no_cache: false,
                         fresh: false,
+                        no_secrets: false,
                     },
                     None,
                 )
@@ -481,6 +485,32 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 .await?;
                 return Ok(serde_json::json!({ "queued": entry.id }));
             }
+            let fork = pr["head"]["repo"]["full_name"].as_str() != Some(r.full_name.as_str());
+            // The label approves the commit it was added on. A fork's later
+            // pushes need it again, so nobody can swap in new code after a
+            // maintainer looked.
+            if action == "labeled" && payload["label"]["name"].as_str() == Some(RUN_LABEL) {
+                let id = app
+                    .create_run(
+                        CreateRun {
+                            repo: repo.name,
+                            url: None,
+                            sha,
+                            overlay: None,
+                            tasks: vec![],
+                            trigger: Some("pr".into()),
+                            git_ref: Some(format!("pull/{number}")),
+                            no_cache: false,
+                            // Fork code gets a throwaway workspace and no secrets.
+                            fresh: fork,
+                            no_secrets: fork,
+                            trusted: false,
+                        },
+                        Some(number),
+                    )
+                    .await?;
+                return Ok(serde_json::json!({ "run": id }));
+            }
             let unlabeled =
                 action == "unlabeled" && payload["label"]["name"].as_str() == Some(MERGE_LABEL);
             if unlabeled || action == "closed" {
@@ -497,10 +527,13 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 return Ok(serde_json::json!({ "ignored": action }));
             }
             // A fork's code (including its pit.config.ts) is untrusted: Pit does
-            // not run it on its own. A maintainer can still queue it with the
-            // merge label. A deleted fork shows up as a missing head repo.
-            if pr["head"]["repo"]["full_name"].as_str() != Some(r.full_name.as_str()) {
-                return Ok(serde_json::json!({ "ignored": "pull request from a fork" }));
+            // not run it on its own. A maintainer runs a commit with the run
+            // label, or queues it with the merge label. A deleted fork shows up
+            // as a missing head repo.
+            if fork {
+                return Ok(serde_json::json!({
+                    "ignored": format!("pull request from a fork: add the {RUN_LABEL} label to run this commit")
+                }));
             }
             let id = app
                 .create_run(
@@ -514,6 +547,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         git_ref: Some(format!("pull/{number}")),
                         no_cache: false,
                         fresh: false,
+                        no_secrets: false,
                         trusted: false,
                     },
                     Some(number),
@@ -540,6 +574,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         git_ref: None,
                         no_cache: false,
                         fresh: false,
+                        no_secrets: false,
                         trusted: false,
                     },
                     None,

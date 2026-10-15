@@ -25,6 +25,7 @@ pub struct UpOpts {
     pub workspace_max_bytes: u64,
     pub worker_token: Option<String>,
     pub notify_url: Option<String>,
+    pub secrets_file: Option<PathBuf>,
 }
 
 /// Server and worker in one process.
@@ -39,6 +40,7 @@ pub async fn up(opts: UpOpts) -> Result<()> {
         workspace_max_bytes,
         worker_token,
         notify_url,
+        secrets_file,
     } = opts;
     // The built-in worker always proves itself; other workers need the same
     // PIT_WORKER_TOKEN to join.
@@ -69,6 +71,7 @@ pub async fn up(opts: UpOpts) -> Result<()> {
         parallelism,
         workspace_max_bytes,
         worker_token: Some(worker_token),
+        secrets_file,
     }));
     tokio::select! {
         r = server => r??,
@@ -114,6 +117,7 @@ pub async fn submit(
                 git_ref: snapshot.branch.clone(),
                 no_cache: opts.no_cache,
                 fresh: opts.fresh,
+                no_secrets: false,
                 trusted: false,
             },
         )

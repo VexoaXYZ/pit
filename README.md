@@ -87,7 +87,7 @@ export default {
 | `outputs` | Files the task produces. Uploaded on success and restored on a cache hit. |
 | `env` | Variables passed through and hashed into the cache key. |
 | `runtime` | Commands whose output is part of the cache key (`["node --version"]`), so a toolchain upgrade never reuses old results. |
-| `secrets` | Variables passed through as secrets: masked in logs (plain, base64, double base64), not in the cache key. |
+| `secrets` | Secrets the task needs, by name: from the worker's `--secrets-file` (or its environment), masked in logs (plain, base64, double base64), not in the cache key. Never given to fork pull requests. |
 | `cache` | `"remote"` (default, shared by all workers), `"workspace"` (per warm workspace, for installs), or `false`. |
 | `backend` | `"host"` (default), `"sandbox"` (Linux PID, IPC, UTS and optional network namespaces), `"docker"`. |
 | `image` | Container image; implies `backend: "docker"`. |
@@ -226,6 +226,20 @@ Point a GitHub App (or a token) and a webhook at the server:
 Webhook URL: `<server>/webhooks/github`, events `push`, `pull_request`, `check_run`.
 Pushes and pull requests start runs; "Re-run" on a check reruns; adding the `pit:merge`
 label to a pull request queues it.
+
+**Forks.** A pull request from a fork never runs on its own: its code, `pit.config.ts`
+included, is someone else's. A maintainer who has read it adds the `pit:run` label, which
+runs that one commit. A later push needs the label again, so nobody can swap code in after a
+review. The run gets a throwaway workspace, no `secrets` and no `env` values, only a minimal
+inherited environment (`PATH`, `HOME`, locale, temp dirs), an untrusted cache scope, and
+the `docker` backend whatever its config says, so it cannot read the worker's files. A worker
+without Docker refuses it.
+
+**Secrets on workers.** Every task inherits the worker's environment (minus `PIT_*`), so a
+token exported there can be read by any task, declared or not. Put secrets in
+`pit worker --secrets-file FILE` (`KEY=VALUE` lines, `PIT_SECRETS_FILE`) instead: those values
+reach only tasks that list them in `secrets`. On the `host` backend a task still runs as the
+worker's user and could read the file itself, so run untrusted code in `docker`.
 
 ## Notifications
 

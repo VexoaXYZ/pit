@@ -39,6 +39,10 @@ pub struct WorkerOpts {
     pub workspace_max_bytes: u64,
     /// Sent when claiming jobs, if the server requires one.
     pub worker_token: Option<String>,
+    /// `KEY=VALUE` lines. These values are given only to tasks that list the
+    /// key in `secrets`, and never to fork PR runs; unlike variables in the
+    /// worker's own environment, no other task can read them.
+    pub secrets_file: Option<PathBuf>,
 }
 
 pub struct Worker {
@@ -50,6 +54,8 @@ pub struct Worker {
     mirror_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     workspaces: Mutex<HashMap<String, Vec<WorkspaceSlot>>>,
     workspace_max_bytes: u64,
+    /// See `WorkerOpts::secrets_file`.
+    secrets: HashMap<String, String>,
     /// `runtime` command outputs, per job (`group id \0 command`).
     runtime_memo: Mutex<HashMap<String, String>>,
 }
@@ -96,6 +102,12 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
     )
     .await?;
     worker.workspace_max_bytes = opts.workspace_max_bytes;
+    if let Some(path) = &opts.secrets_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading secrets file {}", path.display()))?;
+        worker.secrets = parse_secrets(&text);
+        tracing::info!("{} secret(s) from {}", worker.secrets.len(), path.display());
+    }
     worker.client = worker.client.with_worker_token(opts.worker_token.clone());
     let worker = Arc::new(worker);
     tracing::info!(
@@ -169,6 +181,7 @@ impl Worker {
             mirror_locks: Default::default(),
             workspaces: Default::default(),
             workspace_max_bytes: 0,
+            secrets: Default::default(),
             runtime_memo: Default::default(),
         })
     }
@@ -773,7 +786,32 @@ impl Worker {
             files::clear_outputs(ws, &def.outputs)?;
         }
 
-        let backend = def.backend.unwrap_or_default();
+        // Fork code on the host or in the sandbox would share the worker's
+        // filesystem, and with it the secrets file, other workspaces and the
+        // worker's own /proc. It runs in a container that sees only its
+        // workspace, or not at all.
+        let backend = if job.no_secrets {
+            if !self.info.backends.contains(&Backend::Docker) {
+                let r = finish(
+                    Status::Error,
+                    None,
+                    0,
+                    None,
+                    Some(
+                        "pull request from a fork: it only runs in the docker backend, \
+                         which this worker does not have"
+                            .into(),
+                    ),
+                );
+                client
+                    .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
+                    .await?;
+                return Ok((Status::Error, Some(key)));
+            }
+            Backend::Docker
+        } else {
+            def.backend.unwrap_or_default()
+        };
         let mut env: Vec<(String, String)> = vec![
             ("CI".into(), "true".into()),
             ("PIT".into(), "1".into()),
@@ -794,17 +832,41 @@ impl Worker {
             .iter()
             .map(|k| (k, false))
             .chain(def.secrets.iter().map(|k| (k, true)));
-        for (k, secret) in wanted {
+        // A fork's config could ask for anything: it gets nothing.
+        for (k, secret) in wanted.filter(|_| !job.no_secrets) {
             if k.to_ascii_uppercase().starts_with("PIT_") {
                 continue;
             }
-            if let Ok(v) = std::env::var(k) {
+            let value = if secret {
+                self.secrets
+                    .get(k)
+                    .cloned()
+                    .or_else(|| std::env::var(k).ok())
+            } else {
+                std::env::var(k).ok()
+            };
+            if let Some(v) = value {
                 if secret {
                     secret_values.push(v.clone());
                 }
                 env.push((k.clone(), v));
             }
         }
+        if job.no_secrets && !(def.env.is_empty() && def.secrets.is_empty()) {
+            let _ = client
+                .post_empty(
+                    &format!("/api/tasks/{}/log", task.id),
+                    &LogChunk {
+                        text: "[pit: pull request from a fork; `env` and `secrets` are withheld]\n"
+                            .into(),
+                    },
+                )
+                .await;
+        }
+        let policy = exec::EnvPolicy {
+            hide: self.secrets.keys().cloned().collect(),
+            minimal: job.no_secrets,
+        };
         // Secrets never reach the server's logs, live or stored.
         let masker = Arc::new(mask::Masker::new(secret_values));
         // The task's own retries, plus the job's automatic ones (merge queue).
@@ -822,7 +884,7 @@ impl Worker {
                 rx,
                 masker.clone(),
             ));
-            let cmd = exec::command(def, backend, ws, &env);
+            let cmd = exec::command_with(def, backend, ws, &env, &policy);
             let result = exec::run(cmd, limits(def), tx, cancel.clone()).await;
             let _ = forwarder.await;
             let outcome = result?;
@@ -1068,6 +1130,24 @@ impl Worker {
     }
 }
 
+/// `KEY=VALUE` lines; blank lines and `#` comments are skipped, and a value
+/// may be wrapped in matching quotes.
+fn parse_secrets(text: &str) -> HashMap<String, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| {
+            let v = v.trim();
+            let unquoted = ['"', '\'']
+                .iter()
+                .find_map(|q| v.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
+                .unwrap_or(v);
+            (k.trim().to_string(), unquoted.to_string())
+        })
+        .collect()
+}
+
 /// A task's time limits: its own settings, or an hour in total and fifteen
 /// minutes without output, so a hung task never holds a worker forever.
 /// `0` turns a limit off.
@@ -1121,5 +1201,21 @@ async fn forward_logs(
             let text = masker.mask(&std::mem::take(&mut buf));
             let _ = client.post_empty(&path, &LogChunk { text }).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod secrets_file_tests {
+    use super::parse_secrets;
+
+    #[test]
+    fn parses_dotenv_style_lines() {
+        let s = parse_secrets(
+            "# deploy\nDEPLOY_TOKEN=abc=123\n\n NPM_TOKEN = \"q v\" \nBAD LINE\nX='y'\n",
+        );
+        assert_eq!(s["DEPLOY_TOKEN"], "abc=123");
+        assert_eq!(s["NPM_TOKEN"], "q v");
+        assert_eq!(s["X"], "y");
+        assert_eq!(s.len(), 3);
     }
 }

@@ -212,6 +212,11 @@ pub struct CreateRun {
     /// left by earlier runs (ignored files, tool caches) can affect it.
     #[serde(default)]
     pub fresh: bool,
+    /// Code from outside the repo (a fork PR): no secrets, no `env` values
+    /// from the worker, and only a minimal inherited environment. Only the
+    /// server sets it.
+    #[serde(skip)]
+    pub no_secrets: bool,
     /// Code that is, or is about to be, on a protected branch: main pushes,
     /// merge queue and post-merge runs. Only the server sets it; runs created
     /// through the API (`pit run`, scripts) are never trusted. See
@@ -259,6 +264,9 @@ pub struct Job {
     /// See `CreateRun::fresh`.
     #[serde(default)]
     pub fresh: bool,
+    /// See `CreateRun::no_secrets`.
+    #[serde(default)]
+    pub no_secrets: bool,
     pub tasks: Vec<JobTask>,
 }
 

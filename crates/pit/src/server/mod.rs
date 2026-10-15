@@ -261,6 +261,9 @@ impl App {
         if req.fresh {
             self.db.set_run_fresh(&run_id)?;
         }
+        if req.no_secrets {
+            self.db.set_run_no_secrets(&run_id)?;
+        }
         self.emit(
             "run.created",
             Some(&run_id),

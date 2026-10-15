@@ -508,6 +508,7 @@ impl Queue<'_> {
                     git_ref: Some(self.target.to_string()),
                     no_cache: false,
                     fresh: false,
+                    no_secrets: false,
                     trusted: super::trusted_branch(
                         self.target,
                         default_branch(&self.mirror).await.ok().as_deref(),
@@ -644,6 +645,7 @@ impl Queue<'_> {
                         git_ref: Some(format!("queue/{}", e.source)),
                         no_cache: false,
                         fresh: false,
+                        no_secrets: false,
                         // Queueing is the decision to land it on the target.
                         trusted: super::trusted_branch(
                             self.target,
