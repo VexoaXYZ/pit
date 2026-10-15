@@ -556,7 +556,51 @@ impl Db {
         Ok(gid)
     }
 
-    /// Atomically claims the oldest queued group this worker can run.
+    /// Inserts a group the server already answered from the cache: finished,
+    /// with every task's result, and never offered to a worker.
+    pub fn insert_cached_group(
+        &self,
+        run_id: &str,
+        name: &str,
+        os: &str,
+        tasks: &[(String, TaskDef)],
+        results: &[TaskResult],
+    ) -> Result<String> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let gid = new_id("grp");
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO groups_ (id, run_id, name, os, backends, status, worker, prepare_ms, message, created_at, started_at, finished_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', 'passed', 'cache', 0, 'every task came from the cache; no worker needed', ?5, ?5, ?5)",
+            params![gid, run_id, name, os, now],
+        )?;
+        for (pos, ((tname, def), r)) in tasks.iter().zip(results).enumerate() {
+            tx.execute(
+                "INSERT INTO tasks (id, group_id, run_id, name, position, def, status, action_key, exit_code, duration_ms,
+                   log_digest, message, started_at, finished_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                params![
+                    new_id("task"),
+                    gid,
+                    run_id,
+                    tname,
+                    pos as i64,
+                    serde_json::to_string(def)?,
+                    r.status.as_str(),
+                    r.action_key,
+                    r.exit_code,
+                    r.duration_ms as i64,
+                    r.log_digest,
+                    r.message,
+                    now
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(gid)
+    }
+
     /// Claims the oldest queued group this worker can run. Returns the job,
     /// and whether some group was held back for another worker (see below),
     /// so the caller knows to look again shortly.

@@ -148,6 +148,37 @@ fn secs(ms: u64) -> String {
     }
 }
 
+/// One line of `pit run` output for a finished task.
+fn task_line(
+    style: &Style,
+    status: Status,
+    name: &str,
+    ms: u64,
+    exit_code: Option<i64>,
+    message: Option<&str>,
+) -> String {
+    let detail = match status {
+        Status::Cached => style.paint("36", "cached"),
+        Status::Skipped => style.paint("33", "skipped"),
+        Status::Failed => style.paint(
+            "31",
+            &format!(
+                "{} exit {}",
+                secs(ms),
+                exit_code.map(|c| c.to_string()).unwrap_or("?".into())
+            ),
+        ),
+        _ => secs(ms),
+    };
+    // Why it ran (cache miss reason) or that it was flaky; failures print
+    // their message below.
+    let why = message
+        .filter(|m| m.starts_with("ran because") || m.starts_with("flaky:"))
+        .map(|m| format!("  {}", style.dim(m)))
+        .unwrap_or_default();
+    format!("    {} {name:<24} {detail}{why}", style.status(status))
+}
+
 pub async fn run(
     client: &Client,
     dir: &Path,
@@ -188,6 +219,28 @@ pub async fn run(
                 if let Ok(v) = serde_json::from_value::<RunView>(e.data.clone()) {
                     for g in v.groups {
                         groups.insert(g.id.clone(), (g.name.clone(), g.os.clone()));
+                        // Groups finished before streaming began (answered by
+                        // the cache) get no live events; print them now.
+                        if !json && g.status.is_done() {
+                            let who = g.worker.as_deref().unwrap_or("?");
+                            let _ = writeln!(
+                                stderr,
+                                "  {} {}",
+                                style.paint("1", &g.name),
+                                style.dim(&format!("on {who}"))
+                            );
+                            for t in &g.tasks {
+                                let line = task_line(
+                                    &style,
+                                    t.status,
+                                    &t.name,
+                                    t.duration_ms.unwrap_or(0),
+                                    t.exit_code.map(i64::from),
+                                    t.message.as_deref(),
+                                );
+                                let _ = writeln!(stderr, "{line}");
+                            }
+                        }
                         for t in g.tasks {
                             names.insert(t.id, (g.name.clone(), t.name));
                         }
@@ -229,36 +282,15 @@ pub async fn run(
             "task.finished" if !json => {
                 let status: Status =
                     serde_json::from_value(e.data["status"].clone()).unwrap_or(Status::Error);
-                let name = e.data["name"].as_str().unwrap_or_default();
-                let ms = e.data["durationMs"].as_u64().unwrap_or(0);
-                let detail = match status {
-                    Status::Cached => style.paint("36", "cached"),
-                    Status::Skipped => style.paint("33", "skipped"),
-                    Status::Failed => style.paint(
-                        "31",
-                        &format!(
-                            "{} exit {}",
-                            secs(ms),
-                            e.data["exitCode"]
-                                .as_i64()
-                                .map(|c| c.to_string())
-                                .unwrap_or("?".into())
-                        ),
-                    ),
-                    _ => secs(ms),
-                };
-                // Why it ran (cache miss reason) or that it was flaky; failures print
-                // their message below.
-                let why = e.data["message"]
-                    .as_str()
-                    .filter(|m| m.starts_with("ran because") || m.starts_with("flaky:"))
-                    .map(|m| format!("  {}", style.dim(m)))
-                    .unwrap_or_default();
-                let _ = writeln!(
-                    stderr,
-                    "    {} {name:<24} {detail}{why}",
-                    style.status(status)
+                let line = task_line(
+                    &style,
+                    status,
+                    e.data["name"].as_str().unwrap_or_default(),
+                    e.data["durationMs"].as_u64().unwrap_or(0),
+                    e.data["exitCode"].as_i64(),
+                    e.data["message"].as_str(),
                 );
+                let _ = writeln!(stderr, "{line}");
             }
             _ => {}
         }

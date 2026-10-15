@@ -1058,3 +1058,73 @@ async fn newer_pushes_supersede_and_stop_older_runs() {
     // Pushes to main are never superseded.
     assert!(!pit::server::App::supersedes_for_test("push", "main"));
 }
+
+/// A run whose every task is cached does not wait for a worker: with every
+/// slot busy, it still finishes at once, answered by the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fully_cached_runs_do_not_wait_for_busy_workers() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let app = tmp.path().join("app");
+    write(
+        &app,
+        "pit.config.json",
+        r#"{"tasks":{"build":{"run":"mkdir -p dist && cp src/a.txt dist/","inputs":["src/**"],"outputs":["dist/**"]},"test":{"run":"test -f dist/a.txt","deps":["build"],"inputs":["src/**"]}}}"#,
+    );
+    write(&app, "src/a.txt", "a\n");
+    write(&app, ".gitignore", "dist\n");
+    sh(
+        &app,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    assert_eq!(run(&pit, &app).await.status, Status::Passed);
+
+    // Occupy all four worker slots.
+    let busy = tmp.path().join("busy");
+    write(
+        &busy,
+        "pit.config.json",
+        r#"{"tasks":{"long":{"run":"sleep 30","cache":false}}}"#,
+    );
+    sh(
+        &busy,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(&busy, "git rev-parse HEAD").trim().to_string();
+    let url = busy.to_string_lossy().to_string();
+    let mut long = vec![];
+    for _ in 0..4 {
+        let c: serde_json::Value = pit
+            .client
+            .post(
+                "/api/runs",
+                &serde_json::json!({ "repo": "busy", "url": url, "sha": sha }),
+            )
+            .await
+            .unwrap();
+        long.push(c["id"].as_str().unwrap().to_string());
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let started = std::time::Instant::now();
+    let cached = run(&pit, &app).await;
+    assert_eq!(cached.status, Status::Passed);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "waited {:?} for a busy worker",
+        started.elapsed()
+    );
+    assert_eq!(cached.groups[0].worker.as_deref(), Some("cache"));
+    assert!(cached.groups[0]
+        .tasks
+        .iter()
+        .all(|t| t.status == Status::Cached));
+
+    for id in long {
+        let _: serde_json::Value = pit
+            .client
+            .post(&format!("/api/runs/{id}/cancel"), &())
+            .await
+            .unwrap();
+    }
+}

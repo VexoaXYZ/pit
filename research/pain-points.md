@@ -571,3 +571,55 @@ anyone after the hold).
 **Verdict: SOLVED.** Trade-off: affinity concentrates a repo's runs on one worker; when that
 worker is busy it stops polling and other workers take the group after the 2 s hold. Caches
 are still per worker, not shared.
+
+## P12. Fully cached work still waits in line for a runner
+
+**Pain.** When CI is busy, jobs queue for a runner: GitHub caps concurrent jobs per account
+(20 on Free), and teams report runs pending for hours behind other work in the same group
+([StarSling](https://starsling.dev/best-practices/github-actions/cut-queue-time),
+[devopsil](https://devopsil.com/articles/2026-03-30-github-actions-workflow-stuck-queued-fix),
+[community#12835](https://github.com/orgs/community/discussions/12835),
+[#163115](https://github.com/orgs/community/discussions/163115),
+[#147604](https://github.com/orgs/community/discussions/147604),
+[#184661](https://github.com/orgs/community/discussions/184661),
+[GitHub changelog](https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/),
+[ZeroOne](https://laplusda.com/en/posts/github-actions-concurrency-pending-cancelled/),
+[ni18](https://blog.ni18.in/waiting-for-a-runner-to-pick-up-this-job/)). With many agents
+running CI at once, the queue is the bottleneck, even for work that is already done.
+
+**Reproduction** (`/tmp/painhunt/p12`): warm the cache for a repo (`build` and `test`, both
+cacheable), then fill all four worker slots (two workers, two slots each) with 60 s jobs from
+another repo, then rerun the cached repo.
+
+**Before** (research/pain-hunt at P11): every task was a cache hit, but the group still needed a
+worker slot to report that, so it waited behind the long jobs.
+
+```
+passed in 58.2s · 0 ran, 2 cached
+```
+
+**Fix** (research/pain-hunt): at planning time the server computes each task's action key
+itself, from its mirror's tree (`git ls-tree`, the same blob ids a worker's index has) plus the
+overlay. If every task in a group is a cache hit, the group is finished on the spot ("on
+cache") and never offered to a worker. Workspace-cached setup tasks are "not needed" when
+everything depending on them hit. Groups with uncacheable tasks, a leaf setup task, or
+`--no-cache` go to a worker as before. Resolved groups emit the usual events, so the CLI and
+dashboard show them like any other group.
+
+```
+== rerun the fully cached repo (every slot busy)
+  default on cache
+    ◆ build                    cached
+    ◆ test                     cached
+passed in 98ms · 0 ran, 2 cached
+== a run with a real change still goes to a worker (waits for a slot)
+   (still waiting for a free slot after 8s, as expected)
+```
+
+58.2 s → 0.1–0.3 s. Covered by the e2e test `fully_cached_runs_do_not_wait_for_busy_workers`
+(all four slots busy; the cached run must finish within 3 s, on `cache`).
+
+**Verdict: SOLVED** for fully cached groups. A group with even one task to run still waits for
+a slot. Keys depend on the worker's OS, arch and the values of declared `env` variables; the
+server uses its own, so a fleet of a different OS or arch, or tasks keyed on env values that
+differ on the server, simply go to a worker (a missed shortcut, never a wrong hit).

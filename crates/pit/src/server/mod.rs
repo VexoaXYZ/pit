@@ -7,6 +7,7 @@ pub mod gc;
 pub mod github;
 pub mod queue;
 pub mod remote_cache;
+pub mod resolve;
 pub mod web;
 
 use std::collections::HashMap;
@@ -250,7 +251,29 @@ impl App {
             self.run_finished(run_id).await;
             return Ok(());
         }
+        // Groups the cache answers completely never need a worker.
+        let files = if req.no_cache {
+            None
+        } else {
+            resolve::file_index(&mirror, &req.sha, overlay.as_ref())
+                .await
+                .ok()
+        };
+        let mut resolved = 0;
         for g in &groups {
+            if let Some(results) = files
+                .as_deref()
+                .map(|f| resolve::resolve(self, g, f))
+                .transpose()?
+                .flatten()
+            {
+                let gid = self
+                    .db
+                    .insert_cached_group(run_id, &g.name, &g.os, &g.tasks, &results)?;
+                self.emit_cached_group(run_id, &gid)?;
+                resolved += 1;
+                continue;
+            }
             let mut backends: Vec<Backend> = g
                 .tasks
                 .iter()
@@ -267,12 +290,48 @@ impl App {
             Some(run_id),
             None,
             None,
-            serde_json::json!({ "groups": groups.len() }),
+            serde_json::json!({ "groups": groups.len(), "resolvedFromCache": resolved }),
         );
+        if resolved > 0 {
+            self.group_finished(run_id).await?;
+        }
         if let Some(gh) = &self.github {
             gh.report_run(self, run_id).await;
         }
         self.work.notify_waiters();
+        Ok(())
+    }
+
+    /// Emits the events a worker would for a group the cache answered, so the
+    /// CLI, dashboard and MCP clients see it like any other group.
+    fn emit_cached_group(&self, run_id: &str, group_id: &str) -> Result<()> {
+        let view = self.db.run_view(run_id)?;
+        let Some(g) = view.groups.iter().find(|g| g.id == group_id) else {
+            return Ok(());
+        };
+        self.emit(
+            "group.started",
+            Some(run_id),
+            Some(group_id),
+            None,
+            serde_json::json!({ "name": g.name, "worker": "cache" }),
+        );
+        for t in &g.tasks {
+            self.emit(
+                "task.finished",
+                Some(run_id),
+                Some(group_id),
+                Some(&t.id),
+                serde_json::json!({ "name": t.name, "status": t.status, "durationMs": 0, "exitCode": t.exit_code, "message": t.message }),
+            );
+        }
+        self.emit(
+            "group.finished",
+            Some(run_id),
+            Some(group_id),
+            None,
+            serde_json::json!({ "name": g.name, "status": g.status, "prepareMs": 0 }),
+        );
         Ok(())
     }
 
