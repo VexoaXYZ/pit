@@ -152,7 +152,7 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     Ok(view(&row, repo.name))
 }
 
-async fn default_branch(mirror: &Path) -> Result<String> {
+pub(crate) async fn default_branch(mirror: &Path) -> Result<String> {
     for b in ["main", "master", "trunk"] {
         if git::rev_parse(mirror, &format!("refs/heads/{b}"))
             .await?

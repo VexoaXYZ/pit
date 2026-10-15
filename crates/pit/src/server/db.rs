@@ -111,6 +111,12 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 
 -- Running totals for /api/stats that must survive cache eviction.
+-- The minute each schedule last fired, so it fires once per slot.
+CREATE TABLE IF NOT EXISTS schedules (
+  key TEXT PRIMARY KEY,
+  last_minute INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS counters (
   name TEXT PRIMARY KEY,
   value INTEGER NOT NULL DEFAULT 0
@@ -1307,6 +1313,16 @@ impl Db {
         Ok(())
     }
 
+    /// Claims a schedule slot. False if this minute already fired.
+    pub fn claim_schedule_slot(&self, key: &str, minute: i64) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "INSERT INTO schedules (key, last_minute) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET last_minute = ?2 WHERE last_minute < ?2",
+            params![key, minute],
+        )?;
+        Ok(n > 0)
+    }
+
     // ---- merge queue ----
 
     pub fn queue_insert(
@@ -1592,6 +1608,16 @@ mod affinity_tests {
 #[cfg(test)]
 mod stats_tests {
     use super::*;
+
+    #[test]
+    fn a_schedule_slot_fires_once() {
+        let db = Db::memory().unwrap();
+        assert!(db.claim_schedule_slot("r:nightly", 100).unwrap());
+        assert!(!db.claim_schedule_slot("r:nightly", 100).unwrap());
+        assert!(!db.claim_schedule_slot("r:nightly", 99).unwrap());
+        assert!(db.claim_schedule_slot("r:nightly", 101).unwrap());
+        assert!(db.claim_schedule_slot("other:nightly", 100).unwrap());
+    }
 
     #[test]
     fn untrusted_results_are_never_served_to_trusted_runs() {

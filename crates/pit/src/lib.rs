@@ -8,6 +8,7 @@ pub mod cas;
 pub mod cli;
 pub mod client;
 pub mod config;
+pub mod cron;
 pub mod excerpt;
 pub mod git;
 pub mod graph;

@@ -8,6 +8,7 @@ pub mod github;
 pub mod queue;
 pub mod remote_cache;
 pub mod resolve;
+pub mod schedule;
 pub mod web;
 
 use std::collections::HashMap;
@@ -599,6 +600,17 @@ pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) ->
                 Err(e) => tracing::warn!("reaper: {e:#}"),
                 _ => {}
             }
+        }
+    });
+    // Scheduled runs (`schedules` in the config), checked twice a minute so
+    // no minute is missed.
+    let sched = app.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = schedule::tick(&sched, now_ms()).await {
+                tracing::warn!("schedules: {e:#}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     });
     // Say so when a group has no worker that can run it.

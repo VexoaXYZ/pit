@@ -1369,3 +1369,55 @@ when someone runs `pit verify`.
 - **No scheduled fresh run.** The fix is a periodic `pit verify` (nightly cron, or before
   releases), and Pit has no built-in schedule for it yet.
 - **It is slow.** A fresh run is cold. On T3 Code that means the 162s install, at least.
+
+## P26. Scheduled CI runs late, gets dropped, or is silently disabled
+
+**Pain.** Nightly and periodic jobs are where slow, cold, or fresh-environment checks go (P25's
+`pit verify`, dependency audits, full test runs). GitHub says scheduled workflows "can be delayed
+during periods of high loads… If the load is sufficiently high enough, some queued jobs may be
+dropped", and that in public repos they are "automatically disabled when no repository activity
+has occurred in 60 days". One measurement of four public workflows scheduled every 15 minutes
+found only 64% of slots got a run, with a median delay of 7.4 minutes. Keepalive actions commit
+to the repo just to stop schedules being disabled
+([runhooks](https://runhooks.app/blog/github-actions-scheduled-workflows-unreliable/),
+[lastping](https://lastping.dev/monitor/github-actions-scheduled-disabled/),
+[hyperping](https://hyperping.com/blog/how-to-monitor-github-actions-scheduled-workflows),
+[steadycron](https://steadycron.com/guides/github-actions-schedule-not-running/),
+[cronuru](https://cronuru.com/guides/github-actions-scheduled-workflows),
+[dev.to](https://dev.to/amareswer/github-actions-workflow-not-triggering-every-cause-and-fix-5070),
+[efrecon/gh-action-keepalive](https://github.com/efrecon/gh-action-keepalive)).
+
+**Before** (research/pain-hunt at P25): Pit had no schedules at all. P25's fix, a fresh
+`pit verify`, only helps if someone remembers to run it. **NOT SOLVED.**
+
+**Fix** (research/pain-hunt): `schedules` in the config, each with a five-field UTC `cron` and
+optional `tasks`, `fresh` and `noCache`. The cron parser is built in, with no new dependency.
+The server reads schedules from the config on each repo's default branch, memoized per tip, and
+checks twice a minute. A `schedules` table records each fired slot, so a slot fires exactly once,
+even across two ticks in the same minute. When a slot is due, the server fetches, then starts a
+trusted run of the branch tip as `schedule:<name>`. A bad cron is a config error, like other
+typos (P6).
+
+**Live check** (`/tmp/painhunt/p25`, the repo whose stale generated file hides a bug): I added
+`verify: { cron: "* * * * *", fresh: true, noCache: true }` and committed it at 21:59:12.
+
+```
+pit run (warm)            passed in 388ms
+21:59:40 schedule verify on app-676dfe: started run_6aae646be56b
+run_6aae646be56b  failed  schedule:verify main   Error: Cannot find module './gen/legacy.js'
+```
+
+The scheduled fresh run caught the bug the warm run passes, 28s after the commit, with no one
+running anything. After the schedule was removed, no further scheduled runs appeared over the
+next 75s. Covered by the unit tests `matches_like_cron`, `rejects_bad_expressions`,
+`calendar_is_right` and `a_schedule_slot_fires_once`, and the e2e test
+`schedules_start_one_run_per_slot`.
+
+**Verdict: SOLVED** for scheduling on a server you run: no load-based delay beyond the 30s tick,
+no dropped slots while the server is up, and no inactivity shutoff. Not done:
+- **Missed slots are not replayed.** A slot that falls while the server is down is skipped.
+- **UTC only.** There are no time zones.
+- **Default branch only.** Only the default branch's config is read, and that branch is guessed
+  for non-GitHub repos (`main`, then `master`, then `trunk`).
+- **No failure notification.** A failed scheduled run notifies no one beyond the dashboard and
+  GitHub statuses.

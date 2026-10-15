@@ -1401,3 +1401,52 @@ async fn fresh_runs_do_not_see_files_earlier_runs_left_behind() {
     }
     assert_eq!(left(), 0, "the fresh workspace was not deleted");
 }
+
+/// A schedule in the config on the default branch starts one trusted run per
+/// matching minute, with its options, on the branch tip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schedules_start_one_run_per_slot() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    let config = serde_json::json!({
+        "tasks": { "check": { "run": "true", "cache": false } },
+        "schedules": { "nightly": { "cron": "17 3 * * *", "fresh": true, "noCache": true } },
+    });
+    write(&work, "pit.config.json", &config.to_string());
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    // Registers the repo and its mirror.
+    assert_eq!(run(&pit, &work).await.status, Status::Passed);
+
+    let at = |h: i64, m: i64| (20_377 * 1440 + h * 60 + m) * 60_000; // 2025-10-16
+    let scheduled = || async {
+        let runs: Vec<RunView> = pit.client.get("/api/runs?limit=50").await.unwrap();
+        runs.into_iter()
+            .filter(|r| r.trigger == "schedule:nightly")
+            .count()
+    };
+    pit::server::schedule::tick(&pit.app, at(3, 16))
+        .await
+        .unwrap();
+    assert_eq!(scheduled().await, 0, "not due yet");
+    pit::server::schedule::tick(&pit.app, at(3, 17))
+        .await
+        .unwrap();
+    pit::server::schedule::tick(&pit.app, at(3, 17) + 30_000)
+        .await
+        .unwrap();
+    assert_eq!(scheduled().await, 1, "one run per slot");
+
+    // A bad cron is a config error, like any other typo.
+    let bad = serde_json::json!({
+        "tasks": { "check": { "run": "true" } },
+        "schedules": { "nightly": { "cron": "17 3 * *" } },
+    });
+    write(&work, "pit.config.json", &bad.to_string());
+    let view = run(&pit, &work).await;
+    assert_eq!(view.status, Status::Error, "{view:?}");
+    assert!(view.message.unwrap_or_default().contains("five fields"));
+}

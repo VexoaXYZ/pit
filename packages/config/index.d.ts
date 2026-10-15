@@ -86,6 +86,23 @@ export interface PitConfig {
   groups?: Record<string, GroupDef>;
   /** Shorthand for a single group named `default`. */
   tasks?: Record<string, TaskDef>;
+  /**
+   * Runs the server starts by itself, read from the config on the default
+   * branch: e.g. a nightly `pit verify`, which is
+   * `{ cron: "17 3 * * *", fresh: true, noCache: true }`.
+   */
+  schedules?: Record<string, Schedule>;
+}
+
+export interface Schedule {
+  /** Five-field cron expression in UTC: minute hour day-of-month month day-of-week. */
+  cron: string;
+  /** Tasks to run (`task` or `group.task`). Default: all. */
+  tasks?: string[];
+  /** Run in new, empty workspaces instead of warm ones. */
+  fresh?: boolean;
+  /** Ignore cached results. */
+  noCache?: boolean;
 }
 
 /** A JavaScript workspace package (pnpm, npm, Yarn or Bun workspaces). */

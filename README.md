@@ -122,6 +122,20 @@ Inputs come from declared dependencies. A package that reads another without lis
 in `package.json` needs that directory added by hand, or a change there will be a cache hit.
 [`bench/t3code.packages.pit.config.ts`](bench/t3code.packages.pit.config.ts) is a full example.
 
+### Schedules
+
+```ts
+schedules: {
+  // A nightly `pit verify`: no cache, no warm state, so a bug that warm runs hide shows up.
+  verify: { cron: "17 3 * * *", fresh: true, noCache: true },
+},
+```
+
+The server reads `schedules` from the config on each repo's default branch and starts a trusted
+run of the branch tip when a cron (five fields, UTC) matches. It checks twice a minute and
+records each slot, so a slot fires once. A slot missed while the server was down is skipped, not
+replayed. A bad cron is a config error.
+
 ### Tool caches
 
 Workspaces stay warm between runs. Files a commit did not change keep their modification

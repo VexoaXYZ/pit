@@ -152,6 +152,9 @@ fn runtimes() -> Vec<(String, Vec<String>)> {
 
 /// Folds the `tasks` shorthand into a `default` group and fills defaults.
 pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
+    for (name, s) in &config.schedules {
+        crate::cron::Cron::parse(&s.cron).with_context(|| format!("schedule {name}"))?;
+    }
     if !config.tasks.is_empty() {
         if config.groups.contains_key("default") {
             bail!("pit config has both top-level `tasks` and a group named `default`");

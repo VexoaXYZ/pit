@@ -17,6 +17,27 @@ pub struct PitConfig {
     /// Shorthand for a single group named `default`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tasks: BTreeMap<String, TaskDef>,
+    /// Runs the server starts on the default branch, read from the config on
+    /// that branch.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub schedules: BTreeMap<String, Schedule>,
+}
+
+/// A scheduled run, e.g. a nightly `pit verify`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Schedule {
+    /// Five-field cron expression, in UTC (`"17 3 * * *"`).
+    pub cron: String,
+    /// Tasks to run (`task` or `group.task`). Empty means all.
+    #[serde(default)]
+    pub tasks: Vec<String>,
+    /// Run in new, empty workspaces (see `CreateRun::fresh`).
+    #[serde(default)]
+    pub fresh: bool,
+    /// Ignore cached results.
+    #[serde(default)]
+    pub no_cache: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
