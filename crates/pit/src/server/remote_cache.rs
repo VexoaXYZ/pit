@@ -40,12 +40,21 @@ struct TeamQuery {
 
 impl TeamQuery {
     fn ns(&self) -> String {
-        format!("turbo:{}", self.team_id.as_deref().or(self.slug.as_deref()).unwrap_or("default"))
+        format!(
+            "turbo:{}",
+            self.team_id
+                .as_deref()
+                .or(self.slug.as_deref())
+                .unwrap_or("default")
+        )
     }
 }
 
 fn valid_key(k: &str) -> bool {
-    !k.is_empty() && k.len() <= 128 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !k.is_empty()
+        && k.len() <= 128
+        && k.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 async fn turbo_status() -> Json<serde_json::Value> {
@@ -70,8 +79,16 @@ async fn turbo_query(
     for h in q.hashes.iter().filter(|h| valid_key(h)) {
         if let Some(meta) = app.db.kv_get(&team.ns(), h)? {
             let (digest, duration) = split_meta(&meta);
-            let size = app.cas.path(digest).metadata().map(|m| m.len()).unwrap_or(0);
-            out.insert(h.clone(), serde_json::json!({ "size": size, "taskDurationMs": duration, "tag": null }));
+            let size = app
+                .cas
+                .path(digest)
+                .metadata()
+                .map(|m| m.len())
+                .unwrap_or(0);
+            out.insert(
+                h.clone(),
+                serde_json::json!({ "size": size, "taskDurationMs": duration, "tag": null }),
+            );
         }
     }
     Ok(Json(out.into()))
@@ -94,10 +111,16 @@ async fn turbo_get(
     if !valid_key(&hash) {
         return Err(not_found("artifact"));
     }
-    let meta = app.db.kv_get(&team.ns(), &hash)?.ok_or_else(|| not_found("artifact"))?;
+    let meta = app
+        .db
+        .kv_get(&team.ns(), &hash)?
+        .ok_or_else(|| not_found("artifact"))?;
     let (digest, duration) = split_meta(&meta);
     let mut headers = HeaderMap::new();
-    headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
     headers.insert("x-artifact-duration", HeaderValue::from(duration));
     if method == Method::HEAD {
         return Ok((headers, ()).into_response());
@@ -122,8 +145,13 @@ async fn turbo_put(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let digest = app.cas.put(&body)?;
-    app.db.kv_put(&team.ns(), &hash, &format!("{digest}:{duration}"))?;
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "urls": [] }))).into_response())
+    app.db
+        .kv_put(&team.ns(), &hash, &format!("{digest}:{duration}"))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "urls": [] })),
+    )
+        .into_response())
 }
 
 fn bazel_ns(kind: &str) -> Result<&'static str, ApiError> {

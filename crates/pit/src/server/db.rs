@@ -234,13 +234,17 @@ impl Db {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Db { conn: Mutex::new(conn) })
+        Ok(Db {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn memory() -> Result<Db> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Db { conn: Mutex::new(conn) })
+        Ok(Db {
+            conn: Mutex::new(conn),
+        })
     }
 
     // ---- repos ----
@@ -251,38 +255,64 @@ impl Db {
             .query_row(
                 "SELECT id, name, url, github FROM repos WHERE name = ?1",
                 params![name],
-                |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, url: r.get(2)?, github: r.get(3)? }),
+                |r| {
+                    Ok(Repo {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        url: r.get(2)?,
+                        github: r.get(3)?,
+                    })
+                },
             )
             .optional()?;
         if let Some(mut repo) = existing {
             if let Some(url) = url.filter(|u| *u != repo.url) {
-                c.execute("UPDATE repos SET url = ?1 WHERE id = ?2", params![url, repo.id])?;
+                c.execute(
+                    "UPDATE repos SET url = ?1 WHERE id = ?2",
+                    params![url, repo.id],
+                )?;
                 repo.url = url.to_string();
             }
             if let Some(gh) = github.filter(|g| repo.github.as_deref() != Some(*g)) {
-                c.execute("UPDATE repos SET github = ?1 WHERE id = ?2", params![gh, repo.id])?;
+                c.execute(
+                    "UPDATE repos SET github = ?1 WHERE id = ?2",
+                    params![gh, repo.id],
+                )?;
                 repo.github = Some(gh.to_string());
             }
             return Ok(repo);
         }
-        let url = url.with_context(|| format!("unknown repo {name:?}; pass its url to register it"))?;
+        let url =
+            url.with_context(|| format!("unknown repo {name:?}; pass its url to register it"))?;
         let id = new_id("repo");
         c.execute(
             "INSERT INTO repos (id, name, url, github, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, name, url, github, now_ms()],
         )?;
-        Ok(Repo { id, name: name.into(), url: url.into(), github: github.map(String::from) })
+        Ok(Repo {
+            id,
+            name: name.into(),
+            url: url.into(),
+            github: github.map(String::from),
+        })
     }
 
     pub fn repo(&self, id: &str) -> Result<Repo> {
         let c = self.conn.lock();
-        Ok(c.query_row(
+        c.query_row(
             "SELECT id, name, url, github FROM repos WHERE id = ?1 OR name = ?1",
             params![id],
-            |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, url: r.get(2)?, github: r.get(3)? }),
+            |r| {
+                Ok(Repo {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    url: r.get(2)?,
+                    github: r.get(3)?,
+                })
+            },
         )
         .optional()?
-        .with_context(|| format!("unknown repo {id:?}"))?)
+        .with_context(|| format!("unknown repo {id:?}"))
     }
 
     pub fn repo_by_github(&self, full_name: &str) -> Result<Option<Repo>> {
@@ -290,7 +320,14 @@ impl Db {
         Ok(c.query_row(
             "SELECT id, name, url, github FROM repos WHERE github = ?1",
             params![full_name],
-            |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, url: r.get(2)?, github: r.get(3)? }),
+            |r| {
+                Ok(Repo {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    url: r.get(2)?,
+                    github: r.get(3)?,
+                })
+            },
         )
         .optional()?)
     }
@@ -299,7 +336,14 @@ impl Db {
         let c = self.conn.lock();
         let mut st = c.prepare("SELECT id, name, url, github FROM repos ORDER BY name")?;
         let rows = st
-            .query_map([], |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, url: r.get(2)?, github: r.get(3)? }))?
+            .query_map([], |r| {
+                Ok(Repo {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    url: r.get(2)?,
+                    github: r.get(3)?,
+                })
+            })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -329,9 +373,9 @@ impl Db {
 
     pub fn run(&self, id: &str) -> Result<RunRow> {
         let c = self.conn.lock();
-        Ok(c.query_row("SELECT * FROM runs WHERE id = ?1", params![id], run_row)
+        c.query_row("SELECT * FROM runs WHERE id = ?1", params![id], run_row)
             .optional()?
-            .with_context(|| format!("unknown run {id}"))?)
+            .with_context(|| format!("unknown run {id}"))
     }
 
     pub fn set_run_status(&self, id: &str, status: Status, message: Option<&str>) -> Result<()> {
@@ -474,7 +518,9 @@ impl Db {
             let needs: Vec<Backend> = serde_json::from_str(backends).unwrap_or_default();
             (os == "any" || *os == worker.os) && needs.iter().all(|b| worker.backends.contains(b))
         });
-        let Some((gid, run_id, os, _)) = pick else { return Ok(None) };
+        let Some((gid, run_id, os, _)) = pick else {
+            return Ok(None);
+        };
         let now = now_ms();
         tx.execute(
             "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2 WHERE id = ?3",
@@ -488,7 +534,8 @@ impl Db {
             |r| Ok((run_row(r)?, r.get("repo_name")?, r.get("repo_url")?, r.get("group_name")?)),
         )?;
         let tasks = {
-            let mut st = tx.prepare("SELECT id, name, def FROM tasks WHERE group_id = ?1 ORDER BY position")?;
+            let mut st = tx
+                .prepare("SELECT id, name, def FROM tasks WHERE group_id = ?1 ORDER BY position")?;
             let rows = st
                 .query_map(params![gid], |r| {
                     let def: String = r.get(2)?;
@@ -518,7 +565,7 @@ impl Db {
 
     pub fn group(&self, id: &str) -> Result<GroupRow> {
         let c = self.conn.lock();
-        Ok(c.query_row(
+        c.query_row(
             "SELECT id, run_id, name, os, status, check_run_id FROM groups_ WHERE id = ?1",
             params![id],
             |r| {
@@ -533,12 +580,14 @@ impl Db {
             },
         )
         .optional()?
-        .with_context(|| format!("unknown group {id}"))?)
+        .with_context(|| format!("unknown group {id}"))
     }
 
     pub fn groups_for_run(&self, run_id: &str) -> Result<Vec<GroupRow>> {
         let c = self.conn.lock();
-        let mut st = c.prepare("SELECT id, run_id, name, os, status, check_run_id FROM groups_ WHERE run_id = ?1")?;
+        let mut st = c.prepare(
+            "SELECT id, run_id, name, os, status, check_run_id FROM groups_ WHERE run_id = ?1",
+        )?;
         let rows = st
             .query_map(params![run_id], |r| {
                 Ok(GroupRow {
@@ -589,8 +638,11 @@ impl Db {
     pub fn requeue_stale_groups(&self, older_than_ms: i64) -> Result<Vec<String>> {
         let c = self.conn.lock();
         let cutoff = now_ms() - older_than_ms;
-        let mut st = c.prepare("SELECT id FROM groups_ WHERE status = 'running' AND heartbeat_at < ?1")?;
-        let ids: Vec<String> = st.query_map(params![cutoff], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut st =
+            c.prepare("SELECT id FROM groups_ WHERE status = 'running' AND heartbeat_at < ?1")?;
+        let ids: Vec<String> = st
+            .query_map(params![cutoff], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         for id in &ids {
             c.execute(
                 "UPDATE groups_ SET status = 'queued', worker = NULL, started_at = NULL WHERE id = ?1",
@@ -621,13 +673,13 @@ impl Db {
 
     pub fn task_group(&self, task_id: &str) -> Result<(String, String, String)> {
         let c = self.conn.lock();
-        Ok(c.query_row(
+        c.query_row(
             "SELECT group_id, run_id, name FROM tasks WHERE id = ?1",
             params![task_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?
-        .with_context(|| format!("unknown task {task_id}"))?)
+        .with_context(|| format!("unknown task {task_id}"))
     }
 
     pub fn start_task(&self, id: &str, action_key: Option<&str>) -> Result<()> {
@@ -661,20 +713,28 @@ impl Db {
     pub fn live_log(&self, task_id: &str) -> Result<String> {
         let c = self.conn.lock();
         let mut st = c.prepare("SELECT text FROM task_logs WHERE task_id = ?1 ORDER BY seq")?;
-        let parts: Vec<String> = st.query_map(params![task_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let parts: Vec<String> = st
+            .query_map(params![task_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(parts.concat())
     }
 
     pub fn drop_live_log(&self, task_id: &str) -> Result<()> {
-        self.conn.lock().execute("DELETE FROM task_logs WHERE task_id = ?1", params![task_id])?;
+        self.conn
+            .lock()
+            .execute("DELETE FROM task_logs WHERE task_id = ?1", params![task_id])?;
         Ok(())
     }
 
     pub fn task_log_digest(&self, task_id: &str) -> Result<Option<String>> {
         let c = self.conn.lock();
-        Ok(c.query_row("SELECT log_digest FROM tasks WHERE id = ?1", params![task_id], |r| r.get(0))
-            .optional()?
-            .flatten())
+        Ok(c.query_row(
+            "SELECT log_digest FROM tasks WHERE id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
     }
 
     pub fn find_task(&self, run_id: &str, name: &str) -> Result<Option<String>> {
@@ -694,7 +754,11 @@ impl Db {
     pub fn cache_get(&self, key: &str) -> Result<Option<CacheEntry>> {
         let c = self.conn.lock();
         let entry: Option<String> = c
-            .query_row("SELECT entry FROM cache WHERE action_key = ?1", params![key], |r| r.get(0))
+            .query_row(
+                "SELECT entry FROM cache WHERE action_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
             .optional()?;
         if entry.is_some() {
             c.execute(
@@ -715,8 +779,12 @@ impl Db {
 
     pub fn kv_get(&self, ns: &str, key: &str) -> Result<Option<String>> {
         let c = self.conn.lock();
-        Ok(c.query_row("SELECT digest FROM kv WHERE ns = ?1 AND key = ?2", params![ns, key], |r| r.get(0))
-            .optional()?)
+        Ok(c.query_row(
+            "SELECT digest FROM kv WHERE ns = ?1 AND key = ?2",
+            params![ns, key],
+            |r| r.get(0),
+        )
+        .optional()?)
     }
 
     pub fn kv_put(&self, ns: &str, key: &str, digest: &str) -> Result<()> {
@@ -773,7 +841,14 @@ impl Db {
 
     // ---- merge queue ----
 
-    pub fn queue_insert(&self, repo_id: &str, source: &str, pr: Option<u64>, head_sha: &str, target: &str) -> Result<String> {
+    pub fn queue_insert(
+        &self,
+        repo_id: &str,
+        source: &str,
+        pr: Option<u64>,
+        head_sha: &str,
+        target: &str,
+    ) -> Result<String> {
         let id = new_id("q");
         let now = now_ms();
         self.conn.lock().execute(
@@ -789,14 +864,18 @@ impl Db {
         let mut st = c.prepare(
             "SELECT * FROM queue WHERE status IN ('queued', 'testing', 'passed') ORDER BY created_at",
         )?;
-        let rows = st.query_map([], queue_row)?.collect::<rusqlite::Result<_>>()?;
+        let rows = st
+            .query_map([], queue_row)?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
     pub fn queue_all(&self, limit: usize) -> Result<Vec<QueueRow>> {
         let c = self.conn.lock();
         let mut st = c.prepare("SELECT * FROM queue ORDER BY created_at DESC LIMIT ?1")?;
-        let rows = st.query_map(params![limit as i64], queue_row)?.collect::<rusqlite::Result<_>>()?;
+        let rows = st
+            .query_map(params![limit as i64], queue_row)?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
@@ -824,6 +903,11 @@ impl Db {
 
     pub fn queue_by_run(&self, run_id: &str) -> Result<Option<QueueRow>> {
         let c = self.conn.lock();
-        Ok(c.query_row("SELECT * FROM queue WHERE run_id = ?1", params![run_id], queue_row).optional()?)
+        Ok(c.query_row(
+            "SELECT * FROM queue WHERE run_id = ?1",
+            params![run_id],
+            queue_row,
+        )
+        .optional()?)
     }
 }

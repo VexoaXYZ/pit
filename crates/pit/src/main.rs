@@ -177,7 +177,8 @@ async fn main() {
     let quiet = matches!(cli.command, Command::Mcp { .. });
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("PIT_LOG").unwrap_or_else(|_| "pit=info".into()),
+            tracing_subscriber::EnvFilter::try_from_env("PIT_LOG")
+                .unwrap_or_else(|_| "pit=info".into()),
         )
         .with_writer(std::io::stderr)
         .with_target(false)
@@ -194,12 +195,30 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<i32> {
     match cli.command {
-        Command::Up { addr, data, slots, parallelism, token } => {
+        Command::Up {
+            addr,
+            data,
+            slots,
+            parallelism,
+            token,
+        } => {
             let data = data.unwrap_or_else(default_data);
-            cli::up(addr, data, slots, parallelism.unwrap_or_else(default_parallelism), token).await?;
+            cli::up(
+                addr,
+                data,
+                slots,
+                parallelism.unwrap_or_else(default_parallelism),
+                token,
+            )
+            .await?;
             Ok(0)
         }
-        Command::Server { addr, data, token, public_url } => {
+        Command::Server {
+            addr,
+            data,
+            token,
+            public_url,
+        } => {
             pit::server::serve(pit::server::ServerOpts {
                 data_dir: data.unwrap_or_else(default_data).join("server"),
                 addr,
@@ -209,7 +228,13 @@ async fn run(cli: Cli) -> Result<i32> {
             .await?;
             Ok(0)
         }
-        Command::Worker { conn, name, data, slots, parallelism } => {
+        Command::Worker {
+            conn,
+            name,
+            data,
+            slots,
+            parallelism,
+        } => {
             pit::worker::run(pit::worker::WorkerOpts {
                 server: conn.server,
                 token: conn.token,
@@ -221,19 +246,59 @@ async fn run(cli: Cli) -> Result<i32> {
             .await?;
             Ok(0)
         }
-        Command::Run { tasks, conn, no_cache, verbose, json, dir } => {
-            cli::run(&cli::client(&conn.server, conn.token)?, &dir, tasks, no_cache, verbose, json).await
+        Command::Run {
+            tasks,
+            conn,
+            no_cache,
+            verbose,
+            json,
+            dir,
+        } => {
+            cli::run(
+                &cli::client(&conn.server, conn.token)?,
+                &dir,
+                tasks,
+                no_cache,
+                verbose,
+                json,
+            )
+            .await
         }
         Command::Verify { tasks, conn, dir } => {
-            cli::run(&cli::client(&conn.server, conn.token)?, &dir, tasks, true, false, false).await
+            cli::run(
+                &cli::client(&conn.server, conn.token)?,
+                &dir,
+                tasks,
+                true,
+                false,
+                false,
+            )
+            .await
         }
-        Command::Runs { conn, limit } => cli::runs(&cli::client(&conn.server, conn.token)?, limit).await,
-        Command::Logs { run, task, conn } => cli::logs(&cli::client(&conn.server, conn.token)?, &run, &task).await,
+        Command::Runs { conn, limit } => {
+            cli::runs(&cli::client(&conn.server, conn.token)?, limit).await
+        }
+        Command::Logs { run, task, conn } => {
+            cli::logs(&cli::client(&conn.server, conn.token)?, &run, &task).await
+        }
         Command::Queue { command } => match command {
-            QueueCmd::Add { branch, target, conn, dir } => {
-                cli::queue_add(&cli::client(&conn.server, conn.token)?, &dir, &branch, target).await
+            QueueCmd::Add {
+                branch,
+                target,
+                conn,
+                dir,
+            } => {
+                cli::queue_add(
+                    &cli::client(&conn.server, conn.token)?,
+                    &dir,
+                    &branch,
+                    target,
+                )
+                .await
             }
-            QueueCmd::List { conn } => cli::queue_list(&cli::client(&conn.server, conn.token)?).await,
+            QueueCmd::List { conn } => {
+                cli::queue_list(&cli::client(&conn.server, conn.token)?).await
+            }
         },
         Command::Init { dir, force } => pit::init::init(&dir, force).await,
         Command::Import { dir, stdout, force } => pit::import::import(&dir, stdout, force),

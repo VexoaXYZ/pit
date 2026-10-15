@@ -20,6 +20,9 @@ pub struct TsTask {
     pub comments: Vec<String>,
 }
 
+/// A group to render: name, operating systems, tasks.
+pub type TsGroup = (String, Vec<String>, Vec<TsTask>);
+
 pub fn ts_string(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
@@ -76,10 +79,18 @@ pub fn import(dir: &Path, stdout: bool, force: bool) -> Result<i32> {
     }
     let dest = dir.join(crate::config::CONFIG_TS);
     if dest.exists() && !force {
-        bail!("{} already exists (use --force, or --stdout to preview)", dest.display());
+        bail!(
+            "{} already exists (use --force, or --stdout to preview)",
+            dest.display()
+        );
     }
     std::fs::write(&dest, source)?;
-    println!("wrote {} with {} group(s) from {} workflow(s)", dest.display(), groups.len(), files.len());
+    println!(
+        "wrote {} with {} group(s) from {} workflow(s)",
+        dest.display(),
+        groups.len(),
+        files.len()
+    );
     for s in skipped {
         println!("  skipped {s}");
     }
@@ -111,16 +122,23 @@ fn os_of(runs_on: &str) -> &'static str {
 }
 
 /// Translates one workflow file into `(group, os list, tasks)` entries.
-pub fn translate(stem: &str, src: &str) -> Result<Vec<(String, Vec<String>, Vec<TsTask>)>> {
+pub fn translate(stem: &str, src: &str) -> Result<Vec<TsGroup>> {
     let doc: Value = serde_yaml::from_str(src)?;
-    let jobs = doc.get("jobs").and_then(Value::as_mapping).context("no jobs")?;
+    let jobs = doc
+        .get("jobs")
+        .and_then(Value::as_mapping)
+        .context("no jobs")?;
     let mut out = Vec::new();
     for (id, job) in jobs {
         let id = id.as_str().unwrap_or("job");
         let mut oses: Vec<String> = Vec::new();
         let runs_on = match job.get("runs-on") {
             Some(Value::String(s)) => s.clone(),
-            Some(Value::Sequence(seq)) => seq.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+            Some(Value::Sequence(seq)) => seq
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
             _ => String::new(),
         };
         if runs_on.contains("matrix.") {
@@ -147,7 +165,11 @@ pub fn translate(stem: &str, src: &str) -> Result<Vec<(String, Vec<String>, Vec<
         if let Some(needs) = job.get("needs") {
             let needs: Vec<String> = match needs {
                 Value::String(s) => vec![s.clone()],
-                Value::Sequence(v) => v.iter().filter_map(Value::as_str).map(String::from).collect(),
+                Value::Sequence(v) => v
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect(),
                 _ => vec![],
             };
             if !needs.is_empty() {
@@ -157,7 +179,11 @@ pub fn translate(stem: &str, src: &str) -> Result<Vec<(String, Vec<String>, Vec<
                 ));
             }
         }
-        let steps = job.get("steps").and_then(Value::as_sequence).cloned().unwrap_or_default();
+        let steps = job
+            .get("steps")
+            .and_then(Value::as_sequence)
+            .cloned()
+            .unwrap_or_default();
         let mut names = BTreeMap::<String, usize>::new();
         for (i, step) in steps.iter().enumerate() {
             let label = step.get("name").and_then(Value::as_str).map(String::from);
@@ -168,7 +194,9 @@ pub fn translate(stem: &str, src: &str) -> Result<Vec<(String, Vec<String>, Vec<
                 }
                 continue;
             }
-            let Some(run) = step.get("run").and_then(Value::as_str) else { continue };
+            let Some(run) = step.get("run").and_then(Value::as_str) else {
+                continue;
+            };
             let mut run = run.trim().to_string();
             if let Some(dir) = step.get("working-directory").and_then(Value::as_str) {
                 run = format!("cd {} && {run}", shell_quote(dir));
@@ -184,10 +212,21 @@ pub fn translate(stem: &str, src: &str) -> Result<Vec<(String, Vec<String>, Vec<
             if run.contains("${{") {
                 comments.push("TODO: uses a GitHub expression (${{ }}); replace it with a literal or an env var.".into());
             }
-            let install = ["npm ci", "npm install", "bun install", "pnpm install", "yarn install", "yarn --frozen", "vp install"]
-                .iter()
-                .any(|p| run.starts_with(p));
-            let deps = tasks.last().map(|t: &TsTask| vec![t.name.clone()]).unwrap_or_default();
+            let install = [
+                "npm ci",
+                "npm install",
+                "bun install",
+                "pnpm install",
+                "yarn install",
+                "yarn --frozen",
+                "vp install",
+            ]
+            .iter()
+            .any(|p| run.starts_with(p));
+            let deps = tasks
+                .last()
+                .map(|t: &TsTask| vec![t.name.clone()])
+                .unwrap_or_default();
             tasks.push(TsTask {
                 name,
                 run,
@@ -201,14 +240,20 @@ pub fn translate(stem: &str, src: &str) -> Result<Vec<(String, Vec<String>, Vec<
         if tasks.is_empty() {
             continue;
         }
-        let group = if jobs.len() == 1 && slug(id) == "build" { stem.to_string() } else { id.to_string() };
+        let group = if jobs.len() == 1 && slug(id) == "build" {
+            stem.to_string()
+        } else {
+            id.to_string()
+        };
         out.push((group, oses, tasks));
     }
     Ok(out)
 }
 
 fn shell_quote(s: &str) -> String {
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c)) {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
+    {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))

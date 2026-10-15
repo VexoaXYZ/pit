@@ -105,9 +105,15 @@ pub async fn ensure_commit(dir: &Path, url: &str, sha: &str) -> Result<()> {
 }
 
 pub async fn rev_parse(dir: &Path, rev: &str) -> Result<Option<String>> {
-    let out = git_raw(dir, &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")]).await?;
+    let out = git_raw(
+        dir,
+        &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")],
+    )
+    .await?;
     if out.status.success() {
-        Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
     } else {
         Ok(None)
     }
@@ -120,7 +126,11 @@ pub async fn show_file(dir: &Path, sha: &str, path: &str) -> Result<Option<Vec<u
 
 pub async fn changed_files(dir: &Path, from: &str, to: &str) -> Result<Vec<String>> {
     let out = git(dir, &["diff", "--name-only", "-z", from, to]).await?;
-    Ok(out.split('\0').filter(|s| !s.is_empty()).map(String::from).collect())
+    Ok(out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 pub async fn merge_base(dir: &Path, a: &str, b: &str) -> Result<Option<String>> {
@@ -137,7 +147,12 @@ pub async fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> bool {
 
 /// Merges `theirs` into `ours` without a worktree and returns the merge commit,
 /// or `None` on conflict. Needs git 2.38+ for `merge-tree --write-tree`.
-pub async fn merge_commit(dir: &Path, ours: &str, theirs: &str, message: &str) -> Result<Option<String>> {
+pub async fn merge_commit(
+    dir: &Path,
+    ours: &str,
+    theirs: &str,
+    message: &str,
+) -> Result<Option<String>> {
     if is_ancestor(dir, theirs, ours).await {
         return Ok(Some(ours.to_string()));
     }
@@ -157,7 +172,16 @@ pub async fn merge_commit(dir: &Path, ours: &str, theirs: &str, message: &str) -
         .trim()
         .to_string();
     let commit = Command::new("git")
-        .args(["commit-tree", &tree, "-p", ours, "-p", theirs, "-m", message])
+        .args([
+            "commit-tree",
+            &tree,
+            "-p",
+            ours,
+            "-p",
+            theirs,
+            "-m",
+            message,
+        ])
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Pit")
         .env("GIT_AUTHOR_EMAIL", "pit@localhost")
@@ -172,7 +196,9 @@ pub async fn merge_commit(dir: &Path, ours: &str, theirs: &str, message: &str) -
             String::from_utf8_lossy(&commit.stderr).trim()
         );
     }
-    Ok(Some(String::from_utf8_lossy(&commit.stdout).trim().to_string()))
+    Ok(Some(
+        String::from_utf8_lossy(&commit.stdout).trim().to_string(),
+    ))
 }
 
 /// Pushes `sha` to `refname` on origin. Non-forced, so a moved branch fails.
@@ -205,7 +231,9 @@ pub async fn ls_files(dir: &Path) -> Result<Vec<IndexEntry>> {
         }
         let rec = String::from_utf8_lossy(rec);
         // "<mode> <oid> <stage>\t<path>"
-        let Some((meta, path)) = rec.split_once('\t') else { continue };
+        let Some((meta, path)) = rec.split_once('\t') else {
+            continue;
+        };
         let mut parts = meta.split(' ');
         let mode = parts.next().unwrap_or_default();
         let oid = parts.next().unwrap_or_default();

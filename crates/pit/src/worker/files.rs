@@ -8,10 +8,16 @@ use anyhow::{bail, Result};
 /// could escape it.
 pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     let p = Path::new(rel);
-    if rel.is_empty() || p.is_absolute() || p.components().any(|c| !matches!(c, Component::Normal(_))) {
+    if rel.is_empty()
+        || p.is_absolute()
+        || p.components().any(|c| !matches!(c, Component::Normal(_)))
+    {
         bail!("refusing unsafe path {rel:?}");
     }
-    if p.components().next().is_some_and(|c| c.as_os_str() == ".git") {
+    if p.components()
+        .next()
+        .is_some_and(|c| c.as_os_str() == ".git")
+    {
         bail!("refusing to write inside .git: {rel:?}");
     }
     Ok(root.join(p))
@@ -44,7 +50,9 @@ fn set_executable(_: &Path, _: bool) -> Result<()> {
 #[cfg(unix)]
 pub fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
@@ -78,7 +86,11 @@ pub fn collect_outputs(ws: &Path, globs: &[String]) -> Result<Vec<(String, PathB
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for root in roots {
-        let start = if root.is_empty() { ws.to_path_buf() } else { safe_join(ws, root)? };
+        let start = if root.is_empty() {
+            ws.to_path_buf()
+        } else {
+            safe_join(ws, root)?
+        };
         walk(ws, &start, &mut |rel, abs| {
             if set.is_match(rel) && seen.insert(rel.to_string()) {
                 out.push((rel.to_string(), abs.to_path_buf()));
@@ -138,7 +150,10 @@ mod tests {
     #[test]
     fn literal_prefixes() {
         assert_eq!(literal_prefix("dist/**"), "dist");
-        assert_eq!(literal_prefix("packages/web/dist/**/*.js"), "packages/web/dist");
+        assert_eq!(
+            literal_prefix("packages/web/dist/**/*.js"),
+            "packages/web/dist"
+        );
         assert_eq!(literal_prefix("**/*.d.ts"), "");
         assert_eq!(literal_prefix("out.txt"), "out.txt");
     }

@@ -22,8 +22,9 @@ pub fn validate(config: &PitConfig) -> Result<()> {
                 }
             }
             for pattern in task.inputs.iter().flatten().chain(&task.outputs) {
-                Glob::new(pattern.strip_prefix('!').unwrap_or(pattern))
-                    .map_err(|e| anyhow::anyhow!("task {gname}.{tname}: bad glob {pattern:?}: {e}"))?;
+                Glob::new(pattern.strip_prefix('!').unwrap_or(pattern)).map_err(|e| {
+                    anyhow::anyhow!("task {gname}.{tname}: bad glob {pattern:?}: {e}")
+                })?;
             }
         }
         topo_order(&group.tasks).map_err(|e| anyhow::anyhow!("group {gname}: {e}"))?;
@@ -109,8 +110,16 @@ pub fn plan(config: &PitConfig, selected: &[String]) -> Result<Vec<PlannedGroup>
             .map(|t| (t.clone(), group.tasks[&t].clone()))
             .collect();
         for os in &group.os {
-            let name = if group.os.len() > 1 { format!("{gname}@{os}") } else { gname.clone() };
-            groups.push(PlannedGroup { name, os: os.clone(), tasks: tasks.clone() });
+            let name = if group.os.len() > 1 {
+                format!("{gname}@{os}")
+            } else {
+                gname.clone()
+            };
+            groups.push(PlannedGroup {
+                name,
+                os: os.clone(),
+                tasks: tasks.clone(),
+            });
         }
     }
     if let Some(missing) = selected.iter().find(|s| !matched.contains(s.as_str())) {
@@ -144,9 +153,13 @@ pub struct InputMatcher {
 
 impl InputMatcher {
     pub fn new(patterns: &[String]) -> Result<InputMatcher> {
-        let (neg, pos): (Vec<String>, Vec<String>) = patterns.iter().cloned().partition(|p| p.starts_with('!'));
+        let (neg, pos): (Vec<String>, Vec<String>) =
+            patterns.iter().cloned().partition(|p| p.starts_with('!'));
         let neg: Vec<String> = neg.into_iter().map(|p| p[1..].to_string()).collect();
-        Ok(InputMatcher { include: globset(&pos)?, exclude: globset(&neg)? })
+        Ok(InputMatcher {
+            include: globset(&pos)?,
+            exclude: globset(&neg)?,
+        })
     }
 
     pub fn for_task(task: &TaskDef) -> Result<InputMatcher> {
@@ -161,7 +174,9 @@ impl InputMatcher {
 /// Inputs default to every tracked file, which is always correct, just less
 /// cacheable.
 pub fn input_globs(task: &TaskDef) -> Vec<String> {
-    task.inputs.clone().unwrap_or_else(|| vec!["**".to_string()])
+    task.inputs
+        .clone()
+        .unwrap_or_else(|| vec!["**".to_string()])
 }
 
 /// Tasks (`group.task`) whose results can change because of `changed` files:
@@ -191,7 +206,10 @@ pub fn affected(config: &PitConfig, changed: &[String]) -> Result<BTreeSet<Strin
         out.extend(hit.into_iter().map(|t| format!("{gname}.{t}")));
     }
     // A config change can change any task.
-    if changed.iter().any(|f| crate::config::CONFIG_FILES.contains(&f.as_str())) {
+    if changed
+        .iter()
+        .any(|f| crate::config::CONFIG_FILES.contains(&f.as_str()))
+    {
         for (gname, group) in &config.groups {
             out.extend(group.tasks.keys().map(|t| format!("{gname}.{t}")));
         }
@@ -277,16 +295,29 @@ mod tests {
 
     fn sample() -> PitConfig {
         let mut tasks = BTreeMap::new();
-        tasks.insert("install".into(), task("bun i", &[], Some(&["package.json", "bun.lock"])));
+        tasks.insert(
+            "install".into(),
+            task("bun i", &[], Some(&["package.json", "bun.lock"])),
+        );
         tasks.insert("lint".into(), task("lint", &["install"], Some(&["src/**"])));
-        tasks.insert("build".into(), task("build", &["install"], Some(&["src/**", "vite.config.ts"])));
+        tasks.insert(
+            "build".into(),
+            task("build", &["install"], Some(&["src/**", "vite.config.ts"])),
+        );
         tasks.insert("docs".into(), task("docs", &[], Some(&["docs/**"])));
         let mut groups = BTreeMap::new();
         groups.insert(
             "ci".into(),
-            GroupDef { os: vec!["linux".into(), "windows".into()], tasks, ..Default::default() },
+            GroupDef {
+                os: vec!["linux".into(), "windows".into()],
+                tasks,
+                ..Default::default()
+            },
         );
-        PitConfig { groups, ..Default::default() }
+        PitConfig {
+            groups,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -331,23 +362,43 @@ mod tests {
     fn rejects_cycles_and_cross_group_deps() {
         let mut c = sample();
         let g = c.groups.get_mut("ci").unwrap();
-        g.tasks.get_mut("install").unwrap().deps.push("build".into());
+        g.tasks
+            .get_mut("install")
+            .unwrap()
+            .deps
+            .push("build".into());
         assert!(validate(&c).unwrap_err().to_string().contains("cycle"));
         let mut c = sample();
-        c.groups.get_mut("ci").unwrap().tasks.get_mut("lint").unwrap().deps.push("other".into());
+        c.groups
+            .get_mut("ci")
+            .unwrap()
+            .tasks
+            .get_mut("lint")
+            .unwrap()
+            .deps
+            .push("other".into());
         assert!(validate(&c).is_err());
     }
 
     #[test]
     fn action_key_only_changes_with_matching_inputs() {
         let t = task("build", &[], Some(&["src/**"]));
-        let files = vec![("src/a.ts".to_string(), "1".to_string()), ("README.md".to_string(), "1".to_string())];
+        let files = vec![
+            ("src/a.ts".to_string(), "1".to_string()),
+            ("README.md".to_string(), "1".to_string()),
+        ];
         let k1 = action_key(&t, "linux", &files, &[]).unwrap();
-        let readme_changed = vec![("src/a.ts".to_string(), "1".to_string()), ("README.md".to_string(), "2".to_string())];
+        let readme_changed = vec![
+            ("src/a.ts".to_string(), "1".to_string()),
+            ("README.md".to_string(), "2".to_string()),
+        ];
         assert_eq!(k1, action_key(&t, "linux", &readme_changed, &[]).unwrap());
         let src_changed = vec![("src/a.ts".to_string(), "2".to_string())];
         assert_ne!(k1, action_key(&t, "linux", &src_changed, &[]).unwrap());
-        assert_ne!(k1, action_key(&t, "linux", &files, &["dep".into()]).unwrap());
+        assert_ne!(
+            k1,
+            action_key(&t, "linux", &files, &["dep".into()]).unwrap()
+        );
         assert_ne!(k1, action_key(&t, "windows", &files, &[]).unwrap());
     }
 }

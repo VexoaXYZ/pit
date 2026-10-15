@@ -22,11 +22,15 @@ pub async fn serve(client: Client) -> Result<()> {
             write(&mut stdout, json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } })).await?;
             continue;
         };
-        let Some(id) = msg.get("id").cloned() else { continue }; // Notifications need no reply.
+        let Some(id) = msg.get("id").cloned() else {
+            continue;
+        }; // Notifications need no reply.
         let method = msg["method"].as_str().unwrap_or_default();
         let reply = match handle(&client, method, &msg["params"]).await {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": format!("{e:#}") } }),
+            Err(e) => {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": format!("{e:#}") } })
+            }
         };
         write(&mut stdout, reply).await?;
     }
@@ -100,8 +104,12 @@ async fn handle(client: &Client, method: &str, params: &Value) -> Result<Value> 
             let name = params["name"].as_str().unwrap_or_default();
             let args = &params["arguments"];
             match call(client, name, args).await {
-                Ok((text, is_error)) => Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })),
-                Err(e) => Ok(json!({ "content": [{ "type": "text", "text": format!("{e:#}") }], "isError": true })),
+                Ok((text, is_error)) => Ok(
+                    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }),
+                ),
+                Err(e) => Ok(
+                    json!({ "content": [{ "type": "text", "text": format!("{e:#}") }], "isError": true }),
+                ),
             }
         }
         other => anyhow::bail!("method not found: {other}"),
@@ -109,7 +117,10 @@ async fn handle(client: &Client, method: &str, params: &Value) -> Result<Value> 
 }
 
 fn path_arg(args: &Value) -> PathBuf {
-    args["path"].as_str().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    args["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool)> {
@@ -117,13 +128,23 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
         "pit_run" => {
             let tasks: Vec<String> = args["tasks"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let no_cache = args["noCache"].as_bool().unwrap_or(false);
             let started = std::time::Instant::now();
             let sub = crate::cli::submit(client, &path_arg(args), tasks, no_cache).await?;
             let view = crate::cli::wait(client, &sub.run_id, |_| {}).await?;
-            let text = summarize(client, &view, started.elapsed().as_millis() as u64, &sub.url).await;
+            let text = summarize(
+                client,
+                &view,
+                started.elapsed().as_millis() as u64,
+                &sub.url,
+            )
+            .await;
             Ok((text, !view.status.is_ok()))
         }
         "pit_runs" => {
@@ -131,41 +152,81 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
             let runs: Vec<RunView> = client.get(&format!("/api/runs?limit={limit}")).await?;
             let lines: Vec<String> = runs
                 .iter()
-                .map(|r| format!("{} {} {} {}@{}", r.id, r.status.as_str(), r.trigger, r.repo, &r.sha[..r.sha.len().min(8)]))
+                .map(|r| {
+                    format!(
+                        "{} {} {} {}@{}",
+                        r.id,
+                        r.status.as_str(),
+                        r.trigger,
+                        r.repo,
+                        &r.sha[..r.sha.len().min(8)]
+                    )
+                })
                 .collect();
             Ok((lines.join("\n"), false))
         }
         "pit_logs" => {
             let run = args["runId"].as_str().context("runId is required")?;
             let task = args["task"].as_str().context("task is required")?;
-            Ok((client.get_text(&format!("/api/runs/{run}/tasks/{task}/log")).await?, false))
+            Ok((
+                client
+                    .get_text(&format!("/api/runs/{run}/tasks/{task}/log"))
+                    .await?,
+                false,
+            ))
         }
         "pit_queue_add" => {
             let branch = args["branch"].as_str().context("branch is required")?;
-            let root = crate::git::toplevel(&path_arg(args)).await?;
-            let root = std::fs::canonicalize(&root).unwrap_or(root);
-            let repo = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let id = crate::snapshot::identity(&path_arg(args)).await?;
             let e: QueueEntryView = client
                 .post(
                     "/api/queue",
                     &QueueAdd {
-                        repo,
-                        url: Some(root.to_string_lossy().to_string()),
+                        repo: id.name,
+                        url: Some(id.url),
                         branch: Some(branch.into()),
                         pr: None,
                         target: args["target"].as_str().map(String::from),
                     },
                 )
                 .await?;
-            Ok((format!("{} {} -> {}: {} (affected: {})", e.id, e.source, e.target, e.status, e.affected.join(", ")), false))
+            Ok((
+                format!(
+                    "{} {} -> {}: {} (affected: {})",
+                    e.id,
+                    e.source,
+                    e.target,
+                    e.status,
+                    e.affected.join(", ")
+                ),
+                false,
+            ))
         }
         "pit_queue" => {
             let entries: Vec<QueueEntryView> = client.get("/api/queue").await?;
             let lines: Vec<String> = entries
                 .iter()
-                .map(|e| format!("{} {} {} -> {} lane={} affected=[{}] {}", e.id, e.status, e.source, e.target, e.lane.clone().unwrap_or_default(), e.affected.join(","), e.reason.clone().unwrap_or_default()))
+                .map(|e| {
+                    format!(
+                        "{} {} {} -> {} lane={} affected=[{}] {}",
+                        e.id,
+                        e.status,
+                        e.source,
+                        e.target,
+                        e.lane.clone().unwrap_or_default(),
+                        e.affected.join(","),
+                        e.reason.clone().unwrap_or_default()
+                    )
+                })
                 .collect();
-            Ok((if lines.is_empty() { "queue is empty".into() } else { lines.join("\n") }, false))
+            Ok((
+                if lines.is_empty() {
+                    "queue is empty".into()
+                } else {
+                    lines.join("\n")
+                },
+                false,
+            ))
         }
         other => anyhow::bail!("unknown tool {other}"),
     }
@@ -179,7 +240,11 @@ async fn summarize(client: &Client, view: &RunView, elapsed_ms: u64, url: &str) 
         elapsed_ms as f64 / 1000.0,
         view.repo,
         &view.sha[..view.sha.len().min(10)],
-        if view.overlay_files > 0 { format!(" +{} changed files", view.overlay_files) } else { String::new() }
+        if view.overlay_files > 0 {
+            format!(" +{} changed files", view.overlay_files)
+        } else {
+            String::new()
+        }
     );
     if let Some(m) = &view.message {
         s.push_str(&format!("{m}\n"));
@@ -188,15 +253,25 @@ async fn summarize(client: &Client, view: &RunView, elapsed_ms: u64, url: &str) 
     for g in &view.groups {
         s.push_str(&format!("{} ({}):\n", g.name, g.os));
         for t in &g.tasks {
-            let time = t.duration_ms.map(|d| format!(" {:.1}s", d as f64 / 1000.0)).unwrap_or_default();
+            let time = t
+                .duration_ms
+                .map(|d| format!(" {:.1}s", d as f64 / 1000.0))
+                .unwrap_or_default();
             s.push_str(&format!("  {} {}{time}\n", t.status.as_str(), t.name));
             if matches!(t.status, Status::Failed | Status::Error) {
-                failed.push((format!("{}.{}", g.name, t.name), t.id.clone(), t.message.clone()));
+                failed.push((
+                    format!("{}.{}", g.name, t.name),
+                    t.id.clone(),
+                    t.message.clone(),
+                ));
             }
         }
     }
     for (name, id, message) in failed {
-        s.push_str(&format!("\n--- {name}: {} ---\n", message.unwrap_or_default()));
+        s.push_str(&format!(
+            "\n--- {name}: {} ---\n",
+            message.unwrap_or_default()
+        ));
         if let Ok(log) = client.get_text(&format!("/api/tasks/{id}/log")).await {
             let lines: Vec<&str> = log.lines().collect();
             s.push_str(&lines[lines.len().saturating_sub(80)..].join("\n"));

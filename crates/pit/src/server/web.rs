@@ -15,8 +15,19 @@ pub async fn static_handler(uri: Uri) -> Response {
     }
     if let Some(file) = Assets::get(path).filter(|_| !path.is_empty()) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
-        return ([(header::CONTENT_TYPE, mime.as_ref()), (header::CACHE_CONTROL, cache)], file.data).into_response();
+        let cache = if path.starts_with("assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+        return (
+            [
+                (header::CONTENT_TYPE, mime.as_ref()),
+                (header::CACHE_CONTROL, cache),
+            ],
+            file.data,
+        )
+            .into_response();
     }
     // Single-page app: every other route renders index.html.
     match Assets::get("index.html") {

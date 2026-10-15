@@ -45,6 +45,15 @@ pub struct ServerOpts {
 
 impl App {
     pub fn new(data_dir: &Path, token: Option<String>, public_url: String) -> Result<Arc<App>> {
+        Self::with_github(data_dir, token, public_url, github::GitHub::from_env()?)
+    }
+
+    pub fn with_github(
+        data_dir: &Path,
+        token: Option<String>,
+        public_url: String,
+        github: Option<github::GitHub>,
+    ) -> Result<Arc<App>> {
         std::fs::create_dir_all(data_dir)?;
         let db = Db::open(&data_dir.join("pit.db"))?;
         let cas = Cas::open(data_dir.join("cas"))?;
@@ -56,7 +65,7 @@ impl App {
             events,
             work: Notify::new(),
             token,
-            github: github::GitHub::from_env()?,
+            github,
             public_url,
             mirror_locks: Default::default(),
             queue_lock: Default::default(),
@@ -64,7 +73,14 @@ impl App {
         }))
     }
 
-    pub fn emit(&self, kind: &str, run_id: Option<&str>, group_id: Option<&str>, task_id: Option<&str>, data: serde_json::Value) {
+    pub fn emit(
+        &self,
+        kind: &str,
+        run_id: Option<&str>,
+        group_id: Option<&str>,
+        task_id: Option<&str>,
+        data: serde_json::Value,
+    ) {
         let _ = self.events.send(Event {
             kind: kind.to_string(),
             run_id: run_id.map(String::from),
@@ -97,16 +113,28 @@ impl App {
     }
 
     pub fn mirror_lock(&self, repo_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.mirror_locks.lock().entry(repo_id.to_string()).or_default().clone()
+        self.mirror_locks
+            .lock()
+            .entry(repo_id.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Loads the config for a commit, preferring a version from the overlay.
-    pub async fn load_config(&self, mirror: &Path, sha: &str, overlay: Option<&Overlay>) -> Result<PitConfig> {
+    pub async fn load_config(
+        &self,
+        mirror: &Path,
+        sha: &str,
+        overlay: Option<&Overlay>,
+    ) -> Result<PitConfig> {
         let scratch = self.data_dir.join("tmp");
         for name in crate::config::CONFIG_FILES {
             if let Some(entry) = overlay.and_then(|o| o.entries.iter().find(|e| e.path == *name)) {
                 let Some(d) = &entry.digest else { continue };
-                let src = self.cas.get(d)?.context("overlay config blob missing from CAS")?;
+                let src = self
+                    .cas
+                    .get(d)?
+                    .context("overlay config blob missing from CAS")?;
                 return crate::config::parse(name, &src, &scratch).await;
             }
             if let Some(src) = crate::git::show_file(mirror, sha, name).await? {
@@ -117,11 +145,18 @@ impl App {
     }
 
     pub fn load_overlay(&self, digest: &str) -> Result<Overlay> {
-        let bytes = self.cas.get(digest)?.context("overlay manifest missing from CAS")?;
+        let bytes = self
+            .cas
+            .get(digest)?
+            .context("overlay manifest missing from CAS")?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    pub async fn create_run(self: &Arc<Self>, req: CreateRun, github_pr: Option<u64>) -> Result<String> {
+    pub async fn create_run(
+        self: &Arc<Self>,
+        req: CreateRun,
+        github_pr: Option<u64>,
+    ) -> Result<String> {
         let repo = self.db.upsert_repo(&req.repo, req.url.as_deref(), None)?;
         let overlay_files = match &req.overlay {
             Some(d) => self.load_overlay(d)?.entries.len(),
@@ -138,26 +173,46 @@ impl App {
             req.no_cache,
             github_pr,
         )?;
-        self.emit("run.created", Some(&run_id), None, None, serde_json::json!({ "repo": repo.name, "sha": req.sha, "trigger": trigger }));
+        self.emit(
+            "run.created",
+            Some(&run_id),
+            None,
+            None,
+            serde_json::json!({ "repo": repo.name, "sha": req.sha, "trigger": trigger }),
+        );
         let app = self.clone();
         let id = run_id.clone();
         tokio::spawn(async move {
             if let Err(e) = app.plan_run(&id, &repo, &req).await {
                 tracing::warn!("planning {id} failed: {e:#}");
-                let _ = app.db.set_run_status(&id, Status::Error, Some(&format!("{e:#}")));
+                let _ = app
+                    .db
+                    .set_run_status(&id, Status::Error, Some(&format!("{e:#}")));
                 app.run_finished(&id).await;
             }
         });
         Ok(run_id)
     }
 
-    async fn plan_run(self: &Arc<Self>, run_id: &str, repo: &db::Repo, req: &CreateRun) -> Result<()> {
+    async fn plan_run(
+        self: &Arc<Self>,
+        run_id: &str,
+        repo: &db::Repo,
+        req: &CreateRun,
+    ) -> Result<()> {
         let mirror = self.ensure_commit(repo, &req.sha).await?;
-        let overlay = req.overlay.as_deref().map(|d| self.load_overlay(d)).transpose()?;
-        let config = self.load_config(&mirror, &req.sha, overlay.as_ref()).await?;
+        let overlay = req
+            .overlay
+            .as_deref()
+            .map(|d| self.load_overlay(d))
+            .transpose()?;
+        let config = self
+            .load_config(&mirror, &req.sha, overlay.as_ref())
+            .await?;
         let groups = crate::graph::plan(&config, &req.tasks)?;
         if groups.is_empty() {
-            self.db.set_run_status(run_id, Status::Passed, Some("no tasks to run"))?;
+            self.db
+                .set_run_status(run_id, Status::Passed, Some("no tasks to run"))?;
             self.run_finished(run_id).await;
             return Ok(());
         }
@@ -170,9 +225,16 @@ impl App {
                 .collect();
             backends.sort_by_key(|b| b.as_str());
             backends.dedup();
-            self.db.insert_group(run_id, &g.name, &g.os, &backends, &g.tasks)?;
+            self.db
+                .insert_group(run_id, &g.name, &g.os, &backends, &g.tasks)?;
         }
-        self.emit("run.planned", Some(run_id), None, None, serde_json::json!({ "groups": groups.len() }));
+        self.emit(
+            "run.planned",
+            Some(run_id),
+            None,
+            None,
+            serde_json::json!({ "groups": groups.len() }),
+        );
         if let Some(gh) = &self.github {
             gh.report_run(self, run_id).await;
         }
@@ -184,8 +246,14 @@ impl App {
     pub async fn group_finished(self: &Arc<Self>, run_id: &str) -> Result<()> {
         let groups = self.db.groups_for_run(run_id)?;
         if groups.iter().all(|g| g.status.is_done()) {
-            let failed = groups.iter().any(|g| !g.status.is_ok() && g.status != Status::Skipped);
-            let status = if failed { Status::Failed } else { Status::Passed };
+            let failed = groups
+                .iter()
+                .any(|g| !g.status.is_ok() && g.status != Status::Skipped);
+            let status = if failed {
+                Status::Failed
+            } else {
+                Status::Passed
+            };
             self.db.set_run_status(run_id, status, None)?;
             self.run_finished(run_id).await;
         } else if let Some(gh) = &self.github {
@@ -195,8 +263,18 @@ impl App {
     }
 
     pub async fn run_finished(self: &Arc<Self>, run_id: &str) {
-        let status = self.db.run(run_id).map(|r| r.status.as_str()).unwrap_or("error");
-        self.emit("run.finished", Some(run_id), None, None, serde_json::json!({ "status": status }));
+        let status = self
+            .db
+            .run(run_id)
+            .map(|r| r.status.as_str())
+            .unwrap_or("error");
+        self.emit(
+            "run.finished",
+            Some(run_id),
+            None,
+            None,
+            serde_json::json!({ "status": status }),
+        );
         if let Some(gh) = &self.github {
             gh.report_run(self, run_id).await;
         }
@@ -204,27 +282,48 @@ impl App {
     }
 
     pub fn authorized(&self, header: Option<&str>, query_token: Option<&str>) -> bool {
-        let Some(token) = &self.token else { return true };
-        let bearer = header.and_then(|h| h.strip_prefix("Bearer ")).map(str::trim);
+        let Some(token) = &self.token else {
+            return true;
+        };
+        let bearer = header
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::trim);
         let basic_ok = header
             .and_then(|h| h.strip_prefix("Basic "))
             .and_then(|b| {
                 use base64::Engine;
-                base64::engine::general_purpose::STANDARD.decode(b.trim()).ok()
+                base64::engine::general_purpose::STANDARD
+                    .decode(b.trim())
+                    .ok()
             })
-            .map(|raw| String::from_utf8_lossy(&raw).split_once(':').map(|(_, p)| p == token).unwrap_or(false))
+            .map(|raw| {
+                String::from_utf8_lossy(&raw)
+                    .split_once(':')
+                    .map(|(_, p)| p == token)
+                    .unwrap_or(false)
+            })
             .unwrap_or(false);
         bearer == Some(token.as_str()) || query_token == Some(token.as_str()) || basic_ok
     }
 }
 
 pub async fn serve(opts: ServerOpts) -> Result<()> {
-    let public_url = opts.public_url.clone().unwrap_or_else(|| format!("http://{}", opts.addr));
+    let public_url = opts
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}", opts.addr));
     let app = App::new(&opts.data_dir, opts.token.clone(), public_url)?;
     serve_app(app, opts.addr).await
 }
 
 pub async fn serve_app(app: Arc<App>, addr: SocketAddr) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    serve_listener(app, listener).await
+}
+
+pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) -> Result<()> {
     // Requeue work from workers that went away.
     let reaper = app.clone();
     tokio::spawn(async move {
@@ -245,16 +344,17 @@ pub async fn serve_app(app: Arc<App>, addr: SocketAddr) -> Result<()> {
     let queue_app = app.clone();
     tokio::spawn(async move {
         loop {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), queue_app.queue_kick.notified()).await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                queue_app.queue_kick.notified(),
+            )
+            .await;
             if let Err(e) = queue::tick(&queue_app).await {
                 tracing::warn!("merge queue tick failed: {e:#}");
             }
         }
     });
     let router = api::router(app.clone());
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
     tracing::info!("pit server listening on {}", app.public_url);
     axum::serve(listener, router).await?;
     Ok(())

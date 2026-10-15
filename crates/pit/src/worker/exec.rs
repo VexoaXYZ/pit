@@ -24,7 +24,20 @@ pub struct Outcome {
 /// Which isolation backends work on this host.
 pub async fn detect_backends() -> Vec<Backend> {
     let mut backends = vec![Backend::Host];
-    if cfg!(target_os = "linux") && probe("unshare", &["--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"]).await {
+    if cfg!(target_os = "linux")
+        && probe(
+            "unshare",
+            &[
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+                "true",
+            ],
+        )
+        .await
+    {
         backends.push(Backend::Sandbox);
     }
     if probe("docker", &["info", "--format", "{{.ServerVersion}}"]).await {
@@ -34,7 +47,12 @@ pub async fn detect_backends() -> Vec<Backend> {
 }
 
 async fn probe(bin: &str, args: &[&str]) -> bool {
-    let fut = Command::new(bin).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let fut = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     matches!(tokio::time::timeout(Duration::from_secs(10), fut).await, Ok(Ok(s)) if s.success())
 }
 
@@ -51,15 +69,28 @@ fn shell(script: &str) -> (String, Vec<String>) {
 }
 
 /// Builds the command for a task on the chosen backend.
-pub fn command(task: &TaskDef, backend: Backend, workdir: &Path, env: &[(String, String)]) -> Command {
+pub fn command(
+    task: &TaskDef,
+    backend: Backend,
+    workdir: &Path,
+    env: &[(String, String)],
+) -> Command {
     let network = task.network.unwrap_or(true);
     let (program, args): (String, Vec<String>) = match backend {
         Backend::Host => shell(&task.run),
         Backend::Sandbox => {
-            let mut a: Vec<String> = ["--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "--ipc", "--uts"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let mut a: Vec<String> = [
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+                "--ipc",
+                "--uts",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
             if !network {
                 a.push("--net".into());
             }
@@ -88,21 +119,36 @@ pub fn command(task: &TaskDef, backend: Backend, workdir: &Path, env: &[(String,
         }
     };
     let mut cmd = Command::new(program);
-    cmd.args(args).current_dir(workdir).envs(env.iter().cloned());
+    cmd.args(args)
+        .current_dir(workdir)
+        .envs(env.iter().cloned());
     cmd
 }
 
 /// Runs a command, sending log text to `live` as it arrives.
-pub async fn run(mut cmd: Command, timeout: Option<Duration>, live: mpsc::UnboundedSender<String>) -> Result<Outcome> {
+pub async fn run(
+    mut cmd: Command,
+    timeout: Option<Duration>,
+    live: mpsc::UnboundedSender<String>,
+) -> Result<Outcome> {
     let started = Instant::now();
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd.spawn().context("spawning task")?;
     let pid = child.id();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let out = child.stdout.take().map(|s| tokio::spawn(pump(s, tx.clone())));
-    let err = child.stderr.take().map(|s| tokio::spawn(pump(s, tx.clone())));
+    let out = child
+        .stdout
+        .take()
+        .map(|s| tokio::spawn(pump(s, tx.clone())));
+    let err = child
+        .stderr
+        .take()
+        .map(|s| tokio::spawn(pump(s, tx.clone())));
     drop(tx);
 
     let collector = tokio::spawn(async move {
@@ -117,7 +163,9 @@ pub async fn run(mut cmd: Command, timeout: Option<Duration>, live: mpsc::Unboun
             let _ = live.send(line);
         }
         if dropped > 0 {
-            log.push_str(&format!("\n[pit: {dropped} bytes of log output truncated]\n"));
+            log.push_str(&format!(
+                "\n[pit: {dropped} bytes of log output truncated]\n"
+            ));
         }
         log
     });
@@ -193,9 +241,18 @@ mod tests {
     #[tokio::test]
     async fn streams_output_and_reports_exit_codes() {
         let dir = tempfile::tempdir().unwrap();
-        let task = TaskDef { run: if cfg!(windows) { "echo hi && exit 3".into() } else { "echo hi; echo err >&2; exit 3".into() }, ..Default::default() };
+        let task = TaskDef {
+            run: if cfg!(windows) {
+                "echo hi && exit 3".into()
+            } else {
+                "echo hi; echo err >&2; exit 3".into()
+            },
+            ..Default::default()
+        };
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let out = run(command(&task, Backend::Host, dir.path(), &[]), None, tx).await.unwrap();
+        let out = run(command(&task, Backend::Host, dir.path(), &[]), None, tx)
+            .await
+            .unwrap();
         assert_eq!(out.exit_code, Some(3));
         assert!(out.log.contains("hi"));
         let mut live = String::new();
@@ -209,10 +266,19 @@ mod tests {
     #[tokio::test]
     async fn times_out_and_kills_children() {
         let dir = tempfile::tempdir().unwrap();
-        let task = TaskDef { run: "sleep 30 & sleep 30".into(), ..Default::default() };
+        let task = TaskDef {
+            run: "sleep 30 & sleep 30".into(),
+            ..Default::default()
+        };
         let (tx, _rx) = mpsc::unbounded_channel();
         let started = Instant::now();
-        let out = run(command(&task, Backend::Host, dir.path(), &[]), Some(Duration::from_millis(300)), tx).await.unwrap();
+        let out = run(
+            command(&task, Backend::Host, dir.path(), &[]),
+            Some(Duration::from_millis(300)),
+            tx,
+        )
+        .await
+        .unwrap();
         assert!(out.timed_out);
         assert!(started.elapsed() < Duration::from_secs(5));
     }

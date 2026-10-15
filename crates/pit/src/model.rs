@@ -93,7 +93,9 @@ impl<'de> Deserialize<'de> for CacheMode {
                     "unknown cache mode {other:?}, expected remote, workspace or off"
                 ))),
             },
-            other => Err(serde::de::Error::custom(format!("invalid cache mode {other}"))),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid cache mode {other}"
+            ))),
         }
     }
 }

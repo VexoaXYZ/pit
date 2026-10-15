@@ -16,7 +16,13 @@ pub fn client(server: &str, token: Option<String>) -> Result<Client> {
 }
 
 /// Server and worker in one process.
-pub async fn up(addr: SocketAddr, data: PathBuf, slots: usize, parallelism: usize, token: Option<String>) -> Result<()> {
+pub async fn up(
+    addr: SocketAddr,
+    data: PathBuf,
+    slots: usize,
+    parallelism: usize,
+    token: Option<String>,
+) -> Result<()> {
     let public = format!("http://{addr}");
     let app = crate::server::App::new(&data.join("server"), token.clone(), public.clone())?;
     let server = tokio::spawn(crate::server::serve_app(app, addr));
@@ -53,7 +59,12 @@ pub struct Submitted {
 }
 
 /// Snapshots the working tree and starts a run on it.
-pub async fn submit(client: &Client, dir: &Path, tasks: Vec<String>, no_cache: bool) -> Result<Submitted> {
+pub async fn submit(
+    client: &Client,
+    dir: &Path,
+    tasks: Vec<String>,
+    no_cache: bool,
+) -> Result<Submitted> {
     let snapshot = crate::snapshot::local(client, dir).await?;
     let created: serde_json::Value = client
         .post(
@@ -78,11 +89,18 @@ pub async fn submit(client: &Client, dir: &Path, tasks: Vec<String>, no_cache: b
 }
 
 /// Waits for a run to finish, calling `on_event` for every live event.
-pub async fn wait(client: &Client, run_id: &str, mut on_event: impl FnMut(&Event)) -> Result<RunView> {
+pub async fn wait(
+    client: &Client,
+    run_id: &str,
+    mut on_event: impl FnMut(&Event),
+) -> Result<RunView> {
     client
         .events(&format!("/api/runs/{run_id}/events"), |e| {
             on_event(&e);
-            !(e.kind == "run.finished" || (e.kind == "snapshot" && serde_json::from_value::<RunView>(e.data.clone()).is_ok_and(|v| v.status.is_done())))
+            !(e.kind == "run.finished"
+                || (e.kind == "snapshot"
+                    && serde_json::from_value::<RunView>(e.data.clone())
+                        .is_ok_and(|v| v.status.is_done())))
         })
         .await?;
     client.get(&format!("/api/runs/{run_id}")).await
@@ -94,7 +112,11 @@ struct Style {
 
 impl Style {
     fn paint(&self, code: &str, s: &str) -> String {
-        if self.color { format!("\x1b[{code}m{s}\x1b[0m") } else { s.to_string() }
+        if self.color {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
     }
     fn dim(&self, s: &str) -> String {
         self.paint("2", s)
@@ -111,16 +133,33 @@ impl Style {
 }
 
 fn secs(ms: u64) -> String {
-    if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", ms as f64 / 1000.0) }
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
 }
 
-pub async fn run(client: &Client, dir: &Path, tasks: Vec<String>, no_cache: bool, verbose: bool, json: bool) -> Result<i32> {
+pub async fn run(
+    client: &Client,
+    dir: &Path,
+    tasks: Vec<String>,
+    no_cache: bool,
+    verbose: bool,
+    json: bool,
+) -> Result<i32> {
     let started = Instant::now();
     let sub = submit(client, dir, tasks, no_cache).await?;
-    let style = Style { color: std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none() };
+    let style = Style {
+        color: std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+    };
     let snap = &sub.snapshot;
     if !json {
-        let overlay = if snap.files > 0 { format!(" +{} changed file(s)", snap.files) } else { String::new() };
+        let overlay = if snap.files > 0 {
+            format!(" +{} changed file(s)", snap.files)
+        } else {
+            String::new()
+        };
         eprintln!(
             "{} {} {}@{}{} {}",
             style.paint("1", "pit"),
@@ -150,28 +189,54 @@ pub async fn run(client: &Client, dir: &Path, tasks: Vec<String>, no_cache: bool
             "group.started" if !json => {
                 let name = e.data["name"].as_str().unwrap_or_default();
                 let worker = e.data["worker"].as_str().unwrap_or_default();
-                let _ = writeln!(stderr, "  {} {}", style.paint("1", name), style.dim(&format!("on {worker}")));
+                let _ = writeln!(
+                    stderr,
+                    "  {} {}",
+                    style.paint("1", name),
+                    style.dim(&format!("on {worker}"))
+                );
             }
             "group.finished" if !json => {
                 let name = e.data["name"].as_str().unwrap_or_default();
                 let prep = e.data["prepareMs"].as_u64().unwrap_or(0);
-                let _ = writeln!(stderr, "  {} {}", style.dim(name), style.dim(&format!("workspace ready in {}", secs(prep))));
+                let _ = writeln!(
+                    stderr,
+                    "  {} {}",
+                    style.dim(name),
+                    style.dim(&format!("workspace ready in {}", secs(prep)))
+                );
             }
             "task.log" if verbose && !json => {
                 let text = e.data["text"].as_str().unwrap_or_default();
-                let label = e.task_id.as_ref().and_then(|t| names.get(t)).map(|(_, n)| n.clone()).unwrap_or_default();
+                let label = e
+                    .task_id
+                    .as_ref()
+                    .and_then(|t| names.get(t))
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_default();
                 for line in text.lines() {
                     let _ = writeln!(stderr, "    {} {line}", style.dim(&format!("{label} │")));
                 }
             }
             "task.finished" if !json => {
-                let status: Status = serde_json::from_value(e.data["status"].clone()).unwrap_or(Status::Error);
+                let status: Status =
+                    serde_json::from_value(e.data["status"].clone()).unwrap_or(Status::Error);
                 let name = e.data["name"].as_str().unwrap_or_default();
                 let ms = e.data["durationMs"].as_u64().unwrap_or(0);
                 let detail = match status {
                     Status::Cached => style.paint("36", "cached"),
                     Status::Skipped => style.paint("33", "skipped"),
-                    Status::Failed => style.paint("31", &format!("{} exit {}", secs(ms), e.data["exitCode"].as_i64().map(|c| c.to_string()).unwrap_or("?".into()))),
+                    Status::Failed => style.paint(
+                        "31",
+                        &format!(
+                            "{} exit {}",
+                            secs(ms),
+                            e.data["exitCode"]
+                                .as_i64()
+                                .map(|c| c.to_string())
+                                .unwrap_or("?".into())
+                        ),
+                    ),
                     _ => secs(ms),
                 };
                 let _ = writeln!(stderr, "    {} {name:<24} {detail}", style.status(status));
@@ -195,7 +260,11 @@ pub async fn run(client: &Client, dir: &Path, tasks: Vec<String>, no_cache: bool
     } else {
         // Failure logs, unless they were already streamed.
         for g in &view.groups {
-            for t in g.tasks.iter().filter(|t| matches!(t.status, Status::Failed | Status::Error)) {
+            for t in g
+                .tasks
+                .iter()
+                .filter(|t| matches!(t.status, Status::Failed | Status::Error))
+            {
                 if let Some(m) = &t.message {
                     eprintln!("\n  {} {}.{}: {m}", style.status(t.status), g.name, t.name);
                 }
@@ -210,10 +279,20 @@ pub async fn run(client: &Client, dir: &Path, tasks: Vec<String>, no_cache: bool
             }
         }
         let all: Vec<&TaskView> = view.groups.iter().flat_map(|g| &g.tasks).collect();
-        let ran = all.iter().filter(|t| matches!(t.status, Status::Passed | Status::Failed)).count();
+        let ran = all
+            .iter()
+            .filter(|t| matches!(t.status, Status::Passed | Status::Failed))
+            .count();
         let cached = all.iter().filter(|t| t.status == Status::Cached).count();
-        let verdict = if view.status.is_ok() { style.paint("32;1", "passed") } else { style.paint("31;1", view.status.as_str()) };
-        let mut line = format!("{verdict} in {} · {ran} ran, {cached} cached", secs(elapsed));
+        let verdict = if view.status.is_ok() {
+            style.paint("32;1", "passed")
+        } else {
+            style.paint("31;1", view.status.as_str())
+        };
+        let mut line = format!(
+            "{verdict} in {} · {ran} ran, {cached} cached",
+            secs(elapsed)
+        );
         if let Some(m) = &view.message {
             line.push_str(&format!(" · {m}"));
         }
@@ -248,22 +327,42 @@ pub async fn runs(client: &Client, limit: usize) -> Result<i32> {
 }
 
 pub async fn logs(client: &Client, run: &str, task: &str) -> Result<i32> {
-    let text = client.get_text(&format!("/api/runs/{run}/tasks/{task}/log")).await?;
+    let text = client
+        .get_text(&format!("/api/runs/{run}/tasks/{task}/log"))
+        .await?;
     print!("{text}");
     Ok(0)
 }
 
-pub async fn queue_add(client: &Client, dir: &Path, branch: &str, target: Option<String>) -> Result<i32> {
-    let root = crate::git::toplevel(dir).await?;
-    let root = std::fs::canonicalize(&root).unwrap_or(root);
-    let repo = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+pub async fn queue_add(
+    client: &Client,
+    dir: &Path,
+    branch: &str,
+    target: Option<String>,
+) -> Result<i32> {
+    let id = crate::snapshot::identity(dir).await?;
+    if !id.remote {
+        eprintln!(
+            "note: {} has no `origin` remote, so Pit will push merges into this checkout",
+            id.name
+        );
+    }
     let entry: QueueEntryView = client
         .post(
             "/api/queue",
-            &QueueAdd { repo, url: Some(root.to_string_lossy().to_string()), branch: Some(branch.into()), pr: None, target },
+            &QueueAdd {
+                repo: id.name,
+                url: Some(id.url),
+                branch: Some(branch.into()),
+                pr: None,
+                target,
+            },
         )
         .await?;
-    println!("{} queued: {} → {} ({})", entry.id, entry.source, entry.target, entry.status);
+    println!(
+        "{} queued: {} → {} ({})",
+        entry.id, entry.source, entry.target, entry.status
+    );
     if !entry.affected.is_empty() {
         println!("affected: {}", entry.affected.join(", "));
     }

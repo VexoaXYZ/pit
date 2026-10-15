@@ -50,12 +50,20 @@ impl Client {
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let resp = self.req(reqwest::Method::GET, path).send().await.with_context(|| self.unreachable())?;
+        let resp = self
+            .req(reqwest::Method::GET, path)
+            .send()
+            .await
+            .with_context(|| self.unreachable())?;
         Ok(Self::check(resp).await?.json().await?)
     }
 
     pub async fn get_opt<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        let resp = self.req(reqwest::Method::GET, path).send().await.with_context(|| self.unreachable())?;
+        let resp = self
+            .req(reqwest::Method::GET, path)
+            .send()
+            .await
+            .with_context(|| self.unreachable())?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -63,29 +71,51 @@ impl Client {
     }
 
     pub async fn get_text(&self, path: &str) -> Result<String> {
-        let resp = self.req(reqwest::Method::GET, path).send().await.with_context(|| self.unreachable())?;
+        let resp = self
+            .req(reqwest::Method::GET, path)
+            .send()
+            .await
+            .with_context(|| self.unreachable())?;
         Ok(Self::check(resp).await?.text().await?)
     }
 
     pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T> {
-        let resp = self.req(reqwest::Method::POST, path).json(body).send().await.with_context(|| self.unreachable())?;
+        let resp = self
+            .req(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| self.unreachable())?;
         Ok(Self::check(resp).await?.json().await?)
     }
 
     pub async fn post_empty<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let resp = self.req(reqwest::Method::POST, path).json(body).send().await.with_context(|| self.unreachable())?;
+        let resp = self
+            .req(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| self.unreachable())?;
         Self::check(resp).await?;
         Ok(())
     }
 
     pub async fn put_json<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
-        let resp = self.req(reqwest::Method::PUT, path).json(body).send().await.with_context(|| self.unreachable())?;
+        let resp = self
+            .req(reqwest::Method::PUT, path)
+            .json(body)
+            .send()
+            .await
+            .with_context(|| self.unreachable())?;
         Self::check(resp).await?;
         Ok(())
     }
 
     fn unreachable(&self) -> String {
-        format!("could not reach the Pit server at {} (start one with `pit up`)", self.base)
+        format!(
+            "could not reach the Pit server at {} (start one with `pit up`)",
+            self.base
+        )
     }
 
     /// Long-poll for work. Uses its own timeout, longer than the server's.
@@ -119,7 +149,11 @@ impl Client {
     }
 
     pub async fn cas_get(&self, digest: &str) -> Result<Vec<u8>> {
-        let resp = self.req(reqwest::Method::GET, &format!("/api/cas/{digest}")).send().await.with_context(|| self.unreachable())?;
+        let resp = self
+            .req(reqwest::Method::GET, &format!("/api/cas/{digest}"))
+            .send()
+            .await
+            .with_context(|| self.unreachable())?;
         let bytes = Self::check(resp).await?.bytes().await?;
         if crate::cas::digest(&bytes) != digest {
             bail!("blob {digest} failed verification");
@@ -130,7 +164,8 @@ impl Client {
     /// Uploads blobs the server does not have yet, a few at a time.
     pub async fn upload_missing(&self, blobs: Vec<(String, Vec<u8>)>) -> Result<usize> {
         let digests: Vec<String> = blobs.iter().map(|(d, _)| d.clone()).collect();
-        let missing: std::collections::HashSet<String> = self.cas_missing(&digests).await?.into_iter().collect();
+        let missing: std::collections::HashSet<String> =
+            self.cas_missing(&digests).await?.into_iter().collect();
         let uploads = blobs.into_iter().filter(|(d, _)| missing.contains(d));
         let results: Vec<Result<()>> = futures::stream::iter(uploads)
             .map(|(d, b)| async move { self.cas_put(&d, b).await })

@@ -30,7 +30,11 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({ "error": format!("{:#}", self.1) }))).into_response()
+        (
+            self.0,
+            Json(serde_json::json!({ "error": format!("{:#}", self.1) })),
+        )
+            .into_response()
     }
 }
 
@@ -77,12 +81,24 @@ struct TokenQuery {
     token: Option<String>,
 }
 
-async fn auth(State(app): State<Arc<App>>, Query(q): Query<TokenQuery>, req: Request, next: Next) -> Response {
-    let header = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+async fn auth(
+    State(app): State<Arc<App>>,
+    Query(q): Query<TokenQuery>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
     if req.uri().path() == "/api/health" || app.authorized(header, q.token.as_deref()) {
         next.run(req).await
     } else {
-        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "missing or invalid token" }))).into_response()
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing or invalid token" })),
+        )
+            .into_response()
     }
 }
 
@@ -108,12 +124,17 @@ async fn repos(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>
         .db
         .repos()?
         .into_iter()
-        .map(|r| serde_json::json!({ "id": r.id, "name": r.name, "url": r.url, "github": r.github }))
+        .map(
+            |r| serde_json::json!({ "id": r.id, "name": r.name, "url": r.url, "github": r.github }),
+        )
         .collect();
     Ok(Json(repos.into()))
 }
 
-async fn create_run(State(app): State<Arc<App>>, Json(req): Json<CreateRun>) -> ApiResult<Json<serde_json::Value>> {
+async fn create_run(
+    State(app): State<Arc<App>>,
+    Json(req): Json<CreateRun>,
+) -> ApiResult<Json<serde_json::Value>> {
     if let Some(d) = &req.overlay {
         if !app.cas.contains(d) {
             return Err(anyhow::anyhow!("overlay {d} is not in the CAS; upload it first").into());
@@ -130,23 +151,42 @@ struct ListQuery {
     repo: Option<String>,
 }
 
-async fn list_runs(State(app): State<Arc<App>>, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<RunView>>> {
-    let ids = app.db.list_runs(q.limit.unwrap_or(50).min(500), q.repo.as_deref())?;
-    let runs = ids.iter().map(|id| app.db.run_view(id)).collect::<anyhow::Result<_>>()?;
+async fn list_runs(
+    State(app): State<Arc<App>>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<Vec<RunView>>> {
+    let ids = app
+        .db
+        .list_runs(q.limit.unwrap_or(50).min(500), q.repo.as_deref())?;
+    let runs = ids
+        .iter()
+        .map(|id| app.db.run_view(id))
+        .collect::<anyhow::Result<_>>()?;
     Ok(Json(runs))
 }
 
 async fn get_run(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult<Json<RunView>> {
-    app.db.run_view(&id).map(Json).map_err(|_| not_found(format!("run {id}")))
+    app.db
+        .run_view(&id)
+        .map(Json)
+        .map_err(|_| not_found(format!("run {id}")))
 }
 
-async fn cancel_run(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult<Json<serde_json::Value>> {
+async fn cancel_run(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
     app.db.cancel_run(&id)?;
-    app.emit("run.updated", Some(&id), None, None, serde_json::Value::Null);
+    app.emit(
+        "run.updated",
+        Some(&id),
+        None,
+        None,
+        serde_json::Value::Null,
+    );
     app.group_finished(&id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
-
 
 fn to_sse(e: &Event) -> SseEvent {
     SseEvent::default().data(serde_json::to_string(e).unwrap_or_default())
@@ -156,7 +196,10 @@ fn to_sse(e: &Event) -> SseEvent {
 /// connects late still sees the full state, and closes after `run.finished`.
 async fn run_events(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult<Response> {
     let rx = app.events.subscribe();
-    let view = app.db.run_view(&id).map_err(|_| not_found(format!("run {id}")))?;
+    let view = app
+        .db
+        .run_view(&id)
+        .map_err(|_| not_found(format!("run {id}")))?;
     let done = view.status.is_done();
     let snapshot = Event {
         kind: "snapshot".into(),
@@ -202,14 +245,18 @@ async fn run_events(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiR
             }
         }
     };
-    Ok(Sse::new(first.chain(live)).keep_alive(KeepAlive::default()).into_response())
+    Ok(Sse::new(first.chain(live))
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 async fn all_events(State(app): State<Arc<App>>) -> Response {
     let live = BroadcastStream::new(app.events.subscribe())
         .filter_map(|e| e.ok())
         .map(|e| Ok::<_, Infallible>(to_sse(&e)));
-    Sse::new(live).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(live)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn task_log(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult<Response> {
@@ -217,8 +264,14 @@ async fn task_log(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiRes
     Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response())
 }
 
-async fn run_task_log(State(app): State<Arc<App>>, Path((run, name)): Path<(String, String)>) -> ApiResult<Response> {
-    let id = app.db.find_task(&run, &name)?.ok_or_else(|| not_found(format!("task {name} in run {run}")))?;
+async fn run_task_log(
+    State(app): State<Arc<App>>,
+    Path((run, name)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let id = app
+        .db
+        .find_task(&run, &name)?
+        .ok_or_else(|| not_found(format!("task {name} in run {run}")))?;
     task_log(State(app), Path(id)).await
 }
 
@@ -231,21 +284,45 @@ fn read_task_log(app: &App, task_id: &str) -> anyhow::Result<String> {
     app.db.live_log(task_id)
 }
 
-async fn append_log(State(app): State<Arc<App>>, Path(id): Path<String>, Json(chunk): Json<LogChunk>) -> ApiResult<StatusCode> {
+async fn append_log(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(chunk): Json<LogChunk>,
+) -> ApiResult<StatusCode> {
     let (group_id, run_id, _) = app.db.task_group(&id)?;
     app.db.append_log(&id, &chunk.text)?;
-    app.emit("task.log", Some(&run_id), Some(&group_id), Some(&id), serde_json::json!({ "text": chunk.text }));
+    app.emit(
+        "task.log",
+        Some(&run_id),
+        Some(&group_id),
+        Some(&id),
+        serde_json::json!({ "text": chunk.text }),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn start_task(State(app): State<Arc<App>>, Path(id): Path<String>, Json(req): Json<TaskStart>) -> ApiResult<StatusCode> {
+async fn start_task(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(req): Json<TaskStart>,
+) -> ApiResult<StatusCode> {
     let (group_id, run_id, name) = app.db.task_group(&id)?;
     app.db.start_task(&id, req.action_key.as_deref())?;
-    app.emit("task.started", Some(&run_id), Some(&group_id), Some(&id), serde_json::json!({ "name": name }));
+    app.emit(
+        "task.started",
+        Some(&run_id),
+        Some(&group_id),
+        Some(&id),
+        serde_json::json!({ "name": name }),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn finish_task(State(app): State<Arc<App>>, Path(id): Path<String>, Json(r): Json<TaskResult>) -> ApiResult<StatusCode> {
+async fn finish_task(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(r): Json<TaskResult>,
+) -> ApiResult<StatusCode> {
     let (group_id, run_id, name) = app.db.task_group(&id)?;
     app.db.finish_task(&id, &r)?;
     if r.log_digest.is_some() {
@@ -266,7 +343,11 @@ async fn heartbeat(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiRe
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn finish_group(State(app): State<Arc<App>>, Path(id): Path<String>, Json(r): Json<GroupResult>) -> ApiResult<StatusCode> {
+async fn finish_group(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(r): Json<GroupResult>,
+) -> ApiResult<StatusCode> {
     let group = app.db.group(&id)?;
     app.db.finish_group(&id, &r)?;
     app.emit(
@@ -298,7 +379,10 @@ async fn workers(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Valu
 }
 
 /// Long-poll: returns a job the moment one is claimable, or `idle` after 20s.
-async fn claim(State(app): State<Arc<App>>, Json(info): Json<WorkerInfo>) -> ApiResult<Json<ClaimResponse>> {
+async fn claim(
+    State(app): State<Arc<App>>,
+    Json(info): Json<WorkerInfo>,
+) -> ApiResult<Json<ClaimResponse>> {
     app.db.touch_worker(&info)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -332,22 +416,47 @@ async fn claim(State(app): State<Arc<App>>, Json(info): Json<WorkerInfo>) -> Api
     }
 }
 
-async fn cache_get(State(app): State<Arc<App>>, Path(key): Path<String>) -> ApiResult<Json<CacheEntry>> {
-    app.db.cache_get(&key)?.map(Json).ok_or_else(|| not_found("cache entry"))
+async fn cache_get(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<CacheEntry>> {
+    app.db
+        .cache_get(&key)?
+        .map(Json)
+        .ok_or_else(|| not_found("cache entry"))
 }
 
-async fn cache_put(State(app): State<Arc<App>>, Path(key): Path<String>, Json(entry): Json<CacheEntry>) -> ApiResult<StatusCode> {
-    for d in entry.outputs.iter().map(|o| &o.digest).chain(entry.log_digest.iter()) {
+async fn cache_put(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    Json(entry): Json<CacheEntry>,
+) -> ApiResult<StatusCode> {
+    for d in entry
+        .outputs
+        .iter()
+        .map(|o| &o.digest)
+        .chain(entry.log_digest.iter())
+    {
         if !app.cas.contains(d) {
-            return Err(anyhow::anyhow!("cache entry references {d}, which is not in the CAS").into());
+            return Err(
+                anyhow::anyhow!("cache entry references {d}, which is not in the CAS").into(),
+            );
         }
     }
     app.db.cache_put(&key, &entry)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn cas_missing(State(app): State<Arc<App>>, Json(digests): Json<Vec<String>>) -> Json<Vec<String>> {
-    Json(digests.into_iter().filter(|d| !app.cas.contains(d)).collect())
+async fn cas_missing(
+    State(app): State<Arc<App>>,
+    Json(digests): Json<Vec<String>>,
+) -> Json<Vec<String>> {
+    Json(
+        digests
+            .into_iter()
+            .filter(|d| !app.cas.contains(d))
+            .collect(),
+    )
 }
 
 async fn cas_get(State(app): State<Arc<App>>, Path(digest): Path<String>) -> ApiResult<Response> {
@@ -355,7 +464,11 @@ async fn cas_get(State(app): State<Arc<App>>, Path(digest): Path<String>) -> Api
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
 }
 
-async fn cas_put(State(app): State<Arc<App>>, Path(digest): Path<String>, body: Bytes) -> ApiResult<StatusCode> {
+async fn cas_put(
+    State(app): State<Arc<App>>,
+    Path(digest): Path<String>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
     app.cas.put_checked(&digest, &body)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -364,6 +477,10 @@ async fn queue_list(State(app): State<Arc<App>>) -> ApiResult<Json<Vec<QueueEntr
     Ok(Json(super::queue::list(&app)?))
 }
 
-async fn queue_add(State(app): State<Arc<App>>, _h: HeaderMap, Json(req): Json<QueueAdd>) -> ApiResult<Json<QueueEntryView>> {
+async fn queue_add(
+    State(app): State<Arc<App>>,
+    _h: HeaderMap,
+    Json(req): Json<QueueAdd>,
+) -> ApiResult<Json<QueueEntryView>> {
     Ok(Json(super::queue::add(&app, req).await?))
 }

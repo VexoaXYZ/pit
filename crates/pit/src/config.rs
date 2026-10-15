@@ -53,7 +53,10 @@ pub async fn parse(name: &str, source: &[u8], scratch: &Path) -> Result<PitConfi
 async fn eval_ts(source: &[u8], scratch: &Path) -> Result<PitConfig> {
     std::fs::create_dir_all(scratch)?;
     // `.mts` makes both Node and Bun treat the file as an ES module.
-    let file = scratch.join(format!("pit-config-{}.mts", &crate::cas::digest(source)[..16]));
+    let file = scratch.join(format!(
+        "pit-config-{}.mts",
+        &crate::cas::digest(source)[..16]
+    ));
     std::fs::write(&file, source)?;
     let file_arg = file.to_string_lossy().to_string();
 
@@ -62,7 +65,8 @@ async fn eval_ts(source: &[u8], scratch: &Path) -> Result<PitConfig> {
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.args(&args).arg(EVAL_SCRIPT).arg(&file_arg);
         cmd.stdin(Stdio::null()).kill_on_drop(true);
-        let out = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
+        let out = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await
+        {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => {
                 last_err = format!("{bin}: {e}");
@@ -94,10 +98,17 @@ fn runtimes() -> Vec<(String, Vec<String>)> {
         "-e".to_string(),
     ];
     if let Ok(bin) = std::env::var("PIT_JS_RUNTIME") {
-        let args = if bin.contains("bun") { vec!["-e".to_string()] } else { node_args };
+        let args = if bin.contains("bun") {
+            vec!["-e".to_string()]
+        } else {
+            node_args
+        };
         return vec![(bin, args)];
     }
-    vec![("node".into(), node_args), ("bun".into(), vec!["-e".into()])]
+    vec![
+        ("node".into(), node_args),
+        ("bun".into(), vec!["-e".into()]),
+    ]
 }
 
 /// Folds the `tasks` shorthand into a `default` group and fills defaults.
@@ -109,7 +120,10 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
         let tasks = std::mem::take(&mut config.tasks);
         config.groups.insert(
             "default".into(),
-            crate::model::GroupDef { tasks, ..Default::default() },
+            crate::model::GroupDef {
+                tasks,
+                ..Default::default()
+            },
         );
     }
     for (gname, group) in config.groups.iter_mut() {
