@@ -925,3 +925,81 @@ async fn gc_does_not_empty_the_cache_for_blobs_it_cannot_free_yet() {
     let newest = run(&pit, dir).await;
     assert_eq!(newest.groups[0].tasks[0].status, Status::Cached);
 }
+
+/// When origin is down (a GitHub outage), queueing still works from the last
+/// fetched state, the entry says why it is waiting, and it lands once origin
+/// is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_queue_waits_out_an_origin_outage() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let down = tmp.path().join("origin.git.down");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    write(
+        &work,
+        "pit.config.json",
+        r#"{"tasks":{"t":{"run":"true","inputs":["src/**"]}}}"#,
+    );
+    write(&work, "src/a.txt", "a\n");
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    sh(&work, "git checkout -q -b feature && echo b > src/b.txt && git add -A && git commit -qm b && git push -q origin feature && git checkout -q main");
+    let url = origin.to_string_lossy().to_string();
+
+    // Warm the server's mirror while origin is up.
+    let sha = sh(&work, "git rev-parse main").trim().to_string();
+    let created: serde_json::Value = pit
+        .client
+        .post(
+            "/api/runs",
+            &serde_json::json!({ "repo": "outage", "url": url, "sha": sha }),
+        )
+        .await
+        .unwrap();
+    pit::cli::wait(&pit.client, created["id"].as_str().unwrap(), |_| {})
+        .await
+        .unwrap();
+
+    std::fs::rename(&origin, &down).unwrap();
+    let entry: QueueEntryView = pit
+        .client
+        .post(
+            "/api/queue",
+            &QueueAdd {
+                repo: "outage".into(),
+                url: Some(url.clone()),
+                branch: Some("feature".into()),
+                pr: None,
+                target: None,
+            },
+        )
+        .await
+        .expect("queueing must work during an outage");
+    assert_eq!(entry.status, "queued");
+    assert!(
+        entry
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("waiting for origin"),
+        "{entry:?}"
+    );
+
+    std::fs::rename(&down, &origin).unwrap();
+    let landed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let entries: Vec<QueueEntryView> = pit.client.get("/api/queue").await.unwrap();
+            let e = entries.into_iter().find(|e| e.id == entry.id).unwrap();
+            if e.status == "landed" {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("entry did not land after origin came back");
+    assert!(landed.landed_sha.is_some());
+    assert!(sh(&origin, "git ls-tree -r --name-only main").contains("src/b.txt"));
+}

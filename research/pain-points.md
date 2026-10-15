@@ -10,7 +10,6 @@ against Pit on one machine, and a verdict backed by what was measured. Verdicts:
 | --- | --- | --- |
 | B5 | `actions/checkout` fails intermittently; release jobs scheduled twice | [HN 46614558](https://news.ycombinator.com/item?id=46614558) |
 | B6 | Bills keep climbing; teams move CI to one box for a warm cache | [HN 49612772](https://news.ycombinator.com/item?id=49612772) |
-| B7 | GitHub outages stop all CI (4 hours in Feb 2026, 7.5 hours in Aug 2026) | [NERVICO](https://nervico.com/en/blog/github-actions-alternatives-ci-cd/) |
 
 ## P1. Cache misses are silent, and eviction makes them random
 
@@ -331,3 +330,54 @@ Covered by the unit test `typos_in_the_config_are_errors`.
 
 **Verdict: SOLVED**, with the caveat that `pit run` needs a reachable Pit server and workers
 for the target OS; it does not run anything on the laptop itself.
+
+## P7. A GitHub outage stops all CI
+
+**Pain.** When GitHub is down, Actions is down: a four-hour outage in February 2026
+([NERVICO](https://nervico.com/en/blog/github-actions-alternatives-ci-cd/)) and a 7.5-hour one on
+Aug 17, 2026, with GitHub's CTO saying capacity planning had to go from 10x to 30x
+([HackerNoon](https://hackernoon.com/ai-agents-are-killing-the-git-client-not-git-what-anthropics-scion-and-cursors-origin-show)).
+Pit keeps GitHub as the source of truth, so the question is what still works without it.
+
+**Reproduction** (`/tmp/painhunt/p7`): repo with a bare origin and a `feature` branch; one run
+while origin is up; then make origin unreachable (`mv origin.git origin.git.down`).
+
+**Before** (research/pain-hunt at P6):
+
+```
+-- uncommitted change            passed in 154ms
+-- new local commit (unpushed)   passed in 137ms
+-- merge queue during the outage
+Please make sure you have the correct access rights and the repository exists.   (nothing queued)
+== RECOVERY                      (no entry)
+```
+
+CI kept working: workers already hold the base commit in their warm mirrors, and changes,
+including unpushed commits, travel in the overlay. The queue refused the change with raw git
+output, so nothing landed afterwards either.
+
+**Fixes** (research/pain-hunt):
+- Queueing during an outage uses the server mirror's last fetched state of the branch. The
+  entry waits with a reason, and each queue tick retries the fetch.
+- A branch Pit has never fetched gets an explanation instead of git output.
+- A bug the first live run caught: the CLI only made a relative local remote (`../origin.git`)
+  absolute if the path existed, so during the outage it registered the repo with a relative
+  URL and the entry could never land. Local remotes now resolve lexically.
+
+```
+-- never-seen branch during outage:
+pit: 400 Bad Request: feature2 is not known to Pit yet, and /tmp/painhunt/p7/origin.git is unreachable
+('/tmp/painhunt/p7/origin.git' does not appear to be a git repository); Pit can only queue branches it fetched before the outage
+== OUTAGE  (feature2 seen by the server earlier, as a push webhook would)
+q_ea22b0d2b458   queued   feature2 → main   waiting for origin to come back ('/tmp/painhunt/p7/origin.git' does not appear to be a git repository)
+== RECOVERY
+after 3s:   q_ea22b0d2b458   landed   feature2 → main   tested
+main has src/c.txt? 1
+```
+
+Covered by the e2e test `merge_queue_waits_out_an_origin_outage` and the unit test
+`local_remotes_resolve_even_when_missing`.
+
+**Verdict: PARTIAL.** Running CI no longer depends on GitHub being up, and queued changes land
+as soon as it is back. But nothing can be merged or reported to GitHub during an outage (it is
+still the source of truth), and webhooks GitHub fails to deliver are not replayed by Pit.

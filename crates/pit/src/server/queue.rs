@@ -89,7 +89,19 @@ pub fn remove(app: &App, key: &str, repo: Option<&str>, reason: &str) -> Result<
 
 pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     let repo = app.db.upsert_repo(&req.repo, req.url.as_deref(), None)?;
-    let mirror = app.fetch_mirror(&repo).await?;
+    // If origin is down, queue from the last fetched state of the branch; the
+    // queue lands it once origin is back.
+    let mut offline: Option<String> = None;
+    let mirror = match app.fetch_mirror(&repo).await {
+        Ok(m) => m,
+        Err(e) if app.mirror_dir(&repo.id).join("HEAD").exists() => {
+            let why = origin_error(&e);
+            tracing::warn!("queueing from the last fetched state: {why}");
+            offline = Some(why);
+            app.mirror_dir(&repo.id)
+        }
+        Err(e) => bail!("cannot reach {}: {}", repo.url, origin_error(&e)),
+    };
     let source = match (&req.branch, req.pr) {
         (Some(b), None) => b.clone(),
         (None, Some(n)) => format!("pr/{n}"),
@@ -97,7 +109,14 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     };
     let head = git::rev_parse(&mirror, &source_ref(&source))
         .await?
-        .with_context(|| format!("{source} not found in {}", repo.url))?;
+        .with_context(|| match &offline {
+            Some(why) => format!(
+                "{source} is not known to Pit yet, and {} is unreachable ({why}); \
+                 Pit can only queue branches it fetched before the outage",
+                repo.url
+            ),
+            None => format!("{source} not found in {}", repo.url),
+        })?;
     let target = match req.target {
         Some(t) => t,
         None => default_branch(&mirror).await?,
@@ -146,6 +165,18 @@ async fn default_branch(mirror: &Path) -> Result<String> {
 }
 
 /// Advances every queue: collects results, lands, and starts new candidates.
+/// The useful line of a failed fetch, without git's boilerplate.
+fn origin_error(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    for marker in ["fatal: ", "error: "] {
+        if let Some(i) = text.find(marker) {
+            let rest = &text[i + marker.len()..];
+            return rest.lines().next().unwrap_or(rest).trim().to_string();
+        }
+    }
+    text.lines().next().unwrap_or_default().trim().to_string()
+}
+
 pub async fn tick(app: &Arc<App>) -> Result<()> {
     let _guard = app.queue_lock.lock().await;
     let active = app.db.queue_active()?;
@@ -180,9 +211,31 @@ async fn tick_target(
     app: &Arc<App>,
     repo: &Repo,
     target: &str,
-    entries: Vec<QueueRow>,
+    mut entries: Vec<QueueRow>,
 ) -> Result<()> {
-    let mirror = app.fetch_mirror(repo).await?;
+    let mirror = match app.fetch_mirror(repo).await {
+        Ok(m) => m,
+        Err(e) => {
+            // Origin is down (a GitHub outage, a network blip). Nothing can be
+            // tested against the latest target or landed, so wait, and say why.
+            let reason = format!("waiting for origin to come back ({})", origin_error(&e));
+            for entry in entries
+                .iter_mut()
+                .filter(|e| e.reason.as_deref() != Some(reason.as_str()))
+            {
+                entry.reason = Some(reason.clone());
+                app.db.queue_update(entry)?;
+            }
+            app.emit(
+                "queue.updated",
+                None,
+                None,
+                None,
+                serde_json::json!({ "waiting": reason }),
+            );
+            return Ok(());
+        }
+    };
     if let Some(gh) = repo.github.as_deref().and(app.github.as_ref()) {
         let url = gh.push_url(repo.github.as_deref().unwrap()).await?;
         git::git(&mirror, &["config", "remote.origin.pushurl", &url]).await?;
