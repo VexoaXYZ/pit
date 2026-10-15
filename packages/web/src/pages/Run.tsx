@@ -184,7 +184,7 @@ function GroupCard({
             </span>
           ) : group.status === "queued" ? (
             <span>waiting for a worker</span>
-          ) : group.status === "running" ? (
+          ) : group.status === "running" && group.tasks.every((t) => t.status === "queued") ? (
             <span>preparing workspace…</span>
           ) : null}
         </div>
@@ -405,7 +405,7 @@ export function RunPage({ id }: { id: string }) {
             <div>
               <dt>Overlay</dt>
               <dd>
-                +{run.overlayFiles} uncommitted file{run.overlayFiles === 1 ? "" : "s"}
+                +{run.overlayFiles} local file{run.overlayFiles === 1 ? "" : "s"}
               </dd>
             </div>
           )}
