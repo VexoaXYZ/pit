@@ -142,6 +142,21 @@ async fn local_runs_cache_restore_outputs_and_ship_overlays() {
         ]
     );
 
+    // Reruns say why they missed the cache.
+    let why = |v: &RunView, name: &str| {
+        v.groups[0]
+            .tasks
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.message.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(why(&fourth, "build"), "ran because src/b.txt added");
+    assert_eq!(
+        why(&fourth, "test"),
+        "ran because src/b.txt added; build changed"
+    );
+
     // A bug fails the run, and the log says why.
     write(dir, "src/b.txt", "BUG\n");
     let fifth = run(&pit, dir).await;

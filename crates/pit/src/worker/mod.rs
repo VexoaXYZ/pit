@@ -470,7 +470,13 @@ impl Worker {
         // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
         let client = self.client.with_lease(&job.lease);
         let def = &task.def;
-        let key = crate::graph::action_key(def, &job.os, files, dep_keys)?;
+        let inputs = crate::graph::key_inputs(def, &job.os, files, dep_keys)?;
+        let key = inputs.key();
+        // Identifies "this task" across runs, to find its last cached result.
+        let scope = crate::cas::digest(
+            format!("{}\0{}\0{}\0{}", job.repo, job.group, task.name, job.os).as_bytes(),
+        );
+        let mut miss_note: Option<String> = None;
         client
             .post_empty(
                 &format!("/api/tasks/{}/start", task.id),
@@ -527,6 +533,16 @@ impl Worker {
                             .await?;
                         return Ok((Status::Cached, Some(key)));
                     }
+                    // Deps run first and all passed, so their keys line up with `def.deps`.
+                    let dep_names: Vec<(String, String)> = def
+                        .deps
+                        .iter()
+                        .cloned()
+                        .zip(dep_keys.iter().cloned())
+                        .collect();
+                    miss_note = self
+                        .explain_miss(&client, &scope, &inputs, &dep_names)
+                        .await;
                 }
                 CacheMode::Workspace => {
                     if warm.lock().get(&task.name) == Some(&key) {
@@ -608,14 +624,18 @@ impl Worker {
                         });
                         blobs.push((digest, bytes));
                     }
+                    let inputs_bytes = serde_json::to_vec(&inputs)?;
+                    let inputs_digest = crate::cas::digest(&inputs_bytes);
+                    blobs.push((inputs_digest.clone(), inputs_bytes));
                     client.upload_missing(blobs).await?;
                     let entry = CacheEntry {
                         log_digest: Some(log_digest.clone()),
                         outputs: manifest,
                         duration_ms,
+                        inputs: Some(inputs_digest),
                     };
                     client
-                        .put_json(&format!("/api/cache/{key}"), &entry)
+                        .put_json(&format!("/api/cache/{key}?scope={scope}"), &entry)
                         .await?;
                 }
                 CacheMode::Workspace => {
@@ -632,6 +652,13 @@ impl Worker {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "a signal".into())
             ));
+        }
+        // Say why the task ran instead of coming from the cache.
+        if let Some(note) = miss_note {
+            message = Some(match message {
+                Some(m) => format!("{m} · ran because {note}"),
+                None => format!("ran because {note}"),
+            });
         }
         let status = if ok { Status::Passed } else { Status::Failed };
         let r = finish(
@@ -656,6 +683,33 @@ fn warm_file(ws: &Path) -> PathBuf {
 fn save_warm(ws: &Path, warm: &HashMap<String, String>) {
     if let Ok(bytes) = serde_json::to_vec(warm) {
         let _ = std::fs::write(warm_file(ws), bytes);
+    }
+}
+
+impl Worker {
+    /// Compares this run's key inputs with the task's last cached run.
+    /// Best effort: any lookup failure just means no explanation.
+    async fn explain_miss(
+        &self,
+        client: &Client,
+        scope: &str,
+        inputs: &crate::graph::KeyInputs,
+        deps: &[(String, String)],
+    ) -> Option<String> {
+        let last = match client
+            .get_opt::<CacheEntry>(&format!("/api/cache/last/{scope}"))
+            .await
+        {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return Some("nothing was cached for it yet".into()),
+            Err(_) => return None,
+        };
+        let prev: crate::graph::KeyInputs =
+            serde_json::from_slice(&self.blob(last.inputs.as_deref()?).await.ok()?).ok()?;
+        if prev.v != inputs.v {
+            return Some("Pit's cache format changed".into());
+        }
+        Some(crate::graph::explain_miss(&prev, inputs, deps))
     }
 }
 

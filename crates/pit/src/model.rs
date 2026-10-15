@@ -294,6 +294,9 @@ pub struct CacheEntry {
     pub log_digest: Option<String>,
     pub outputs: Vec<OutputFile>,
     pub duration_ms: u64,
+    /// CAS digest of the run's `graph::KeyInputs`, used to explain later misses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

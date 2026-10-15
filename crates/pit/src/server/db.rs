@@ -845,6 +845,19 @@ impl Db {
         Ok(entry.and_then(|e| serde_json::from_str(&e).ok()))
     }
 
+    /// Reads a cache entry without counting it as a hit.
+    pub fn cache_peek(&self, key: &str) -> Result<Option<CacheEntry>> {
+        let c = self.conn.lock();
+        let entry: Option<String> = c
+            .query_row(
+                "SELECT entry FROM cache WHERE action_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(entry.and_then(|e| serde_json::from_str(&e).ok()))
+    }
+
     pub fn cache_put(&self, key: &str, entry: &CacheEntry) -> Result<()> {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO cache (action_key, entry, created_at) VALUES (?1, ?2, ?3)",

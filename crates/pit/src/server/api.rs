@@ -63,6 +63,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/workers", get(workers))
         .route("/api/workers/claim", post(claim))
         .route("/api/cache/{key}", get(cache_get).put(cache_put))
+        .route("/api/cache/last/{scope}", get(cache_last))
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
         .route("/api/queue", get(queue_list).post(queue_add))
@@ -354,7 +355,7 @@ async fn finish_task(
         Some(&run_id),
         Some(&group_id),
         Some(&id),
-        serde_json::json!({ "name": name, "status": r.status, "durationMs": r.duration_ms, "exitCode": r.exit_code }),
+        serde_json::json!({ "name": name, "status": r.status, "durationMs": r.duration_ms, "exitCode": r.exit_code, "message": r.message }),
     );
     Ok(StatusCode::NO_CONTENT)
 }
@@ -464,9 +465,17 @@ async fn cache_get(
         .ok_or_else(|| not_found("cache entry"))
 }
 
+#[derive(Deserialize)]
+struct ScopeQuery {
+    /// Identifies the task (repo, group, task, OS) so its latest cached run
+    /// can be found when a later run misses.
+    scope: Option<String>,
+}
+
 async fn cache_put(
     State(app): State<Arc<App>>,
     Path(key): Path<String>,
+    Query(q): Query<ScopeQuery>,
     Json(entry): Json<CacheEntry>,
 ) -> ApiResult<StatusCode> {
     for d in entry
@@ -474,6 +483,7 @@ async fn cache_put(
         .iter()
         .map(|o| &o.digest)
         .chain(entry.log_digest.iter())
+        .chain(entry.inputs.iter())
     {
         if !app.cas.contains(d) {
             return Err(
@@ -482,7 +492,25 @@ async fn cache_put(
         }
     }
     app.db.cache_put(&key, &entry)?;
+    if let Some(scope) = q.scope.filter(|s| crate::cas::is_digest(s)) {
+        app.db.kv_put("last", &scope, &key)?;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The latest cached run of a task, to explain why a new run missed.
+async fn cache_last(
+    State(app): State<Arc<App>>,
+    Path(scope): Path<String>,
+) -> ApiResult<Json<CacheEntry>> {
+    let key = app
+        .db
+        .kv_get("last", &scope)?
+        .ok_or_else(|| not_found("previous run"))?;
+    app.db
+        .cache_peek(&key)?
+        .map(Json)
+        .ok_or_else(|| not_found("previous run"))
 }
 
 async fn cas_missing(

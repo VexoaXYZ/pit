@@ -244,7 +244,17 @@ pub async fn run(
                     ),
                     _ => secs(ms),
                 };
-                let _ = writeln!(stderr, "    {} {name:<24} {detail}", style.status(status));
+                // Why it ran (cache miss reason); failures print their message below.
+                let why = e.data["message"]
+                    .as_str()
+                    .filter(|m| m.starts_with("ran because"))
+                    .map(|m| format!("  {}", style.dim(m)))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    stderr,
+                    "    {} {name:<24} {detail}{why}",
+                    style.status(status)
+                );
             }
             _ => {}
         }

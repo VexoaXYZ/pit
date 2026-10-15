@@ -217,17 +217,9 @@ pub fn affected(config: &PitConfig, changed: &[String]) -> Result<BTreeSet<Strin
     Ok(out)
 }
 
-/// Identity of one input file: a git blob oid for tracked files, or a BLAKE3
-/// digest for overlay files.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct InputFile<'a> {
-    pub path: &'a str,
-    pub id: &'a str,
-}
-
+/// Everything about a task except its input files and deps.
 #[derive(Serialize)]
-struct KeyMaterial<'a> {
-    v: u32,
+struct ConfigMaterial<'a> {
     run: &'a str,
     os: &'a str,
     arch: &'a str,
@@ -238,23 +230,39 @@ struct KeyMaterial<'a> {
     network: Option<bool>,
     timeout: Option<u64>,
     env: Vec<(&'a str, String)>,
-    deps: Vec<&'a str>,
-    files: Vec<InputFile<'a>>,
 }
 
-/// The action key: a hash of everything that can change a task's result.
-pub fn action_key(
+/// What an action key is made of, kept so a cache miss can say what changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct KeyInputs {
+    pub v: u32,
+    /// Digest of the task definition, OS, arch and env values.
+    pub config: String,
+    /// Action keys of the task's deps, sorted.
+    pub deps: Vec<String>,
+    /// Matching input files as (path, git blob id or overlay digest), sorted.
+    pub files: Vec<(String, String)>,
+}
+
+impl KeyInputs {
+    /// The action key: a hash of everything that can change a task's result.
+    pub fn key(&self) -> String {
+        crate::cas::digest(&serde_json::to_vec(self).unwrap_or_default())
+    }
+}
+
+pub fn key_inputs(
     task: &TaskDef,
     os: &str,
     files: &[(String, String)],
     dep_keys: &[String],
-) -> Result<String> {
+) -> Result<KeyInputs> {
     let inputs = input_globs(task);
     let set = InputMatcher::new(&inputs)?;
-    let mut matched: Vec<InputFile> = files
+    let mut matched: Vec<(String, String)> = files
         .iter()
         .filter(|(p, _)| set.is_match(p))
-        .map(|(p, id)| InputFile { path: p, id })
+        .cloned()
         .collect();
     matched.sort();
     let mut env: Vec<(&str, String)> = task
@@ -263,10 +271,9 @@ pub fn action_key(
         .map(|k| (k.as_str(), std::env::var(k).unwrap_or_default()))
         .collect();
     env.sort();
-    let mut deps: Vec<&str> = dep_keys.iter().map(String::as_str).collect();
+    let mut deps = dep_keys.to_vec();
     deps.sort();
-    let material = KeyMaterial {
-        v: 2,
+    let config = ConfigMaterial {
         run: &task.run,
         os,
         arch: std::env::consts::ARCH,
@@ -277,10 +284,75 @@ pub fn action_key(
         network: task.network,
         timeout: task.timeout,
         env,
+    };
+    Ok(KeyInputs {
+        v: 3,
+        config: crate::cas::digest(&serde_json::to_vec(&config)?),
         deps,
         files: matched,
-    };
-    Ok(crate::cas::digest(&serde_json::to_vec(&material)?))
+    })
+}
+
+/// The action key: a hash of everything that can change a task's result.
+pub fn action_key(
+    task: &TaskDef,
+    os: &str,
+    files: &[(String, String)],
+    dep_keys: &[String],
+) -> Result<String> {
+    Ok(key_inputs(task, os, files, dep_keys)?.key())
+}
+
+/// Why a task's key differs from its previous cached run, in a few words:
+/// `"src/a.ts changed; build changed"`. `deps` names the current dep keys.
+pub fn explain_miss(prev: &KeyInputs, cur: &KeyInputs, deps: &[(String, String)]) -> String {
+    let mut reasons = Vec::new();
+    if prev.config != cur.config {
+        reasons.push("task definition or environment changed".to_string());
+    }
+    let before: std::collections::BTreeMap<&str, &str> = prev
+        .files
+        .iter()
+        .map(|(p, i)| (p.as_str(), i.as_str()))
+        .collect();
+    let after: std::collections::BTreeMap<&str, &str> = cur
+        .files
+        .iter()
+        .map(|(p, i)| (p.as_str(), i.as_str()))
+        .collect();
+    let mut changed: Vec<String> = Vec::new();
+    for (path, id) in &after {
+        match before.get(path) {
+            None => changed.push(format!("{path} added")),
+            Some(old) if old != id => changed.push(format!("{path} changed")),
+            _ => {}
+        }
+    }
+    for path in before.keys().filter(|p| !after.contains_key(*p)) {
+        changed.push(format!("{path} removed"));
+    }
+    if !changed.is_empty() {
+        let shown = changed.len().min(3);
+        let mut text = changed[..shown].join(", ");
+        if changed.len() > shown {
+            text.push_str(&format!(" and {} more file(s)", changed.len() - shown));
+        }
+        reasons.push(text);
+    }
+    let prev_deps: BTreeSet<&str> = prev.deps.iter().map(String::as_str).collect();
+    let changed_deps: Vec<&str> = deps
+        .iter()
+        .filter(|(_, k)| !prev_deps.contains(k.as_str()))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if !changed_deps.is_empty() {
+        reasons.push(format!("{} changed", changed_deps.join(", ")));
+    }
+    if reasons.is_empty() {
+        "inputs changed".to_string()
+    } else {
+        reasons.join("; ")
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +424,63 @@ mod tests {
         assert_eq!(a.len(), 3, "install change affects lint and build: {a:?}");
         assert!(affected(&c, &["README.md".into()]).unwrap().is_empty());
         assert_eq!(affected(&c, &["pit.config.ts".into()]).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn explains_why_a_task_missed_the_cache() {
+        let t = task("build", &[], Some(&["src/**", "tsconfig.json"]));
+        let files = |v: &[(&str, &str)]| {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let before = key_inputs(
+            &t,
+            "linux",
+            &files(&[("src/a.ts", "1"), ("tsconfig.json", "1")]),
+            &[],
+        )
+        .unwrap();
+        let after = key_inputs(
+            &t,
+            "linux",
+            &files(&[("src/a.ts", "1"), ("tsconfig.json", "2"), ("src/b.ts", "1")]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            explain_miss(&before, &after, &[]),
+            "src/b.ts added, tsconfig.json changed"
+        );
+        let test = task("test", &["build"], Some(&["test/**"]));
+        let a = key_inputs(&test, "linux", &[], &[before.key()]).unwrap();
+        let b = key_inputs(&test, "linux", &[], &[after.key()]).unwrap();
+        assert_eq!(
+            explain_miss(&a, &b, &[("build".into(), after.key())]),
+            "build changed"
+        );
+        let edited = task("build --prod", &[], Some(&["src/**", "tsconfig.json"]));
+        let c = key_inputs(
+            &edited,
+            "linux",
+            &files(&[("src/a.ts", "1"), ("tsconfig.json", "1")]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            explain_miss(&before, &c, &[]),
+            "task definition or environment changed"
+        );
+        assert_eq!(
+            before.key(),
+            action_key(
+                &t,
+                "linux",
+                &files(&[("src/a.ts", "1"), ("tsconfig.json", "1")]),
+                &[]
+            )
+            .unwrap()
+        );
     }
 
     #[test]
