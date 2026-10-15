@@ -217,6 +217,10 @@ the change keeps its place and the task is reported as `flaky:` (and counted in
 behind it. Pull request and local runs stay strict, and a flaky pass is never cached, so
 the flake keeps showing until it is fixed.
 
+**Priority.** Workers take merge queue groups first, since every change waiting to land
+waits on them, then other trusted runs (main pushes, post-merge), then PRs and local runs,
+oldest first within each.
+
 Landing is a non-forced push of the exact commit that was tested. Every landed commit also
 gets a full post-merge run as a backstop for undeclared inputs.
 

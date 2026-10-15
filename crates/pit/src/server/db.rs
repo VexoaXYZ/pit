@@ -642,6 +642,10 @@ impl Db {
         // OS is filtered in SQL; backends (JSON) are checked row by row. The
         // scan is lazy and unbounded, so incompatible groups at the head of
         // the queue cannot hide a compatible one behind them.
+        //
+        // Merge queue runs go first: every change waiting to land waits on
+        // them. Then other trusted runs (main, post-merge), then the rest,
+        // each oldest first.
         let pick = {
             let mut st = tx.prepare(
                 "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends, groups_.created_at,
@@ -658,7 +662,8 @@ impl Db {
                  JOIN runs ON runs.id = groups_.run_id
                  WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                    AND (groups_.os = 'any' OR groups_.os = ?1)
-                 ORDER BY groups_.created_at",
+                 ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
+                   groups_.created_at",
             )?;
             let mut rows = st.query_map(params![worker.os], |r| {
                 Ok((
@@ -1369,6 +1374,54 @@ mod tests {
         assert_eq!(job.group_id, linux);
         assert!(db.heartbeat_group(&job.group_id, Some(&job.lease)).unwrap());
         assert!(!db.heartbeat_group(&job.group_id, Some("stale")).unwrap());
+    }
+
+    #[test]
+    fn merge_queue_runs_are_claimed_before_older_runs() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let mut groups = vec![];
+        for (trigger, trusted) in [
+            ("pr", false),
+            ("local", false),
+            ("push", true),
+            ("queue", true),
+        ] {
+            let run = db
+                .insert_run(
+                    &repo.id, "sha", None, None, 0, trigger, false, None, trusted,
+                )
+                .unwrap();
+            groups.push(db.insert_group(&run, "g", "linux", &[], &task).unwrap());
+        }
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+        };
+        let order: Vec<String> = (0..4)
+            .map(|_| db.claim_group(&worker).unwrap().0.unwrap().group_id)
+            .collect();
+        // Queue, then main, then the rest oldest first.
+        assert_eq!(
+            order,
+            [
+                groups[3].clone(),
+                groups[2].clone(),
+                groups[0].clone(),
+                groups[1].clone()
+            ]
+        );
     }
 }
 

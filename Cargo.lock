@@ -1160,6 +1160,7 @@ dependencies = [
  "hex",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "mime_guess",
  "num_cpus",
  "parking_lot",

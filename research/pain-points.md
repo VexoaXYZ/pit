@@ -1165,3 +1165,56 @@ measured case dropped from 443s to 209s. Still to do:
   same limit.
 - **Package managers.** Only JavaScript workspaces are read; Cargo and Go workspaces are not.
 - **More cores.** Parity with Blacksmith on a full rerun needs more workers.
+
+## P22. Merge queue jobs wait in line behind pull request jobs
+
+**Pain.** Merge queue checks share runners with every PR's CI. On a busy day the queue's jobs
+sit behind a wave of PR jobs, and every change waiting to land waits with them. GitHub offers no
+job priority. It removed the old workaround of preferring repository-level runners: "the first
+available matching runner at any level will run the job"
+([community#25309](https://github.com/orgs/community/discussions/25309)). The remaining
+advice is a separate runner pool just for merge-group jobs
+([community#12835](https://github.com/orgs/community/discussions/12835),
+[merge queue feedback](https://github.com/orgs/community/discussions/46757)). Related pain is
+jobs stuck in "Waiting for a runner to pick up this job…"
+([community#62365](https://github.com/orgs/community/discussions/62365),
+[#31587](https://github.com/orgs/community/discussions/31587),
+[actions/runner#3609](https://github.com/actions/runner/issues/3609),
+[sengi](https://sengi.run/blog/github-actions-jobs-stuck)).
+
+**Reproduction** (`/tmp/painhunt/p22`): a 2-slot worker, a task that takes 4s, six runs created
+through the API, then a branch added to the merge queue half a second later. The measurement is
+how long the queue run's group waited for a worker.
+
+**Before** (research/pain-hunt at P21): groups were claimed strictly oldest first.
+
+```
+queue run waited 12.1s for a worker, then ran 4.5s
+```
+
+That is the full backlog: 6 × 4s over 2 slots.
+
+**Fix** (research/pain-hunt): the claim order is now:
+1. Merge queue groups.
+2. Other trusted runs (main pushes, post-merge).
+3. PRs, local and API runs.
+
+Each tier is served oldest first. Affinity (P11) and backend matching still apply within that
+order. Covered by the unit test `merge_queue_runs_are_claimed_before_older_runs`.
+
+```
+queue run waited 3.2s for a worker, then ran 4.4s
+```
+
+That is the time for one of the running tasks to finish. Pit does not preempt running work.
+
+**Found on the way:** `pit … | head -1` panicked with "failed printing to stdout: Broken pipe",
+because Rust ignores SIGPIPE by default. The CLI now restores the default on Unix and exits
+quietly (status 141, like `ls | head`).
+
+**Verdict: SOLVED** for ordering: queue work never waits behind PR work that has not started.
+Not done:
+- **No preemption.** A queue run still waits for a busy slot to free up, at most one task's
+  duration.
+- **Starvation.** A constant stream of queue and main runs can keep PR runs waiting. Nothing
+  ages them up yet.
