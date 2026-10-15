@@ -486,3 +486,44 @@ file had it run to the end; none did) and the unit test
 **Verdict: SOLVED.** Caveats: a stopped task can run up to one heartbeat (2 s) after the
 cancel, and superseding is keyed on the branch name, so two people running `pit run` locally on
 identically named branches of the same repo would cancel each other.
+
+## P10. Path filters leave required checks stuck on "Expected"
+
+**Pain.** Monorepos add `paths:` filters so a docs-only PR skips CI, but a required check
+whose workflow did not run never reports, and the PR sits at "Expected — Waiting for status to
+be reported", unmergeable. GitHub's own docs say not to path-filter required workflows; the
+workarounds are a gate job that always runs, a mirror no-op workflow, or a polling action
+([GitHub Docs](https://docs.github.com/en/enterprise-server@3.15/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks),
+[community#26698](https://github.com/orgs/community/discussions/26698),
+[#49124](https://github.com/orgs/community/discussions/49124),
+[#72708](https://github.com/orgs/community/discussions/72708),
+[#25720](https://github.com/orgs/community/discussions/25720),
+[Medium](https://medium.com/@khawaja.muhammad.mushood/how-to-fix-waiting-for-status-to-be-reported-in-github-984b9c44cee4),
+[devopsinterviewkb](https://devopsinterviewkb.com/questions/github/branch-protection/required-status-check-stuck-expected-forever),
+[wait-for-status-checks](https://github.com/poseidon/wait-for-status-checks)).
+
+**Reproduction** (`/tmp/painhunt/p10`): a monorepo with `backend` and `frontend` groups (inputs
+`backend/**` and `frontend/**`, 3 s each) and a `docs/` folder. A second Pit server with GitHub
+token mode pointed at a mock GitHub API (`mockgh.py`) that records every commit status. Signed
+webhooks: a push to main, then PRs from a docs-only branch and a backend-only branch.
+
+**Result** (no Pit changes needed):
+
+```
+== push to main (warms the cache)
+    {'pit / backend': 'success', 'pit / frontend': 'success'}
+== PR from docs-only
+    {'pit / backend': 'success', 'pit / frontend': 'success'}
+    run passed in 794 ms; backend:cached, frontend:cached
+== PR from backend-change
+    {'pit / backend': 'success', 'pit / frontend': 'success'}
+    run passed in 3492 ms; backend:passed, frontend:cached
+```
+
+Pit never skips a group to save time. A group whose inputs did not change is a cache hit
+and reports success in milliseconds, so every required check always reports. No `paths:`
+filter, gate job or mirror workflow needed, and the check names never change.
+
+**Verdict: SOLVED.** One gap: if the config itself fails to load, Pit reports a single
+`pit / plan` failure, and the per-group required checks stay at "Expected" (the PR is still
+blocked, which is the safe direction, but the reason is on a different check).
