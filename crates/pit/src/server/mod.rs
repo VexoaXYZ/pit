@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod db;
+pub mod gc;
 pub mod github;
 pub mod queue;
 pub mod remote_cache;
@@ -11,6 +12,7 @@ pub mod web;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -34,6 +36,13 @@ pub struct App {
     pub queue_lock: tokio::sync::Mutex<()>,
     /// Wakes the merge queue loop (see `serve_app`).
     pub queue_kick: Notify,
+    /// CAS size limit in bytes; 0 means unlimited. See `gc`.
+    pub cache_max_bytes: AtomicU64,
+    /// Blobs younger than this are never garbage collected.
+    pub gc_grace_ms: AtomicU64,
+    /// Totals since start, for `/api/stats`.
+    pub evicted_entries: AtomicU64,
+    pub freed_bytes: AtomicU64,
 }
 
 pub struct ServerOpts {
@@ -41,6 +50,8 @@ pub struct ServerOpts {
     pub addr: SocketAddr,
     pub token: Option<String>,
     pub public_url: Option<String>,
+    /// CAS size limit in bytes; 0 means unlimited.
+    pub cache_max_bytes: u64,
 }
 
 impl App {
@@ -70,6 +81,10 @@ impl App {
             mirror_locks: Default::default(),
             queue_lock: Default::default(),
             queue_kick: Notify::new(),
+            cache_max_bytes: AtomicU64::new(0),
+            gc_grace_ms: AtomicU64::new(2 * 60 * 1000),
+            evicted_entries: AtomicU64::new(0),
+            freed_bytes: AtomicU64::new(0),
         }))
     }
 
@@ -324,6 +339,8 @@ pub async fn serve(opts: ServerOpts) -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("http://{}", opts.addr));
     let app = App::new(&opts.data_dir, opts.token.clone(), public_url)?;
+    app.cache_max_bytes
+        .store(opts.cache_max_bytes, std::sync::atomic::Ordering::Relaxed);
     serve_app(app, opts.addr).await
 }
 
@@ -346,6 +363,19 @@ pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) ->
                     reaper.work.notify_waiters();
                 }
                 Err(e) => tracing::warn!("reaper: {e:#}"),
+                _ => {}
+            }
+        }
+    });
+    // Keep the cache under its size limit.
+    let gc_app = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let app = gc_app.clone();
+            match tokio::task::spawn_blocking(move || gc::collect(&app, false)).await {
+                Ok(Err(e)) => tracing::warn!("cache gc failed: {e:#}"),
+                Err(e) => tracing::warn!("cache gc panicked: {e}"),
                 _ => {}
             }
         }

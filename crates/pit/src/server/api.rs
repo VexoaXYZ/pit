@@ -64,6 +64,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/workers/claim", post(claim))
         .route("/api/cache/{key}", get(cache_get).put(cache_put))
         .route("/api/cache/last/{scope}", get(cache_last))
+        .route("/api/gc", post(gc_now))
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
         .route("/api/queue", get(queue_list).post(queue_add))
@@ -118,6 +119,10 @@ async fn stats(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>
     let (blobs, bytes) = app.cas.stats();
     s["casBlobs"] = blobs.into();
     s["casBytes"] = bytes.into();
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    s["cacheLimitBytes"] = load(&app.cache_max_bytes).into();
+    s["evictedEntries"] = load(&app.evicted_entries).into();
+    s["evictedBytes"] = load(&app.freed_bytes).into();
     Ok(Json(s))
 }
 
@@ -499,6 +504,7 @@ async fn cache_put(
 }
 
 /// The latest cached run of a task, to explain why a new run missed.
+/// 410 Gone when it existed but has been evicted.
 async fn cache_last(
     State(app): State<Arc<App>>,
     Path(scope): Path<String>,
@@ -507,10 +513,19 @@ async fn cache_last(
         .db
         .kv_get("last", &scope)?
         .ok_or_else(|| not_found("previous run"))?;
-    app.db
-        .cache_peek(&key)?
-        .map(Json)
-        .ok_or_else(|| not_found("previous run"))
+    app.db.cache_peek(&key)?.map(Json).ok_or_else(|| {
+        ApiError(
+            StatusCode::GONE,
+            anyhow::anyhow!("previous result was evicted"),
+        )
+    })
+}
+
+/// `POST /api/gc`: collect now. Under the limit this only deletes blobs
+/// nothing refers to.
+async fn gc_now(State(app): State<Arc<App>>) -> ApiResult<Json<super::gc::GcReport>> {
+    let report = tokio::task::spawn_blocking(move || super::gc::collect(&app, true)).await??;
+    Ok(Json(report))
 }
 
 async fn cas_missing(

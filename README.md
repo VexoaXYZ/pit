@@ -200,6 +200,13 @@ seconds without pushing.
 | `pit init`, `pit import` | Write a config from the repo or from Actions workflows. |
 | `pit mcp` | MCP server over stdio. |
 
+**Cache size.** The server keeps its cache under `--cache-max-gb` (default 20, `0` for
+unlimited, env `PIT_CACHE_MAX_GB`). Past the limit it evicts the least recently used task
+results and Turborepo/Bazel artifacts, then deletes blobs nothing refers to, until usage is
+under 90% of the limit, the way bazel-remote does. Blobs younger than two minutes and logs of
+runs from the last 14 days are kept. Evictions are logged, counted in `/api/stats`, and a
+task whose last result was evicted says so when it reruns. `POST /api/gc` collects now.
+
 Data lives in `~/.pit` (`PIT_DATA`). Set `PIT_TOKEN` on the server and clients to require
 a bearer token.
 

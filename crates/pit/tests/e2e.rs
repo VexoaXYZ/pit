@@ -10,6 +10,7 @@ use pit::model::*;
 struct Pit {
     _data: tempfile::TempDir,
     client: Client,
+    app: std::sync::Arc<pit::server::App>,
 }
 
 async fn start() -> Pit {
@@ -17,7 +18,7 @@ async fn start() -> Pit {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let app = pit::server::App::new(&data.path().join("server"), None, base.clone()).unwrap();
-    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
     tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
         server: base.clone(),
         token: None,
@@ -36,6 +37,7 @@ async fn start() -> Pit {
     Pit {
         _data: data,
         client,
+        app,
     }
 }
 
@@ -838,4 +840,57 @@ async fn merge_queue_retries_flakes_once_and_flags_them() {
     sh(&work, "git pull -q origin main");
     let local = run(&pit, &work).await;
     assert_eq!(local.status, Status::Failed);
+}
+
+/// The cache stays under its size limit: least recently used results are
+/// evicted, a rerun says its result was evicted, and recent results survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_is_kept_under_its_size_limit() {
+    use std::sync::atomic::Ordering;
+    let pit = start().await;
+    pit.app.cache_max_bytes.store(3_500_000, Ordering::Relaxed);
+    pit.app.gc_grace_ms.store(0, Ordering::Relaxed);
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    write(
+        dir,
+        "pit.config.json",
+        r#"{"tasks":{"artifact":{"run":"mkdir -p out && head -c 1000000 /dev/urandom > out/blob.bin","inputs":["src/**"],"outputs":["out/**"]}}}"#,
+    );
+    write(dir, "src/v", "0\n");
+    write(dir, ".gitignore", "out\n");
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    for v in 1..=6 {
+        write(dir, "src/v", &format!("{v}\n"));
+        assert_eq!(run(&pit, dir).await.status, Status::Passed);
+    }
+    let report: serde_json::Value = pit.client.post("/api/gc", &()).await.unwrap();
+    assert!(report["evictedEntries"].as_u64().unwrap() > 0, "{report}");
+    assert!(
+        report["bytesAfter"].as_u64().unwrap() <= 3_150_000,
+        "{report}"
+    );
+
+    // The newest result is still cached.
+    let newest = run(&pit, dir).await;
+    assert_eq!(newest.groups[0].tasks[0].status, Status::Cached, "{report}");
+    // The oldest was evicted: it runs again instead of coming from the cache.
+    write(dir, "src/v", "1\n");
+    let oldest = run(&pit, dir).await;
+    assert_eq!(oldest.groups[0].tasks[0].status, Status::Passed);
+    // When the task's latest result itself is evicted, the rerun says so.
+    pit.app.cache_max_bytes.store(1, Ordering::Relaxed);
+    let _: serde_json::Value = pit.client.post("/api/gc", &()).await.unwrap();
+    let rerun = run(&pit, dir).await;
+    let t = &rerun.groups[0].tasks[0];
+    assert_eq!(t.status, Status::Passed);
+    assert_eq!(
+        t.message.as_deref(),
+        Some("ran because its earlier result was evicted to keep the cache under its size limit")
+    );
+    let stats: serde_json::Value = pit.client.get("/api/stats").await.unwrap();
+    assert!(stats["evictedEntries"].as_u64().unwrap() > 0);
 }

@@ -477,6 +477,7 @@ impl Worker {
             format!("{}\0{}\0{}\0{}", job.repo, job.group, task.name, job.os).as_bytes(),
         );
         let mut miss_note: Option<String> = None;
+        let mut restore_failed: Option<String> = None;
         client
             .post_empty(
                 &format!("/api/tasks/{}/start", task.id),
@@ -506,32 +507,30 @@ impl Worker {
                         .await?
                     {
                         let t = Instant::now();
-                        files::clear_outputs(ws, &def.outputs)?;
-                        for out in &entry.outputs {
-                            let dest = files::safe_join(ws, &out.path)?;
-                            files::write_file(
-                                &dest,
-                                &self.blob(&out.digest).await?,
-                                out.executable,
-                            )?;
+                        // The server may evict the outputs between the lookup
+                        // and the restore. Then the task just runs.
+                        if let Err(e) = self.restore_outputs(ws, def, &entry).await {
+                            restore_failed =
+                                Some(format!("its cached outputs could not be restored ({e:#})"));
+                        } else {
+                            let msg = format!(
+                                "cache hit, saved {:.1}s ({} output file(s) restored in {}ms)",
+                                entry.duration_ms as f64 / 1000.0,
+                                entry.outputs.len(),
+                                t.elapsed().as_millis()
+                            );
+                            let r = finish(
+                                Status::Cached,
+                                Some(0),
+                                t.elapsed().as_millis() as u64,
+                                entry.log_digest.clone(),
+                                Some(msg),
+                            );
+                            client
+                                .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
+                                .await?;
+                            return Ok((Status::Cached, Some(key)));
                         }
-                        let msg = format!(
-                            "cache hit, saved {:.1}s ({} output file(s) restored in {}ms)",
-                            entry.duration_ms as f64 / 1000.0,
-                            entry.outputs.len(),
-                            t.elapsed().as_millis()
-                        );
-                        let r = finish(
-                            Status::Cached,
-                            Some(0),
-                            t.elapsed().as_millis() as u64,
-                            entry.log_digest.clone(),
-                            Some(msg),
-                        );
-                        client
-                            .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
-                            .await?;
-                        return Ok((Status::Cached, Some(key)));
                     }
                     // Deps run first and all passed, so their keys line up with `def.deps`.
                     let dep_names: Vec<(String, String)> = def
@@ -540,9 +539,13 @@ impl Worker {
                         .cloned()
                         .zip(dep_keys.iter().cloned())
                         .collect();
-                    miss_note = self
-                        .explain_miss(&client, &scope, &inputs, &dep_names)
-                        .await;
+                    miss_note = match restore_failed {
+                        Some(note) => Some(note),
+                        None => {
+                            self.explain_miss(&client, &scope, &inputs, &dep_names)
+                                .await
+                        }
+                    };
                 }
                 CacheMode::Workspace => {
                     if warm.lock().get(&task.name) == Some(&key) {
@@ -726,6 +729,19 @@ fn save_warm(ws: &Path, warm: &HashMap<String, String>) {
 }
 
 impl Worker {
+    async fn restore_outputs(&self, ws: &Path, def: &TaskDef, entry: &CacheEntry) -> Result<()> {
+        // Fetch everything first so a missing blob leaves the workspace untouched.
+        let mut blobs = Vec::with_capacity(entry.outputs.len());
+        for out in &entry.outputs {
+            blobs.push(self.blob(&out.digest).await?);
+        }
+        files::clear_outputs(ws, &def.outputs)?;
+        for (out, bytes) in entry.outputs.iter().zip(blobs) {
+            files::write_file(&files::safe_join(ws, &out.path)?, &bytes, out.executable)?;
+        }
+        Ok(())
+    }
+
     /// Compares this run's key inputs with the task's last cached run.
     /// Best effort: any lookup failure just means no explanation.
     async fn explain_miss(
@@ -741,6 +757,11 @@ impl Worker {
         {
             Ok(Some(entry)) => entry,
             Ok(None) => return Some("nothing was cached for it yet".into()),
+            Err(e) if e.to_string().contains("410") => {
+                return Some(
+                    "its earlier result was evicted to keep the cache under its size limit".into(),
+                )
+            }
             Err(_) => return None,
         };
         let prev: crate::graph::KeyInputs =

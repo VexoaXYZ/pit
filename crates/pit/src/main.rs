@@ -39,6 +39,10 @@ enum Command {
         parallelism: Option<usize>,
         #[arg(long, env = "PIT_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// Cache size limit in GB; least recently used results are evicted
+        /// past it. 0 means unlimited.
+        #[arg(long, env = "PIT_CACHE_MAX_GB", default_value_t = 20.0)]
+        cache_max_gb: f64,
     },
     /// Run the control plane.
     Server {
@@ -51,6 +55,10 @@ enum Command {
         /// URL used in links (GitHub check runs, CLI output).
         #[arg(long, env = "PIT_PUBLIC_URL")]
         public_url: Option<String>,
+        /// Cache size limit in GB; least recently used results are evicted
+        /// past it. 0 means unlimited.
+        #[arg(long, env = "PIT_CACHE_MAX_GB", default_value_t = 20.0)]
+        cache_max_gb: f64,
     },
     /// Run a worker that claims groups from a server.
     Worker {
@@ -175,6 +183,10 @@ fn default_data() -> PathBuf {
         .join(".pit")
 }
 
+fn gb_to_bytes(gb: f64) -> u64 {
+    (gb.max(0.0) * 1_000_000_000.0) as u64
+}
+
 fn default_parallelism() -> usize {
     (num_cpus::get() / 2).max(2)
 }
@@ -209,6 +221,7 @@ async fn run(cli: Cli) -> Result<i32> {
             slots,
             parallelism,
             token,
+            cache_max_gb,
         } => {
             let data = data.unwrap_or_else(default_data);
             cli::up(
@@ -217,6 +230,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 slots,
                 parallelism.unwrap_or_else(default_parallelism),
                 token,
+                gb_to_bytes(cache_max_gb),
             )
             .await?;
             Ok(0)
@@ -226,12 +240,14 @@ async fn run(cli: Cli) -> Result<i32> {
             data,
             token,
             public_url,
+            cache_max_gb,
         } => {
             pit::server::serve(pit::server::ServerOpts {
                 data_dir: data.unwrap_or_else(default_data).join("server"),
                 addr,
                 token,
                 public_url,
+                cache_max_bytes: gb_to_bytes(cache_max_gb),
             })
             .await?;
             Ok(0)

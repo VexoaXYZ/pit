@@ -22,9 +22,12 @@ pub async fn up(
     slots: usize,
     parallelism: usize,
     token: Option<String>,
+    cache_max_bytes: u64,
 ) -> Result<()> {
     let public = format!("http://{addr}");
     let app = crate::server::App::new(&data.join("server"), token.clone(), public.clone())?;
+    app.cache_max_bytes
+        .store(cache_max_bytes, std::sync::atomic::Ordering::Relaxed);
     let server = tokio::spawn(crate::server::serve_app(app, addr));
     // Wait for the listener before the worker starts polling.
     let probe = Client::new(&public, token.clone())?;

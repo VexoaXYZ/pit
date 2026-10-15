@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS kv (
   key TEXT NOT NULL,
   digest TEXT NOT NULL,
   created_at INTEGER NOT NULL,
+  last_used_at INTEGER,
   PRIMARY KEY (ns, key)
 );
 
@@ -196,6 +197,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has_lease {
         conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lease TEXT")?;
+    }
+    let has_kv_used: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('kv') WHERE name = 'last_used_at'")?
+        .exists([])?;
+    if !has_kv_used {
+        conn.execute_batch("ALTER TABLE kv ADD COLUMN last_used_at INTEGER")?;
     }
     Ok(())
 }
@@ -869,12 +876,111 @@ impl Db {
 
     pub fn kv_get(&self, ns: &str, key: &str) -> Result<Option<String>> {
         let c = self.conn.lock();
-        Ok(c.query_row(
-            "SELECT digest FROM kv WHERE ns = ?1 AND key = ?2",
-            params![ns, key],
+        let digest: Option<String> = c
+            .query_row(
+                "SELECT digest FROM kv WHERE ns = ?1 AND key = ?2",
+                params![ns, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if digest.is_some() {
+            // Least-recently-used eviction needs to know what is still read.
+            c.execute(
+                "UPDATE kv SET last_used_at = ?1 WHERE ns = ?2 AND key = ?3",
+                params![now_ms(), ns, key],
+            )?;
+        }
+        Ok(digest)
+    }
+
+    /// Deletes the `n` least recently used cache entries (task results and
+    /// Turborepo/Bazel artifacts). Returns how many were deleted.
+    pub fn evict_lru(&self, n: usize) -> Result<usize> {
+        let c = self.conn.lock();
+        let victims: Vec<(String, String, String)> = {
+            let mut st = c.prepare(
+                "SELECT 'cache', '', action_key, COALESCE(last_hit_at, created_at) AS used FROM cache
+                 UNION ALL
+                 SELECT 'kv', ns, key, COALESCE(last_used_at, created_at) AS used FROM kv WHERE ns != 'last'
+                 ORDER BY used LIMIT ?1",
+            )?;
+            let rows = st
+                .query_map(params![n as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (kind, ns, key) in &victims {
+            if kind == "cache" {
+                c.execute("DELETE FROM cache WHERE action_key = ?1", params![key])?;
+            } else {
+                c.execute(
+                    "DELETE FROM kv WHERE ns = ?1 AND key = ?2",
+                    params![ns, key],
+                )?;
+            }
+        }
+        Ok(victims.len())
+    }
+
+    pub fn evictable_entries(&self) -> Result<usize> {
+        let c = self.conn.lock();
+        let n: i64 = c.query_row(
+            "SELECT (SELECT COUNT(*) FROM cache) + (SELECT COUNT(*) FROM kv WHERE ns != 'last')",
+            [],
             |r| r.get(0),
-        )
-        .optional()?)
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Blobs that must survive a sweep: everything a cache entry or remote
+    /// cache artifact points to, plus logs and overlays of runs that are
+    /// active or newer than `keep_runs_since` (ms). Overlay manifests are
+    /// returned separately: the files they list must be kept too.
+    pub fn referenced_blobs(
+        &self,
+        keep_runs_since: i64,
+    ) -> Result<(std::collections::HashSet<String>, Vec<String>)> {
+        let c = self.conn.lock();
+        let mut keep = std::collections::HashSet::new();
+        {
+            let mut st = c.prepare("SELECT entry FROM cache")?;
+            for entry in st.query_map([], |r| r.get::<_, String>(0))? {
+                if let Ok(e) = serde_json::from_str::<CacheEntry>(&entry?) {
+                    keep.extend(e.outputs.into_iter().map(|o| o.digest));
+                    keep.extend(e.log_digest);
+                    keep.extend(e.inputs);
+                }
+            }
+        }
+        {
+            let mut st = c.prepare("SELECT digest FROM kv WHERE ns != 'last'")?;
+            for d in st.query_map([], |r| r.get::<_, String>(0))? {
+                // Turborepo entries are `<digest>:<duration>`.
+                keep.insert(d?.split(':').next().unwrap_or_default().to_string());
+            }
+        }
+        let recent = "(runs.created_at >= ?1 OR runs.status IN ('queued', 'running'))";
+        {
+            let mut st = c.prepare(&format!(
+                "SELECT tasks.log_digest FROM tasks JOIN runs ON runs.id = tasks.run_id
+                 WHERE tasks.log_digest IS NOT NULL AND {recent}"
+            ))?;
+            for d in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
+                keep.insert(d?);
+            }
+        }
+        let mut overlays = Vec::new();
+        {
+            let mut st = c.prepare(&format!(
+                "SELECT overlay FROM runs WHERE overlay IS NOT NULL AND {recent}"
+            ))?;
+            for d in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
+                let d = d?;
+                keep.insert(d.clone());
+                overlays.push(d);
+            }
+        }
+        Ok((keep, overlays))
     }
 
     pub fn kv_put(&self, ns: &str, key: &str, digest: &str) -> Result<()> {
