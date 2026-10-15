@@ -445,6 +445,9 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         overlay: None,
                         tasks: vec![],
                         trigger: Some("push".into()),
+                        trusted: git_ref
+                            .as_deref()
+                            .is_some_and(|b| super::trusted_branch(b, r.default_branch.as_deref())),
                         git_ref,
                         no_cache: false,
                     },
@@ -509,6 +512,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         trigger: Some("pr".into()),
                         git_ref: Some(format!("pull/{number}")),
                         no_cache: false,
+                        trusted: false,
                     },
                     Some(number),
                 )
@@ -533,6 +537,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         trigger: Some("rerun".into()),
                         git_ref: None,
                         no_cache: false,
+                        trusted: false,
                     },
                     None,
                 )

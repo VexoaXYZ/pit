@@ -136,6 +136,17 @@ hit on another worker would skip a build whose image is not there.
    outputs, record the result.
 5. **Report.** Events stream to the CLI, dashboard, MCP clients and GitHub.
 
+**Trusted and untrusted runs.** Runs of code that is, or is about to be, on `main` (pushes
+to the default branch or `main`/`master`/`trunk`, merge queue and post-merge runs) are
+trusted. PRs, other branches and every `pit run` are not, and neither is any run created
+through the API or carrying uncommitted files. Untrusted runs reuse trusted results, but
+what they cache is kept apart and never served to a trusted run, and they get their own
+warm workspaces. So a branch cannot plant a build result under the key main will compute
+(cache poisoning, CVE-2025-36852) or leave a file in a workspace main reuses. Trust is
+decided by the server from the job's lease, not claimed by the worker or the client. This
+does not stop a task on the `host` backend from writing elsewhere on the worker: run
+untrusted code with `sandbox` or `docker`. The Turborepo and Bazel caches are not split yet.
+
 ## GitHub
 
 Point a GitHub App (or a token) and a webhook at the server:

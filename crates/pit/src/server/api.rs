@@ -470,12 +470,19 @@ async fn claim(
     }
 }
 
+/// Trust comes from the job's lease, never from the request: only a worker
+/// running a trusted run's group holds one.
 async fn cache_get(
     State(app): State<Arc<App>>,
     Path(key): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<CacheEntry>> {
+    let trusted = app.db.lease_trusted(lease(&headers))?;
     app.db
-        .cache_get(&key)?
+        .cache_find(&key, trusted)?
+        .map(|stored| app.db.cache_get(&stored))
+        .transpose()?
+        .flatten()
         .map(Json)
         .ok_or_else(|| not_found("cache entry"))
 }
@@ -491,6 +498,7 @@ async fn cache_put(
     State(app): State<Arc<App>>,
     Path(key): Path<String>,
     Query(q): Query<ScopeQuery>,
+    headers: HeaderMap,
     Json(entry): Json<CacheEntry>,
 ) -> ApiResult<StatusCode> {
     for d in entry
@@ -506,9 +514,10 @@ async fn cache_put(
             );
         }
     }
-    app.db.cache_put(&key, &entry)?;
+    let trusted = app.db.lease_trusted(lease(&headers))?;
+    let stored = app.db.cache_put(&key, trusted, &entry)?;
     if let Some(scope) = q.scope.filter(|s| crate::cas::is_digest(s)) {
-        app.db.kv_put("last", &scope, &key)?;
+        app.db.kv_put("last", &scope, &stored)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }

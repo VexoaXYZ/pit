@@ -179,6 +179,8 @@ impl App {
             None => 0,
         };
         let trigger = req.trigger.clone().unwrap_or_else(|| "api".into());
+        // Uncommitted files are never trusted, whoever sends them.
+        let trusted = req.trusted && req.overlay.is_none();
         let run_id = self.db.insert_run(
             &repo.id,
             &req.sha,
@@ -188,6 +190,7 @@ impl App {
             &trigger,
             req.no_cache,
             github_pr,
+            trusted,
         )?;
         self.emit(
             "run.created",
@@ -242,9 +245,11 @@ impl App {
             .load_config(&mirror, &req.sha, overlay.as_ref())
             .await?;
         let groups = crate::graph::plan(&config, &req.tasks)?;
-        if self.db.run(run_id)?.status.is_done() {
+        let run = self.db.run(run_id)?;
+        if run.status.is_done() {
             return Ok(()); // Cancelled while planning.
         }
+        let trusted = run.trusted;
         if groups.is_empty() {
             self.db
                 .set_run_status(run_id, Status::Passed, Some("no tasks to run"))?;
@@ -263,7 +268,7 @@ impl App {
         for g in &groups {
             if let Some(results) = files
                 .as_deref()
-                .map(|f| resolve::resolve(self, g, f))
+                .map(|f| resolve::resolve(self, g, f, trusted))
                 .transpose()?
                 .flatten()
             {
@@ -413,6 +418,15 @@ impl App {
     pub fn supersedes_for_test(trigger: &str, git_ref: &str) -> bool {
         supersedes(trigger, git_ref)
     }
+}
+
+/// Whether runs for this branch are trusted: they write the cache that every
+/// run reads and get their own warm workspaces. Untrusted runs (PRs, other
+/// branches, `pit run`) read trusted results but write a separate cache that
+/// trusted runs never read, so a branch cannot plant a result or a file that
+/// main later picks up (cache poisoning, CVE-2025-36852).
+pub fn trusted_branch(branch: &str, default_branch: Option<&str>) -> bool {
+    Some(branch) == default_branch || matches!(branch, "main" | "master" | "trunk")
 }
 
 /// Whether a new run with this trigger and ref replaces older ones.

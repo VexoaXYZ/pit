@@ -1202,3 +1202,97 @@ async fn sharded_tasks_run_each_shard_once() {
         ]
     );
 }
+
+/// A branch run cannot poison what main uses: its cached result for the key
+/// main computes and the files it leaves in its workspace are both invisible
+/// to trusted (merge queue) runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn untrusted_runs_cannot_poison_trusted_ones() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    // The build script is not an input, so a branch that edits it gets the
+    // key main will compute.
+    let config = serde_json::json!({ "tasks": {
+        "build": { "run": "sh build.sh", "inputs": ["src/**"], "outputs": ["dist/**"] },
+        "check": { "run": "cat dist/out; test ! -f junk/planted", "deps": ["build"], "cache": false },
+    } });
+    write(&work, "pit.config.json", &config.to_string());
+    write(&work, "src/a.txt", "a\n");
+    write(
+        &work,
+        "build.sh",
+        "mkdir -p dist && echo clean > dist/out\n",
+    );
+    write(&work, ".gitignore", "dist/\njunk/\n");
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    sh(&work, "git checkout -q -b evil");
+    write(
+        &work,
+        "build.sh",
+        "mkdir -p dist junk && echo POISONED > dist/out && touch junk/planted\n",
+    );
+    sh(&work, "git commit -qam evil");
+    let evil = run(&pit, &work).await;
+    assert_eq!(
+        evil.status,
+        Status::Failed,
+        "the planted file is seen by the branch itself"
+    );
+    sh(&work, "git checkout -q main && git checkout -q -b docs && echo d > README && git add -A && git commit -qm docs && git push -q origin docs");
+
+    let url = origin.to_string_lossy().to_string();
+    let _: QueueEntryView = pit
+        .client
+        .post(
+            "/api/queue",
+            &QueueAdd {
+                repo: "trust".into(),
+                url: Some(url),
+                branch: Some("docs".into()),
+                pr: None,
+                target: None,
+            },
+        )
+        .await
+        .unwrap();
+    let entry = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let entries: Vec<QueueEntryView> = pit.client.get("/api/queue").await.unwrap();
+            let e = entries.into_iter().find(|e| e.source == "docs").unwrap();
+            if matches!(e.status.as_str(), "landed" | "failed") {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("queue did not settle");
+    assert_eq!(entry.status, "landed", "{entry:?}");
+    let queued: RunView = pit
+        .client
+        .get(&format!("/api/runs/{}", entry.run_id.unwrap()))
+        .await
+        .unwrap();
+    let build = queued.groups[0]
+        .tasks
+        .iter()
+        .find(|t| t.name == "build")
+        .unwrap();
+    assert_eq!(
+        build.status,
+        Status::Passed,
+        "trusted run reused a branch's result: {build:?}"
+    );
+    assert!(
+        build
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("untrusted run"),
+        "{build:?}"
+    );
+}

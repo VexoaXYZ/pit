@@ -163,6 +163,7 @@ pub struct RunRow {
     pub status: Status,
     pub no_cache: bool,
     pub github_pr: Option<u64>,
+    pub trusted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +217,18 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_kv_used {
         conn.execute_batch("ALTER TABLE kv ADD COLUMN last_used_at INTEGER")?;
     }
+    let has_trusted: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'trusted'")?
+        .exists([])?;
+    if !has_trusted {
+        // Results cached before trust existed may have come from anywhere;
+        // keep them, but only for untrusted runs.
+        conn.execute_batch(
+            "ALTER TABLE runs ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0;
+             UPDATE cache SET action_key = 'u:' || action_key WHERE action_key NOT LIKE 'u:%';
+             UPDATE kv SET digest = 'u:' || digest WHERE ns = 'last' AND digest NOT LIKE 'u:%';",
+        )?;
+    }
     Ok(())
 }
 
@@ -260,6 +273,7 @@ fn run_row(r: &Row) -> rusqlite::Result<RunRow> {
         status: Status::parse(&r.get::<_, String>("status")?),
         no_cache: r.get::<_, i64>("no_cache")? != 0,
         github_pr: r.get::<_, Option<i64>>("github_pr")?.map(|v| v as u64),
+        trusted: r.get::<_, i64>("trusted")? != 0,
     })
 }
 
@@ -422,12 +436,13 @@ impl Db {
         trigger: &str,
         no_cache: bool,
         github_pr: Option<u64>,
+        trusted: bool,
     ) -> Result<String> {
         let id = new_id("run");
         self.conn.lock().execute(
-            "INSERT INTO runs (id, repo_id, sha, ref, overlay, overlay_files, trigger, status, no_cache, github_pr, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, ?9, ?10)",
-            params![id, repo_id, sha, git_ref, overlay, overlay_files as i64, trigger, no_cache as i64, github_pr.map(|v| v as i64), now_ms()],
+            "INSERT INTO runs (id, repo_id, sha, ref, overlay, overlay_files, trigger, status, no_cache, github_pr, created_at, trusted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, ?9, ?10, ?11)",
+            params![id, repo_id, sha, git_ref, overlay, overlay_files as i64, trigger, no_cache as i64, github_pr.map(|v| v as i64), now_ms(), trusted as i64],
         )?;
         Ok(id)
     }
@@ -714,6 +729,7 @@ impl Db {
             os: if os == "any" { worker.os.clone() } else { os },
             no_cache: run.no_cache,
             flake_retries: u32::from(run.trigger == "queue"),
+            trusted: run.trusted,
             tasks,
         };
         Ok((Some(job), held))
@@ -1012,12 +1028,52 @@ impl Db {
         Ok(entry.and_then(|e| serde_json::from_str(&e).ok()))
     }
 
-    pub fn cache_put(&self, key: &str, entry: &CacheEntry) -> Result<()> {
+    /// Stores a result and returns the row key it went under: the action key
+    /// for trusted runs, `u:<key>` for untrusted ones.
+    pub fn cache_put(&self, key: &str, trusted: bool, entry: &CacheEntry) -> Result<String> {
+        let stored = if trusted {
+            key.to_string()
+        } else {
+            format!("u:{key}")
+        };
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO cache (action_key, entry, created_at) VALUES (?1, ?2, ?3)",
-            params![key, serde_json::to_string(entry)?, now_ms()],
+            params![stored, serde_json::to_string(entry)?, now_ms()],
         )?;
-        Ok(())
+        Ok(stored)
+    }
+
+    /// The row key a run may use for an action key: trusted runs only see
+    /// trusted results, untrusted runs see both (trusted first).
+    pub fn cache_find(&self, key: &str, trusted: bool) -> Result<Option<String>> {
+        let c = self.conn.lock();
+        let untrusted = format!("u:{key}");
+        let candidates: &[&str] = if trusted { &[key] } else { &[key, &untrusted] };
+        for k in candidates {
+            if c.prepare_cached("SELECT 1 FROM cache WHERE action_key = ?1")?
+                .exists(params![k])?
+            {
+                return Ok(Some(k.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the group holding this lease belongs to a trusted run.
+    /// Unknown or missing leases are untrusted.
+    pub fn lease_trusted(&self, lease: Option<&str>) -> Result<bool> {
+        let Some(lease) = lease else { return Ok(false) };
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT runs.trusted FROM groups_ JOIN runs ON runs.id = groups_.run_id
+                 WHERE groups_.lease = ?1 AND groups_.status = 'running'",
+                params![lease],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|t| t != 0))
     }
 
     pub fn kv_get(&self, ns: &str, key: &str) -> Result<Option<String>> {
@@ -1281,7 +1337,7 @@ mod tests {
         let db = Db::memory().unwrap();
         let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
         let run = db
-            .insert_run(&repo.id, "sha", None, None, 0, "test", false, None)
+            .insert_run(&repo.id, "sha", None, None, 0, "test", false, None, false)
             .unwrap();
         let task = vec![(
             "t".to_string(),
@@ -1376,7 +1432,7 @@ mod affinity_tests {
         db.touch_worker(&warm).unwrap();
         db.touch_worker(&cold).unwrap();
         let run1 = db
-            .insert_run(&repo.id, "a", None, None, 0, "t", false, None)
+            .insert_run(&repo.id, "a", None, None, 0, "t", false, None, false)
             .unwrap();
         db.insert_group(&run1, "ci", "linux", &[], &task).unwrap();
         let job = db.claim_group(&warm).unwrap().0.unwrap();
@@ -1391,7 +1447,7 @@ mod affinity_tests {
 
         // The next run of that group is held for `warm`...
         let run2 = db
-            .insert_run(&repo.id, "b", None, None, 0, "t", false, None)
+            .insert_run(&repo.id, "b", None, None, 0, "t", false, None, false)
             .unwrap();
         db.insert_group(&run2, "ci", "linux", &[], &task).unwrap();
         let (job, held) = db.claim_group(&cold).unwrap();
@@ -1404,7 +1460,7 @@ mod affinity_tests {
 
         // Once the hold expires, any worker may take it.
         let run3 = db
-            .insert_run(&repo.id, "c", None, None, 0, "t", false, None)
+            .insert_run(&repo.id, "c", None, None, 0, "t", false, None, false)
             .unwrap();
         db.insert_group(&run3, "ci", "linux", &[], &task).unwrap();
         db.conn
@@ -1423,10 +1479,33 @@ mod stats_tests {
     use super::*;
 
     #[test]
+    fn untrusted_results_are_never_served_to_trusted_runs() {
+        let db = Db::memory().unwrap();
+        let entry = |ms| CacheEntry {
+            log_digest: None,
+            outputs: vec![],
+            duration_ms: ms,
+            inputs: None,
+        };
+        // A branch caches a result under the key main will compute.
+        assert_eq!(db.cache_put("k", false, &entry(1)).unwrap(), "u:k");
+        assert_eq!(db.cache_find("k", true).unwrap(), None);
+        assert_eq!(db.cache_find("k", false).unwrap().as_deref(), Some("u:k"));
+        // Main's own result is shared with everyone and preferred.
+        assert_eq!(db.cache_put("k", true, &entry(2)).unwrap(), "k");
+        assert_eq!(db.cache_find("k", true).unwrap().as_deref(), Some("k"));
+        assert_eq!(db.cache_find("k", false).unwrap().as_deref(), Some("k"));
+        // Without a live lease, a request is untrusted.
+        assert!(!db.lease_trusted(None).unwrap());
+        assert!(!db.lease_trusted(Some("forged")).unwrap());
+    }
+
+    #[test]
     fn time_saved_survives_eviction() {
         let db = Db::memory().unwrap();
         db.cache_put(
             "k",
+            true,
             &CacheEntry {
                 log_digest: None,
                 outputs: vec![],

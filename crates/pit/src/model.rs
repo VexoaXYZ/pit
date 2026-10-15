@@ -182,6 +182,12 @@ pub struct CreateRun {
     pub git_ref: Option<String>,
     #[serde(default)]
     pub no_cache: bool,
+    /// Code that is, or is about to be, on a protected branch: main pushes,
+    /// merge queue and post-merge runs. Only the server sets it; runs created
+    /// through the API (`pit run`, scripts) are never trusted. See
+    /// `server::trusted_branch`.
+    #[serde(skip)]
+    pub trusted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +222,10 @@ pub struct Job {
     /// test does not eject a change that did not cause it.
     #[serde(default)]
     pub flake_retries: u32,
+    /// Trusted runs get their own warm workspaces and only reuse cached
+    /// results from other trusted runs.
+    #[serde(default)]
+    pub trusted: bool,
     pub tasks: Vec<JobTask>,
 }
 

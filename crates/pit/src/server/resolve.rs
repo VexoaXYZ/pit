@@ -54,6 +54,7 @@ pub fn resolve(
     app: &App,
     group: &PlannedGroup,
     files: &[(String, String)],
+    trusted: bool,
 ) -> Result<Option<Vec<TaskResult>>> {
     // An `any` group's keys depend on the OS of the worker that would run it;
     // try the server's own, which is what a single-OS fleet uses.
@@ -64,6 +65,8 @@ pub fn resolve(
     };
     let mut keys: HashMap<&str, String> = HashMap::new();
     let mut results = Vec::with_capacity(group.tasks.len());
+    // The cache row each hit came from (see `Db::cache_find`).
+    let mut stored: Vec<Option<String>> = Vec::with_capacity(group.tasks.len());
     for (name, def) in &group.tasks {
         let dep_keys: Vec<String> = def
             .deps
@@ -77,19 +80,27 @@ pub fn resolve(
         }
         let result = match def.cache {
             CacheMode::Off => return Ok(None),
-            CacheMode::Remote => match app.db.cache_peek(&key)? {
-                Some(entry) => TaskResult {
-                    status: Status::Cached,
-                    exit_code: Some(0),
-                    action_key: Some(key.clone()),
-                    duration_ms: 0,
-                    log_digest: entry.log_digest,
-                    message: Some(format!(
-                        "cache hit, resolved by the server without a worker (saved {:.1}s)",
-                        entry.duration_ms as f64 / 1000.0
-                    )),
-                },
-                None => return Ok(None),
+            CacheMode::Remote => match app
+                .db
+                .cache_find(&key, trusted)?
+                .map(|row| Ok::<_, anyhow::Error>((app.db.cache_peek(&row)?, row)))
+                .transpose()?
+            {
+                Some((Some(entry), row)) => {
+                    stored.push(Some(row));
+                    TaskResult {
+                        status: Status::Cached,
+                        exit_code: Some(0),
+                        action_key: Some(key.clone()),
+                        duration_ms: 0,
+                        log_digest: entry.log_digest,
+                        message: Some(format!(
+                            "cache hit, resolved by the server without a worker (saved {:.1}s)",
+                            entry.duration_ms as f64 / 1000.0
+                        )),
+                    }
+                }
+                _ => return Ok(None),
             },
             CacheMode::Workspace => {
                 // Setup for other tasks. Only skippable if something cached
@@ -97,6 +108,7 @@ pub fn resolve(
                 if !group.tasks.iter().any(|(_, t)| t.deps.contains(name)) {
                     return Ok(None);
                 }
+                stored.push(None);
                 TaskResult {
                     status: Status::Cached,
                     exit_code: Some(0),
@@ -113,12 +125,8 @@ pub fn resolve(
         results.push(result);
     }
     // Count the hits only once the whole group is known to resolve.
-    for (r, (_, def)) in results.iter().zip(&group.tasks) {
-        if def.cache == CacheMode::Remote {
-            if let Some(key) = &r.action_key {
-                app.db.cache_get(key)?;
-            }
-        }
+    for row in stored.into_iter().flatten() {
+        app.db.cache_get(&row)?;
     }
     Ok(Some(results))
 }

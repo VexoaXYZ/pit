@@ -167,13 +167,20 @@ impl Worker {
     /// The most recently used free workspace for this repo and group, so the
     /// group's dependencies and build output from its last run are still
     /// there. Groups do different work (a Rust build, a JS install), so they
-    /// never share warm state. Creates a workspace if all are busy.
-    fn lease_workspace(&self, repo: &str, group: &str) -> WorkspaceLease<'_> {
+    /// never share warm state. Neither do trusted and untrusted runs: files
+    /// a branch leaves behind (a planted `node_modules` entry) must not be
+    /// there when main runs. Creates a workspace if all are busy.
+    fn lease_workspace(&self, repo: &str, group: &str, trusted: bool) -> WorkspaceLease<'_> {
+        let pool = if trusted {
+            safe_name(group)
+        } else {
+            format!("{}~untrusted", safe_name(group))
+        };
         let dir = self
             .data_dir
             .join("workspaces")
             .join(safe_name(repo))
-            .join(safe_name(group));
+            .join(pool);
         let key = dir.to_string_lossy().to_string();
         let mut pools = self.workspaces.lock();
         let slots = pools.entry(key.clone()).or_default();
@@ -342,7 +349,7 @@ impl Worker {
                 }
             })
         };
-        let lease = self.lease_workspace(&job.repo, &job.group);
+        let lease = self.lease_workspace(&job.repo, &job.group, job.trusted);
         let ws = lease.path.clone();
         let prep_start = Instant::now();
         let prepared = self.prepare(&job, &ws).await;
@@ -956,6 +963,13 @@ impl Worker {
             serde_json::from_slice(&self.blob(last.inputs.as_deref()?).await.ok()?).ok()?;
         if prev.v != inputs.v {
             return Some("Pit's cache format changed".into());
+        }
+        if prev.key() == inputs.key() {
+            return Some(
+                "its only cached result came from an untrusted run (a PR, branch or `pit run`), \
+                 which trusted runs do not reuse"
+                    .into(),
+            );
         }
         Some(crate::graph::explain_miss(&prev, inputs, deps))
     }

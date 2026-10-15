@@ -83,6 +83,7 @@ pub async fn submit(
                 trigger: Some("local".into()),
                 git_ref: snapshot.branch.clone(),
                 no_cache,
+                trusted: false,
             },
         )
         .await?;
