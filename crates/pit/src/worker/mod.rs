@@ -995,6 +995,17 @@ impl Worker {
         inputs: &crate::graph::KeyInputs,
         deps: &[(String, String)],
     ) -> Option<String> {
+        // A rerun after a failure: failures are not cached, and the inputs
+        // matter more than how they differ from some older success.
+        if let Ok(Some(v)) = client
+            .get_opt::<serde_json::Value>(&format!("/api/cache/failed/{}", inputs.key()))
+            .await
+        {
+            return Some(format!(
+                "it failed with these same inputs in {} (failures are not cached)",
+                v["runId"].as_str().unwrap_or("an earlier run")
+            ));
+        }
         let last = match client
             .get_opt::<CacheEntry>(&format!("/api/cache/last/{scope}"))
             .await

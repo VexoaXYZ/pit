@@ -1534,3 +1534,39 @@ async fn notifies_when_a_trusted_line_breaks_and_is_fixed() {
     assert_eq!(got[0]["failed"][0], "default.check");
     assert!(got[0]["text"].as_str().unwrap().contains("is broken"));
 }
+
+/// Rerunning after a failure reruns only the failed task, and says it ran
+/// because it failed last time with the same inputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rerun_reruns_only_what_failed_and_says_why() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let down = dir.join("..").join(format!("down-{}", std::process::id()));
+    std::fs::write(&down, "").unwrap();
+    let config = serde_json::json!({ "tasks": {
+        "build": { "run": "mkdir -p dist && echo x > dist/x", "outputs": ["dist/**"] },
+        "test": { "run": format!("test ! -f {}", down.display()), "deps": ["build"] },
+    } });
+    write(dir, "pit.config.json", &config.to_string());
+    write(dir, ".gitignore", "dist/\n");
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    assert_eq!(run(&pit, dir).await.status, Status::Failed);
+    std::fs::remove_file(&down).unwrap();
+    let view = run(&pit, dir).await;
+    assert_eq!(view.status, Status::Passed);
+    let task = |n: &str| {
+        view.groups[0]
+            .tasks
+            .iter()
+            .find(|t| t.name == n)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(task("build").status, Status::Cached);
+    let msg = task("test").message.unwrap_or_default();
+    assert!(msg.contains("failed with these same inputs"), "{msg}");
+}

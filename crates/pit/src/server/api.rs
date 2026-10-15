@@ -64,6 +64,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/workers/claim", post(claim))
         .route("/api/cache/{key}", get(cache_get).put(cache_put))
         .route("/api/cache/last/{scope}", get(cache_last))
+        .route("/api/cache/failed/{key}", get(cache_failed))
         .route("/api/gc", post(gc_now))
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
@@ -566,6 +567,18 @@ async fn cache_last(
             anyhow::anyhow!("previous result was evicted"),
         )
     })
+}
+
+/// The run where a task with these exact inputs last failed. Failures are
+/// not cached, so this is how a rerun can say why it ran again.
+async fn cache_failed(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    app.db
+        .last_failure(&key)?
+        .map(|run| Json(serde_json::json!({ "runId": run })))
+        .ok_or_else(|| not_found("failure"))
 }
 
 /// `POST /api/gc`: collect now. Under the limit this only deletes blobs

@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_group ON tasks(group_id, position);
 CREATE INDEX IF NOT EXISTS tasks_run ON tasks(run_id);
+CREATE INDEX IF NOT EXISTS tasks_key ON tasks(action_key);
 
 CREATE TABLE IF NOT EXISTS task_logs (
   task_id TEXT NOT NULL,
@@ -1317,6 +1318,20 @@ impl Db {
             params![message, id],
         )?;
         Ok(())
+    }
+
+    /// The run in which a task with this action key last failed, if any.
+    pub fn last_failure(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT run_id FROM tasks WHERE action_key = ?1 AND status IN ('failed', 'error')
+                 ORDER BY finished_at DESC LIMIT 1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Records a line's latest result and returns the one before it.

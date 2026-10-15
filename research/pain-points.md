@@ -1465,3 +1465,48 @@ and expects exactly `["broken", "fixed"]` over break, still broken, fixed.
 - **No retry.** Delivery is one attempt with a 10s timeout; a failure is logged.
 - **No mentions.** The message does not mention the people who caused the break.
 - **One URL.** There is one notify URL per server, not per repo.
+
+## P28. Re-running a failure repeats the whole job
+
+**Pain.** When one step fails for a reason outside the code (a service down, a network blip),
+GitHub can re-run failed jobs, and since 2022 individual jobs, but not a step. A re-run gets a
+fresh runner and repeats checkout, setup, install and build before it reaches the step that
+failed. People ask for step-level re-runs and resume-from-failure, and work around it with retry
+loops, retry actions, or `actions/cache` marker files that skip work that already passed
+([community#27121](https://github.com/orgs/community/discussions/27121),
+[#4278](https://github.com/orgs/community/discussions/4278),
+[GitHub changelog](https://github.blog/changelog/2022-03-17-github-actions-re-run-only-failed-or-individual-jobs/),
+[GitHub blog](https://github.blog/news-insights/product-news/save-time-partial-re-runs-github-actions/),
+[This Dot](https://www.thisdot.co/blog/how-to-retry-failed-steps-in-github-action-workflows),
+[Medium](https://medium.com/@tcorbisier/github-actions-re-run-a-single-5e9f1744c788)).
+
+**Reproduction** (`/tmp/painhunt/p28`): `install` (3s, workspace cache), `build` (3s, outputs)
+and `lint` (2s) feed `test`. `test` fails while a marker file says the database is down. One run
+with the database down, then a rerun after it is back.
+
+```
+first run   ✓ install 3.1s  ✓ lint 2.0s  ✓ build 3.0s  ✗ test (ECONNREFUSED)   failed in 7.6s
+rerun       ◆ install  ◆ lint  ◆ build  ✓ test 1.0s                          passed in 1.5s · 1 ran, 3 cached
+```
+
+That needed no configuration. Every task is its own cached step, and failures are not cached,
+so a rerun repeats exactly the failed task and anything downstream of it. The same holds for
+GitHub's "Re-run" button: Pit plans a new run, and everything that passed is a cache hit.
+
+**Gap found:** the rerun said "ran because nothing was cached for it yet", or compared against an
+older success ("package.json changed; build changed"). Both are true and neither is the reason.
+
+**Fix** (research/pain-hunt): before explaining a miss, the worker asks
+`/api/cache/failed/{key}` whether a task with these exact inputs failed before. The lookup
+uses a new `tasks(action_key)` index.
+
+```
+rerun   ✓ test 1.1s  ran because it failed with these same inputs in run_5e109e42daad (failures are not cached)
+        passed in 1.3s · 1 ran, 3 cached
+```
+
+Covered by the e2e test `a_rerun_reruns_only_what_failed_and_says_why`.
+
+**Verdict: SOLVED.** A rerun costs only the failed task, and says why it ran. Not done: a task
+that is itself long (a 10-minute test suite) still reruns in full, since Pit's unit of work is the
+task. Splitting it (`shards`, P14) is the answer there.
