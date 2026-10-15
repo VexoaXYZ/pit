@@ -1,0 +1,219 @@
+//! Execution backends and process supervision with live log streaming.
+
+use std::path::Path;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc;
+
+use crate::model::{Backend, TaskDef};
+
+/// Logs above this size keep the head and tail only.
+const MAX_LOG: usize = 8 * 1024 * 1024;
+
+pub struct Outcome {
+    pub exit_code: Option<i32>,
+    pub log: String,
+    pub duration: Duration,
+    pub timed_out: bool,
+}
+
+/// Which isolation backends work on this host.
+pub async fn detect_backends() -> Vec<Backend> {
+    let mut backends = vec![Backend::Host];
+    if cfg!(target_os = "linux") && probe("unshare", &["--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"]).await {
+        backends.push(Backend::Sandbox);
+    }
+    if probe("docker", &["info", "--format", "{{.ServerVersion}}"]).await {
+        backends.push(Backend::Docker);
+    }
+    backends
+}
+
+async fn probe(bin: &str, args: &[&str]) -> bool {
+    let fut = Command::new(bin).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    matches!(tokio::time::timeout(Duration::from_secs(10), fut).await, Ok(Ok(s)) if s.success())
+}
+
+pub fn kvm_available() -> bool {
+    Path::new("/dev/kvm").exists()
+}
+
+fn shell(script: &str) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        ("cmd".into(), vec!["/C".into(), script.into()])
+    } else {
+        ("sh".into(), vec!["-c".into(), script.into()])
+    }
+}
+
+/// Builds the command for a task on the chosen backend.
+pub fn command(task: &TaskDef, backend: Backend, workdir: &Path, env: &[(String, String)]) -> Command {
+    let network = task.network.unwrap_or(true);
+    let (program, args): (String, Vec<String>) = match backend {
+        Backend::Host => shell(&task.run),
+        Backend::Sandbox => {
+            let mut a: Vec<String> = ["--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "--ipc", "--uts"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if !network {
+                a.push("--net".into());
+            }
+            a.extend(["sh".into(), "-c".into(), task.run.clone()]);
+            ("unshare".into(), a)
+        }
+        Backend::Docker => {
+            let mut a = vec![
+                "run".to_string(),
+                "--rm".into(),
+                "--init".into(),
+                "-v".into(),
+                format!("{}:/workspace", workdir.display()),
+                "-w".into(),
+                "/workspace".into(),
+            ];
+            if !network {
+                a.extend(["--network".into(), "none".into()]);
+            }
+            for (k, v) in env {
+                a.extend(["-e".into(), format!("{k}={v}")]);
+            }
+            a.push(task.image.clone().unwrap_or_else(|| "ubuntu:24.04".into()));
+            a.extend(["sh".into(), "-c".into(), task.run.clone()]);
+            ("docker".into(), a)
+        }
+    };
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(workdir).envs(env.iter().cloned());
+    cmd
+}
+
+/// Runs a command, sending log text to `live` as it arrives.
+pub async fn run(mut cmd: Command, timeout: Option<Duration>, live: mpsc::UnboundedSender<String>) -> Result<Outcome> {
+    let started = Instant::now();
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().context("spawning task")?;
+    let pid = child.id();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let out = child.stdout.take().map(|s| tokio::spawn(pump(s, tx.clone())));
+    let err = child.stderr.take().map(|s| tokio::spawn(pump(s, tx.clone())));
+    drop(tx);
+
+    let collector = tokio::spawn(async move {
+        let mut log = String::new();
+        let mut dropped = 0usize;
+        while let Some(line) = rx.recv().await {
+            if log.len() + line.len() <= MAX_LOG {
+                log.push_str(&line);
+            } else {
+                dropped += line.len();
+            }
+            let _ = live.send(line);
+        }
+        if dropped > 0 {
+            log.push_str(&format!("\n[pit: {dropped} bytes of log output truncated]\n"));
+        }
+        log
+    });
+
+    let wait = child.wait();
+    let (status, timed_out) = match timeout {
+        Some(t) => match tokio::time::timeout(t, wait).await {
+            Ok(s) => (Some(s?), false),
+            Err(_) => {
+                kill_tree(pid);
+                let _ = child.kill().await;
+                (None, true)
+            }
+        },
+        None => (Some(wait.await?), false),
+    };
+    // A backgrounded grandchild can hold the pipes open; do not wait forever.
+    for h in [out, err].into_iter().flatten() {
+        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+    }
+    kill_tree(pid);
+    let mut log = collector.await.unwrap_or_default();
+    if timed_out {
+        log.push_str("\n[pit: task timed out]\n");
+    }
+    Ok(Outcome {
+        exit_code: status.and_then(|s| s.code()),
+        log,
+        duration: started.elapsed(),
+        timed_out,
+    })
+}
+
+async fn pump(stream: impl AsyncRead + Unpin, tx: mpsc::UnboundedSender<String>) {
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if tx.send(String::from_utf8_lossy(&buf).into_owned()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Kills the task's whole process group so nothing outlives it.
+fn kill_tree(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: plain syscall; a negative pid targets the process group we created.
+        unsafe {
+            libc_kill(-(pid as i32), 9);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn streams_output_and_reports_exit_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskDef { run: if cfg!(windows) { "echo hi && exit 3".into() } else { "echo hi; echo err >&2; exit 3".into() }, ..Default::default() };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = run(command(&task, Backend::Host, dir.path(), &[]), None, tx).await.unwrap();
+        assert_eq!(out.exit_code, Some(3));
+        assert!(out.log.contains("hi"));
+        let mut live = String::new();
+        while let Ok(l) = rx.try_recv() {
+            live.push_str(&l);
+        }
+        assert!(live.contains("hi"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn times_out_and_kills_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskDef { run: "sleep 30 & sleep 30".into(), ..Default::default() };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let started = Instant::now();
+        let out = run(command(&task, Backend::Host, dir.path(), &[]), Some(Duration::from_millis(300)), tx).await.unwrap();
+        assert!(out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
