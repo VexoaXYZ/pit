@@ -43,6 +43,10 @@ enum Command {
         /// past it. 0 means unlimited.
         #[arg(long, env = "PIT_CACHE_MAX_GB", default_value_t = 20.0)]
         cache_max_gb: f64,
+        /// Disk budget in GB for the worker's warm workspaces; least
+        /// recently used idle ones are removed past it. 0 means no limit.
+        #[arg(long, env = "PIT_WORKSPACE_MAX_GB", default_value_t = 50.0)]
+        workspace_max_gb: f64,
     },
     /// Run the control plane.
     Server {
@@ -72,6 +76,10 @@ enum Command {
         slots: usize,
         #[arg(long)]
         parallelism: Option<usize>,
+        /// Disk budget in GB for the worker's warm workspaces; least
+        /// recently used idle ones are removed past it. 0 means no limit.
+        #[arg(long, env = "PIT_WORKSPACE_MAX_GB", default_value_t = 50.0)]
+        workspace_max_gb: f64,
     },
     /// Run tasks on the working tree, including uncommitted changes.
     Run {
@@ -222,6 +230,7 @@ async fn run(cli: Cli) -> Result<i32> {
             parallelism,
             token,
             cache_max_gb,
+            workspace_max_gb,
         } => {
             let data = data.unwrap_or_else(default_data);
             cli::up(
@@ -231,6 +240,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 parallelism.unwrap_or_else(default_parallelism),
                 token,
                 gb_to_bytes(cache_max_gb),
+                gb_to_bytes(workspace_max_gb),
             )
             .await?;
             Ok(0)
@@ -258,6 +268,7 @@ async fn run(cli: Cli) -> Result<i32> {
             data,
             slots,
             parallelism,
+            workspace_max_gb,
         } => {
             pit::worker::run(pit::worker::WorkerOpts {
                 server: conn.server,
@@ -266,6 +277,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 data_dir: data.unwrap_or_else(default_data).join("worker"),
                 slots,
                 parallelism: parallelism.unwrap_or_else(default_parallelism),
+                workspace_max_bytes: gb_to_bytes(workspace_max_gb),
             })
             .await?;
             Ok(0)

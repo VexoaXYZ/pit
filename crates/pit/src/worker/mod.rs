@@ -5,6 +5,7 @@
 //! A job is a whole group of tasks. They run in one workspace, in dependency
 //! order, with independent tasks in parallel.
 
+pub mod disk;
 pub mod exec;
 pub mod files;
 pub mod mask;
@@ -33,6 +34,9 @@ pub struct WorkerOpts {
     pub slots: usize,
     /// Tasks run at the same time within one group.
     pub parallelism: usize,
+    /// Disk budget for warm workspaces; least recently used idle ones are
+    /// removed past it. 0 means no size limit.
+    pub workspace_max_bytes: u64,
 }
 
 pub struct Worker {
@@ -43,6 +47,7 @@ pub struct Worker {
     parallelism: usize,
     mirror_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     workspaces: Mutex<HashMap<String, Vec<WorkspaceSlot>>>,
+    workspace_max_bytes: u64,
     /// `runtime` command outputs, per job (`group id \0 command`).
     runtime_memo: Mutex<HashMap<String, String>>,
 }
@@ -69,20 +74,21 @@ impl Drop for WorkspaceLease<'_> {
                 s.last_used = Instant::now();
             }
         }
+        disk::touch_used(&self.path);
     }
 }
 
 pub async fn run(opts: WorkerOpts) -> Result<()> {
-    let worker = Arc::new(
-        Worker::new(
-            opts.server.as_str(),
-            opts.token.clone(),
-            opts.name.clone(),
-            &opts.data_dir,
-            opts.parallelism,
-        )
-        .await?,
-    );
+    let mut worker = Worker::new(
+        opts.server.as_str(),
+        opts.token.clone(),
+        opts.name.clone(),
+        &opts.data_dir,
+        opts.parallelism,
+    )
+    .await?;
+    worker.workspace_max_bytes = opts.workspace_max_bytes;
+    let worker = Arc::new(worker);
     tracing::info!(
         "pit worker {} ({} {}, {} cpus, backends: {}) serving {} with {} slot(s)",
         worker.info.name,
@@ -100,6 +106,10 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
         opts.slots,
     );
     let mut loops = JoinSet::new();
+    {
+        let w = worker.clone();
+        loops.spawn(async move { w.workspace_gc_loop().await });
+    }
     for slot in 0..opts.slots.max(1) {
         let w = worker.clone();
         loops.spawn(async move { w.claim_loop(slot).await });
@@ -149,6 +159,7 @@ impl Worker {
             parallelism: parallelism.max(1),
             mirror_locks: Default::default(),
             workspaces: Default::default(),
+            workspace_max_bytes: 0,
             runtime_memo: Default::default(),
         })
     }
@@ -213,6 +224,73 @@ impl Worker {
             pool: key,
             path,
         }
+    }
+
+    /// Removes stale workspaces, and least recently used ones past the disk
+    /// budget, every ten minutes (see `disk`).
+    async fn workspace_gc_loop(self: Arc<Self>) {
+        loop {
+            let w = self.clone();
+            match tokio::task::spawn_blocking(move || w.collect_workspaces()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("workspace cleanup: {e:#}"),
+                Err(e) => tracing::warn!("workspace cleanup: {e}"),
+            }
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        }
+    }
+
+    fn collect_workspaces(&self) -> Result<()> {
+        let root = self.data_dir.join("workspaces");
+        let trash = root.join(".trash");
+        // Left over from a cleanup that was interrupted.
+        let _ = std::fs::remove_dir_all(&trash);
+        let found = disk::scan(&root);
+        let now = std::time::SystemTime::now();
+        let mut doomed = Vec::new();
+        {
+            // Holding the pool lock: nothing can lease a workspace while it
+            // is chosen and moved out of the way.
+            let mut pools = self.workspaces.lock();
+            let busy = |p: &Path| pools.values().flatten().any(|s| s.busy && s.path == p);
+            let chosen = disk::plan(&found, busy, self.workspace_max_bytes, now);
+            for path in chosen {
+                let dest = trash.join(uuid::Uuid::new_v4().simple().to_string());
+                std::fs::create_dir_all(&trash)?;
+                if std::fs::rename(&path, &dest).is_err() {
+                    continue;
+                }
+                for slots in pools.values_mut() {
+                    slots.retain(|s| s.path != path);
+                }
+                doomed.push((path, dest));
+            }
+        }
+        let total: u64 = found.iter().map(|w| w.bytes).sum();
+        let mut freed = 0;
+        for (path, dest) in doomed {
+            let w = found.iter().find(|w| w.path == path);
+            let bytes = w.map(|w| w.bytes).unwrap_or_default();
+            let idle_days = w
+                .and_then(|w| now.duration_since(w.last_used).ok())
+                .map(|d| d.as_secs() / 86_400)
+                .unwrap_or_default();
+            tracing::info!(
+                "removed workspace {} ({:.1} GB, unused for {idle_days} day(s))",
+                path.strip_prefix(&root).unwrap_or(&path).display(),
+                bytes as f64 / 1e9,
+            );
+            std::fs::remove_dir_all(&dest)?;
+            freed += bytes;
+        }
+        if freed > 0 {
+            tracing::info!(
+                "workspaces: {:.1} GB → {:.1} GB",
+                total as f64 / 1e9,
+                (total - freed) as f64 / 1e9
+            );
+        }
+        Ok(())
     }
 
     async fn claim_loop(self: Arc<Self>, slot: usize) {

@@ -928,3 +928,63 @@ unit test `a_silent_task_is_stopped_by_the_idle_limit`.
 hours. The CircleCI trade-off still applies: a task that is legitimately quiet for over 15
 minutes (a long silent link or upload) must set `idleTimeout`, and Pit cannot tell a deadlock
 from a task that is busy without printing.
+
+## P19. Self-hosted runners fill their disks
+
+**Pain.** Long-lived self-hosted runners keep every job's leftovers: work directories, tool
+caches, Docker images. Eventually the disk is full and every job on that machine fails with
+"No space left on device" until someone logs in and deletes things
+([JetBrains IDEA-381717](https://youtrack.jetbrains.com/projects/IDEA/issues/IDEA-381717/GitHub-Actions-runner-fails-with-System.IO.IOException-No-space-left-on-device),
+[community#133486](https://github.com/orgs/community/discussions/133486),
+[DevOpsBoys](https://devopsboys.com/blog/runner-out-of-disk-space-fix-2026),
+[WarpBuild](https://www.warpbuild.com/guides/github-actions-runner-out-of-disk)). Other systems
+have the same problem: Buildkite users write their own cleanup hooks and ask for build
+directories to be purged
+([elastic-ci-stack-for-aws#1255](https://github.com/buildkite/elastic-ci-stack-for-aws/issues/1255),
+[forum](https://forum.buildkite.community/t/disk-space-cleanup-on-agents-the-environment-hook-vs-docker-low-disk-gc/3325)),
+an agent with a full disk keeps taking jobs and failing them
+([buildkite/agent#1111](https://github.com/buildkite/agent/issues/1111)), IREE saw unbounded
+growth from per-pipeline checkouts ([iree#7139](https://github.com/google/iree/issues/7139)),
+and Azure Pipelines agents ask for work directory cleanup
+([azure-pipelines-agent#1506](https://github.com/microsoft/azure-pipelines-agent/issues/1506)).
+
+Pit makes this worse on purpose: warm workspaces keep `node_modules` and `target` between runs.
+
+**Reproduction**: the worker on this machine, after a day of benchmarks and this hunt.
+
+**Before** (research/pain-hunt at P18): nothing ever removed a workspace. The worker held
+13.6 GB of workspaces, 8.8 GB of them dead: `t3code/0` (4.9 GB on `du`), `t3-7681688b/0` and
+`/1` (2 GB each) were left by an older directory layout and would never be leased again, the
+same thing a renamed group or a repo nobody builds leaves behind. A fake 300 MB workspace last
+used 30 days ago was added to check age-based removal.
+
+**Fix** (research/pain-hunt): every ten minutes the worker scans its workspaces (any directory
+with a `.git` up to three levels down, so older layouts are found too). Idle workspaces unused
+for 14 days are removed. Past `--workspace-max-gb` (default 50), the least recently used idle
+ones go until the total fits. Busy workspaces are never touched. Last use is the mtime of a
+marker written when a job releases the workspace, so it survives restarts. Under the pool lock
+a chosen workspace is renamed into `.trash` and dropped from the pool, so no job can lease it
+mid-delete; the slow delete happens after.
+
+Restarted with `PIT_WORKSPACE_MAX_GB=5`:
+
+```
+removed workspace painhunt-p19/build/0 (0.3 GB, unused for 30 day(s))
+removed workspace pitdemo/0 (0.0 GB, unused for 0 day(s))
+removed workspace t3code/0 (5.4 GB, unused for 0 day(s))
+removed workspace isodemo/0 (0.0 GB, unused for 0 day(s))
+removed workspace t3-7681688b/0 (2.4 GB, unused for 0 day(s))
+removed workspace t3-7681688b/1 (2.4 GB, unused for 0 day(s))
+workspaces: 13.6 GB → 3.2 GB
+```
+
+(Sizes are allocated blocks in GB; `du -sh` reports GiB.) The live workspaces `rust/0` and
+`web/0` survived: the next `pit run` of this repo had both ready in 1.5s, and clippy took 27s
+incrementally. Deleting the 10 GB took about 25s, off the job path. Covered by the unit tests
+`evicts_stale_then_least_recently_used_idle_workspaces` and `finds_workspaces_in_any_layout`.
+
+**Verdict: PARTIAL.** Workspaces, the largest and fastest-growing part, are now bounded, and so
+is the server cache (P4). Still unbounded on a worker: git mirrors (1.7 GB here, one per repo),
+the worker's blob cache (89 MB), and Docker images and BuildKit cache, which Pit leaves to
+`docker system prune`. The budget is checked every ten minutes, so a burst can overshoot it in
+between, and a worker whose disk is full still claims jobs.

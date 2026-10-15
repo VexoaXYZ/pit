@@ -23,6 +23,7 @@ pub async fn up(
     parallelism: usize,
     token: Option<String>,
     cache_max_bytes: u64,
+    workspace_max_bytes: u64,
 ) -> Result<()> {
     let public = format!("http://{addr}");
     let app = crate::server::App::new(&data.join("server"), token.clone(), public.clone())?;
@@ -46,6 +47,7 @@ pub async fn up(
         data_dir: data.join("worker"),
         slots,
         parallelism,
+        workspace_max_bytes,
     }));
     tokio::select! {
         r = server => r??,

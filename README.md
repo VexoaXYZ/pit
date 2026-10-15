@@ -219,6 +219,13 @@ under 90% of the limit, the way bazel-remote does. Blobs younger than two minute
 runs from the last 14 days are kept. Evictions are logged, counted in `/api/stats`, and a
 task whose last result was evicted says so when it reruns. `POST /api/gc` collects now.
 
+**Workspace disk.** Workers keep a warm workspace per repo and group, `node_modules` and
+`target` included. Every ten minutes a worker removes idle workspaces unused for 14 days, and
+past `--workspace-max-gb` (default 50, `0` for no size limit, env `PIT_WORKSPACE_MAX_GB`) the
+least recently used idle ones, so repos and groups nobody builds any more do not fill the disk.
+A removed workspace only costs a cold run. Git mirrors, the worker's blob cache and Docker
+images are not trimmed.
+
 Data lives in `~/.pit` (`PIT_DATA`). Set `PIT_TOKEN` on the server and clients to require
 a bearer token.
 

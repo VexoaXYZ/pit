@@ -26,6 +26,7 @@ async fn start() -> Pit {
         data_dir: data.path().join("worker"),
         slots: 4,
         parallelism: 4,
+        workspace_max_bytes: 0,
     }));
     let client = Client::new(&base, None).unwrap();
     for _ in 0..100 {
@@ -346,6 +347,7 @@ async fn github_webhook_runs_commit_and_reports_statuses() {
         data_dir: data.path().join("worker"),
         slots: 2,
         parallelism: 2,
+        workspace_max_bytes: 0,
     }));
 
     let repo = tempfile::tempdir().unwrap();
