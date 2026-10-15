@@ -521,3 +521,72 @@ async fn turbo_and_bazel_remote_cache_protocols() {
         .unwrap();
     assert_eq!(head.status(), 200);
 }
+
+/// A run cancelled before any worker picks it up must fail, never pass:
+/// the merge queue lands on green runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_run_is_not_green() {
+    // Server only, no worker, so the group stays queued.
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = pit::server::App::with_github(&data.path().join("server"), None, base.clone(), None)
+        .unwrap();
+    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = Client::new(&base, None).unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        repo.path(),
+        "pit.config.json",
+        r#"{"tasks":{"t":{"run":"true"}}}"#,
+    );
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sub = pit::cli::submit(&client, repo.path(), vec![], false)
+        .await
+        .unwrap();
+    // Wait for planning, then cancel.
+    for _ in 0..100 {
+        let v: RunView = client
+            .get(&format!("/api/runs/{}", sub.run_id))
+            .await
+            .unwrap();
+        if !v.groups.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _: serde_json::Value = client
+        .post(&format!("/api/runs/{}/cancel", sub.run_id), &())
+        .await
+        .unwrap();
+    let v: RunView = client
+        .get(&format!("/api/runs/{}", sub.run_id))
+        .await
+        .unwrap();
+    assert_eq!(v.status, Status::Failed, "{v:?}");
+    assert_eq!(v.message.as_deref(), Some("cancelled"));
+}
+
+/// Tasks never see Pit's own settings, such as the API token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tasks_do_not_inherit_pit_secrets() {
+    std::env::set_var("PIT_TEST_SECRET", "hunter2");
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        repo.path(),
+        "pit.config.json",
+        r#"{"tasks":{"env":{"run":"test -z \"$PIT_TEST_SECRET\" && test \"$PIT\" = 1","cache":false}}}"#,
+    );
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run(&pit, repo.path()).await;
+    assert_eq!(view.status, Status::Passed, "task saw PIT_TEST_SECRET");
+}

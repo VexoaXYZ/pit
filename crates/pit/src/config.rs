@@ -28,6 +28,18 @@ import(pathToFileURL(process.argv[process.argv.length - 1]).href).then(
 );
 "#;
 
+/// The only variables a config evaluation sees.
+const EVAL_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
+
 fn cache() -> &'static Mutex<HashMap<String, PitConfig>> {
     static CACHE: OnceLock<Mutex<HashMap<String, PitConfig>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
@@ -53,10 +65,8 @@ pub async fn parse(name: &str, source: &[u8], scratch: &Path) -> Result<PitConfi
 async fn eval_ts(source: &[u8], scratch: &Path) -> Result<PitConfig> {
     std::fs::create_dir_all(scratch)?;
     // `.mts` makes both Node and Bun treat the file as an ES module.
-    let file = scratch.join(format!(
-        "pit-config-{}.mts",
-        &crate::cas::digest(source)[..16]
-    ));
+    // Unique per evaluation: two plans of the same commit may run at once.
+    let file = scratch.join(format!("{}.mts", crate::model::new_id("pit-config")));
     std::fs::write(&file, source)?;
     let file_arg = file.to_string_lossy().to_string();
 
@@ -65,6 +75,13 @@ async fn eval_ts(source: &[u8], scratch: &Path) -> Result<PitConfig> {
         let mut cmd = tokio::process::Command::new(&bin);
         cmd.args(&args).arg(EVAL_SCRIPT).arg(&file_arg);
         cmd.stdin(Stdio::null()).kill_on_drop(true);
+        // The config is repository code. It gets none of Pit's secrets.
+        cmd.env_clear();
+        for key in EVAL_ENV {
+            if let Some(v) = std::env::var_os(key) {
+                cmd.env(key, v);
+            }
+        }
         let out = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await
         {
             Ok(Ok(out)) => out,

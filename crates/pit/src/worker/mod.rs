@@ -177,11 +177,18 @@ impl Worker {
                 s.path.clone()
             }
             None => {
+                let index = (0..)
+                    .find(|i: &usize| {
+                        !slots
+                            .iter()
+                            .any(|s| s.path.file_name() == Some(i.to_string().as_ref()))
+                    })
+                    .unwrap_or_default();
                 let path = self
                     .data_dir
                     .join("workspaces")
                     .join(safe_name(repo))
-                    .join(slots.len().to_string());
+                    .join(index.to_string());
                 slots.push(WorkspaceSlot {
                     path: path.clone(),
                     busy: true,
@@ -346,7 +353,7 @@ impl Worker {
         ws: &Path,
         files: Arc<Vec<(String, String)>>,
     ) -> Status {
-        let warm_path = ws.join(".git").join("pit-warm.json");
+        let warm_path = warm_file(ws);
         let warm: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(
             std::fs::read(&warm_path)
                 .ok()
@@ -426,9 +433,7 @@ impl Worker {
                 None => break,
             }
         }
-        if let Ok(bytes) = serde_json::to_vec(&*warm.lock()) {
-            let _ = std::fs::write(&warm_path, bytes);
-        }
+        save_warm(ws, &warm.lock());
         let failed = state
             .values()
             .any(|(s, _)| matches!(s, Status::Failed | Status::Error));
@@ -527,6 +532,14 @@ impl Worker {
             }
         }
 
+        // About to change the workspace: forget the warm result until this
+        // run succeeds, so a failed or partial run is never treated as warm.
+        if def.cache == CacheMode::Workspace && warm.lock().remove(&task.name).is_some() {
+            save_warm(ws, &warm.lock());
+        }
+        // Outputs left by an older run must not be stored under this key.
+        files::clear_outputs(ws, &def.outputs)?;
+
         let backend = def.backend.unwrap_or_default();
         let mut env: Vec<(String, String)> = vec![
             ("CI".into(), "true".into()),
@@ -609,6 +622,17 @@ impl Worker {
             .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
             .await?;
         Ok((status, Some(key)))
+    }
+}
+
+fn warm_file(ws: &Path) -> PathBuf {
+    ws.join(".git").join("pit-warm.json")
+}
+
+/// Which workspace-cached tasks this workspace has run, by action key.
+fn save_warm(ws: &Path, warm: &HashMap<String, String>) {
+    if let Ok(bytes) = serde_json::to_vec(warm) {
+        let _ = std::fs::write(warm_file(ws), bytes);
     }
 }
 

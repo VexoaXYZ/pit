@@ -260,7 +260,7 @@ impl GitHub {
             Auth::Token(_) => {
                 let state = match status {
                     Status::Queued | Status::Running => "pending",
-                    s if s.is_ok() || s == Status::Skipped => "success",
+                    s if s.is_ok() => "success",
                     Status::Error => "error",
                     _ => "failure",
                 };
@@ -294,7 +294,7 @@ impl GitHub {
                         body["status"] = "completed".into();
                         body["conclusion"] = match s {
                             Status::Passed | Status::Cached => "success",
-                            Status::Skipped => "skipped",
+                            Status::Skipped => "cancelled",
                             _ => "failure",
                         }
                         .into();
@@ -458,6 +458,12 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
             let r = repo_payload()?;
             let pr = &payload["pull_request"];
             let number = pr["number"].as_u64().context("pull_request.number")?;
+            // A fork's code (including its pit.config.ts) is untrusted: Pit
+            // does not run it automatically.
+            let head_repo = pr["head"]["repo"]["full_name"].as_str();
+            if head_repo.is_some_and(|h| h != r.full_name) {
+                return Ok(serde_json::json!({ "ignored": "pull request from a fork" }));
+            }
             let sha = pr["head"]["sha"]
                 .as_str()
                 .context("pull_request.head.sha")?

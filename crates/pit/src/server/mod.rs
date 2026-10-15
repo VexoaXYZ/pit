@@ -244,17 +244,22 @@ impl App {
 
     /// Called whenever a group finishes; closes the run when all are done.
     pub async fn group_finished(self: &Arc<Self>, run_id: &str) -> Result<()> {
+        if self.db.run(run_id)?.status.is_done() {
+            return Ok(());
+        }
         let groups = self.db.groups_for_run(run_id)?;
         if groups.iter().all(|g| g.status.is_done()) {
-            let failed = groups
-                .iter()
-                .any(|g| !g.status.is_ok() && g.status != Status::Skipped);
+            // Workers never report a skipped group; only a cancel does, and a
+            // cancelled run must never count as green.
+            let cancelled = groups.iter().any(|g| g.status == Status::Skipped);
+            let failed = groups.iter().any(|g| !g.status.is_ok());
             let status = if failed {
                 Status::Failed
             } else {
                 Status::Passed
             };
-            self.db.set_run_status(run_id, status, None)?;
+            self.db
+                .set_run_status(run_id, status, cancelled.then_some("cancelled"))?;
             self.run_finished(run_id).await;
         } else if let Some(gh) = &self.github {
             gh.report_run(self, run_id).await;

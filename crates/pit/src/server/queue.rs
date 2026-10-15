@@ -156,6 +156,8 @@ struct Queue<'a> {
     target: &'a str,
     tip: String,
     entries: Vec<QueueRow>,
+    /// Runs cancelled this tick, closed once the tick is done.
+    cancelled: Vec<String>,
 }
 
 async fn tick_target(
@@ -179,11 +181,18 @@ async fn tick_target(
         target,
         tip,
         entries,
+        cancelled: vec![],
     };
-    q.collect_results().await?;
-    q.land().await?;
-    q.start_candidates().await?;
-    Ok(())
+    let result = async {
+        q.collect_results().await?;
+        q.land().await?;
+        q.start_candidates().await
+    }
+    .await;
+    for run in std::mem::take(&mut q.cancelled) {
+        app.group_finished(&run).await?;
+    }
+    result
 }
 
 impl Queue<'_> {
@@ -204,6 +213,7 @@ impl Queue<'_> {
         let e = &mut self.entries[idx];
         if let Some(run) = e.run_id.take() {
             let _ = self.app.db.cancel_run(&run);
+            self.cancelled.push(run);
         }
         e.status = "queued".into();
         e.lane = None;
@@ -273,6 +283,16 @@ impl Queue<'_> {
                 let e = self.entries[i].clone();
                 self.save(&e)?;
             } else {
+                // A candidate contains every earlier change in its lane. Until
+                // those have passed, the failure may not be this change's fault.
+                let (lane, pos) = (self.entries[i].lane.clone(), self.entries[i].position);
+                let earlier_untested = self
+                    .entries
+                    .iter()
+                    .any(|o| o.lane == lane && o.position < pos && o.status == "testing");
+                if earlier_untested {
+                    continue;
+                }
                 let e = &mut self.entries[i];
                 e.status = "failed".into();
                 e.reason = Some(format!("tests failed in run {run_id}"));

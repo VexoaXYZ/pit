@@ -145,17 +145,29 @@ pub async fn local(client: &Client, dir: &Path) -> Result<Snapshot> {
     })
 }
 
-/// The newest commit in HEAD's history that the remote already has.
+/// The newest commit in HEAD's history that `origin` already has. Other
+/// remotes do not count: the server fetches from origin.
 async fn pushed_base(root: &Path, head: &str, branch: Option<&str>) -> Result<Option<String>> {
-    let contains = git::git(root, &["branch", "-r", "--contains", head])
-        .await
-        .unwrap_or_default();
+    let contains = git::git(
+        root,
+        &["branch", "-r", "--contains", head, "--list", "origin/*"],
+    )
+    .await
+    .unwrap_or_default();
     if !contains.trim().is_empty() {
         return Ok(Some(head.to_string()));
     }
     let mut candidates = Vec::new();
     if let Some(b) = branch {
-        candidates.push(format!("{b}@{{upstream}}"));
+        let upstream = git::git(
+            root,
+            &["rev-parse", "--abbrev-ref", &format!("{b}@{{upstream}}")],
+        )
+        .await
+        .unwrap_or_default();
+        if upstream.trim().starts_with("origin/") {
+            candidates.push(upstream.trim().to_string());
+        }
     }
     candidates.extend([
         "origin/HEAD".to_string(),

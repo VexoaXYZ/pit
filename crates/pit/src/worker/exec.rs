@@ -68,14 +68,21 @@ fn shell(script: &str) -> (String, Vec<String>) {
     }
 }
 
+/// A task's process, plus the container to remove if it has to be killed.
+pub struct TaskCommand {
+    pub cmd: Command,
+    pub container: Option<String>,
+}
+
 /// Builds the command for a task on the chosen backend.
 pub fn command(
     task: &TaskDef,
     backend: Backend,
     workdir: &Path,
     env: &[(String, String)],
-) -> Command {
+) -> TaskCommand {
     let network = task.network.unwrap_or(true);
+    let mut container = None;
     let (program, args): (String, Vec<String>) = match backend {
         Backend::Host => shell(&task.run),
         Backend::Sandbox => {
@@ -98,10 +105,13 @@ pub fn command(
             ("unshare".into(), a)
         }
         Backend::Docker => {
+            let name = crate::model::new_id("pit");
             let mut a = vec![
                 "run".to_string(),
                 "--rm".into(),
                 "--init".into(),
+                "--name".into(),
+                name.clone(),
                 "-v".into(),
                 format!("{}:/workspace", workdir.display()),
                 "-w".into(),
@@ -110,6 +120,14 @@ pub fn command(
             if !network {
                 a.extend(["--network".into(), "none".into()]);
             }
+            // Files written to the warm workspace must stay owned by the worker,
+            // or the next checkout in it fails.
+            #[cfg(unix)]
+            if let Ok(meta) = std::fs::metadata(workdir) {
+                use std::os::unix::fs::MetadataExt;
+                a.extend(["--user".into(), format!("{}:{}", meta.uid(), meta.gid())]);
+            }
+            container = Some(name);
             for (k, v) in env {
                 a.extend(["-e".into(), format!("{k}={v}")]);
             }
@@ -119,18 +137,26 @@ pub fn command(
         }
     };
     let mut cmd = Command::new(program);
+    // Pit's own settings (server URL, API token, GitHub credentials) are not
+    // the task's business: a task holding PIT_TOKEN could write to the cache.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("PIT_") {
+            cmd.env_remove(key);
+        }
+    }
     cmd.args(args)
         .current_dir(workdir)
         .envs(env.iter().cloned());
-    cmd
+    TaskCommand { cmd, container }
 }
 
 /// Runs a command, sending log text to `live` as it arrives.
 pub async fn run(
-    mut cmd: Command,
+    task: TaskCommand,
     timeout: Option<Duration>,
     live: mpsc::UnboundedSender<String>,
 ) -> Result<Outcome> {
+    let TaskCommand { mut cmd, container } = task;
     let started = Instant::now();
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -177,14 +203,29 @@ pub async fn run(
             Err(_) => {
                 kill_tree(pid);
                 let _ = child.kill().await;
+                // Killing the docker client leaves the container running.
+                if let Some(name) = &container {
+                    let _ = Command::new("docker")
+                        .args(["rm", "-f", name])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .await;
+                }
                 (None, true)
             }
         },
         None => (Some(wait.await?), false),
     };
     // A backgrounded grandchild can hold the pipes open; do not wait forever.
-    for h in [out, err].into_iter().flatten() {
-        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+    for mut h in [out, err].into_iter().flatten() {
+        if tokio::time::timeout(Duration::from_secs(2), &mut h)
+            .await
+            .is_err()
+        {
+            h.abort();
+        }
     }
     kill_tree(pid);
     let mut log = collector.await.unwrap_or_default();
