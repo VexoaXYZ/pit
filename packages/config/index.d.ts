@@ -23,6 +23,11 @@ export interface TaskDef {
   inputs?: string[];
   /** Globs of files the task produces. Restored from the cache on a hit. */
   outputs?: string[];
+  /**
+   * Commands whose output is part of the cache key, e.g. `["node --version"]`,
+   * so a toolchain upgrade on a worker never reuses results built with the old one.
+   */
+  runtime?: string[];
   /** Environment variables to pass through. Their values are part of the cache key. */
   env?: string[];
   /**

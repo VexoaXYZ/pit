@@ -314,6 +314,10 @@ pub struct KeyInputs {
     pub deps: Vec<String>,
     /// Matching input files as (path, git blob id or overlay digest), sorted.
     pub files: Vec<(String, String)>,
+    /// Output of the task's `runtime` commands on the worker that ran it.
+    /// Left out when empty, so keys of tasks without `runtime` do not change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime: Vec<(String, String)>,
 }
 
 impl KeyInputs {
@@ -321,6 +325,31 @@ impl KeyInputs {
     pub fn key(&self) -> String {
         crate::cas::digest(&serde_json::to_vec(self).unwrap_or_default())
     }
+}
+
+/// Like `key_inputs`, with the outputs of the task's `runtime` commands.
+pub fn key_inputs_with_runtime(
+    task: &TaskDef,
+    os: &str,
+    files: &[(String, String)],
+    dep_keys: &[String],
+    runtime: &std::collections::HashMap<String, String>,
+) -> Result<KeyInputs> {
+    let mut inputs = key_inputs(task, os, files, dep_keys)?;
+    inputs.runtime = task
+        .runtime
+        .iter()
+        .map(|cmd| {
+            (
+                cmd.clone(),
+                runtime
+                    .get(cmd)
+                    .cloned()
+                    .unwrap_or_else(|| "<not measured>".into()),
+            )
+        })
+        .collect();
+    Ok(inputs)
 }
 
 pub fn key_inputs(
@@ -364,6 +393,7 @@ pub fn key_inputs(
         config: crate::cas::digest(&serde_json::to_vec(&config)?),
         deps,
         files: matched,
+        runtime: vec![],
     })
 }
 
@@ -381,6 +411,18 @@ pub fn action_key(
 /// `"src/a.ts changed; build changed"`. `deps` names the current dep keys.
 pub fn explain_miss(prev: &KeyInputs, cur: &KeyInputs, deps: &[(String, String)]) -> String {
     let mut reasons = Vec::new();
+    let before_rt: BTreeMap<&str, &str> = prev
+        .runtime
+        .iter()
+        .map(|(c, o)| (c.as_str(), o.as_str()))
+        .collect();
+    for (cmd, out) in &cur.runtime {
+        match before_rt.get(cmd.as_str()) {
+            Some(old) if old != out => reasons.push(format!("`{cmd}` changed ({old} → {out})")),
+            Some(_) => {}
+            None => reasons.push(format!("`{cmd}` is now part of the key ({out})")),
+        }
+    }
     if prev.config != cur.config {
         reasons.push("task definition or environment changed".to_string());
     }
@@ -609,6 +651,30 @@ mod tests {
             .deps
             .push("test".into());
         assert!(validate(&bad).unwrap_err().to_string().contains("sharded"));
+    }
+
+    #[test]
+    fn runtime_outputs_are_part_of_the_key() {
+        let mut t = task("build", &[], Some(&["src/**"]));
+        t.runtime = vec!["node --version".into()];
+        let rt = |v: &str| {
+            std::collections::HashMap::from([("node --version".to_string(), v.to_string())])
+        };
+        let a = key_inputs_with_runtime(&t, "linux", &[], &[], &rt("v22.11.0")).unwrap();
+        let b = key_inputs_with_runtime(&t, "linux", &[], &[], &rt("v24.3.0")).unwrap();
+        assert_ne!(a.key(), b.key());
+        assert_eq!(
+            explain_miss(&a, &b, &[]),
+            "`node --version` changed (v22.11.0 → v24.3.0)"
+        );
+        // Tasks without `runtime` keep their keys.
+        let plain = task("build", &[], Some(&["src/**"]));
+        assert_eq!(
+            key_inputs_with_runtime(&plain, "linux", &[], &[], &rt("x"))
+                .unwrap()
+                .key(),
+            action_key(&plain, "linux", &[], &[]).unwrap()
+        );
     }
 
     #[test]

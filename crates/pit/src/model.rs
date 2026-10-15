@@ -53,6 +53,11 @@ pub struct TaskDef {
     /// Environment variable names that are passed through and hashed.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Commands whose output is part of the cache key, e.g. `node --version`,
+    /// so a toolchain upgrade on a worker never reuses results built with the
+    /// old one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime: Vec<String>,
     /// Environment variable names passed through as secrets: masked in logs
     /// (including base64-encoded forms) and left out of the cache key, so
     /// rotating one does not invalidate cached results.

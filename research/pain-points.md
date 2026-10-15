@@ -822,3 +822,56 @@ About 6× fewer tokens, and both errors present. Covered by the unit tests
 **Verdict: SOLVED** for logs whose errors say "error" or "fail". It is keyword matching: a
 failure that prints none of those words falls back to the tail, and a log that prints "error"
 on every line uses the 40-line budget on the first ones.
+
+## P17. A toolchain upgrade reuses results built with the old toolchain
+
+**Pain.** Caches keyed on lockfiles and sources but not on the toolchain restore artifacts built by
+a different Node: native addons fail with "The module was compiled against a different Node.js
+version" or crash V8. Ghost's CI shared caches across Node versions and got flaky native crashes
+until it added the Node version to every cache key ([Ghost#23277](https://github.com/TryGhost/Ghost/pull/23277));
+the same error is a staple of native-module issue trackers
+([better-sqlite3#919](https://github.com/WiseLibs/better-sqlite3/issues/919),
+[better-sqlite3#211](https://github.com/JoshuaWise/better-sqlite3/issues/211),
+[node-canvas#1942](https://github.com/Automattic/node-canvas/issues/1942),
+[electron/fiddle#1636](https://github.com/electron/fiddle/issues/1636),
+[Azure OSS](https://azureossd.github.io/2023/05/31/Troubleshooting-a-Module-was-compiled-against-a-different-Node.js-version-errors/),
+[SAP](https://userapps.support.sap.com/sap/support/knowledge/en/2956493),
+[Edge Impulse](https://forum.edgeimpulse.com/t/error-the-module-was-compiled-against-a-different-nodejs-version/4766)),
+and `setup-node` versions like `lts/*` move over time
+([setup-node](https://github.com/marketplace/actions/setup-node-js-environment?version=v4.0.1)).
+
+**Reproduction** (`/tmp/painhunt/p17`): a stand-in `toolver` command prints the toolchain version.
+`build` writes "built with <version>" into `dist/` (cached output); `test` checks that the built
+addon matches the current toolchain. Run, then "upgrade" the toolchain on the worker and run again.
+
+**Before** (research/pain-hunt at P16): action keys cover the OS, arch, command, input files and
+declared env values, not tool versions, so the upgrade reused the old build.
+
+```
+== toolchain upgraded to v24 on the worker, no code change
+    ◆ build                    cached
+    ✗ test                     21ms exit 1
+    │ addon was compiled against a different toolchain:
+    │ built with v22.11.0
+    │ v24.3.0
+```
+
+A wrong cache hit, the worst kind of cache bug.
+
+**Fix** (research/pain-hunt): `runtime: ["node --version"]` on a task (Nx calls these runtime
+inputs). The worker runs each command once per job, in the workspace, and its output is part of
+the action key; tasks without `runtime` keep their keys. Misses name the change. The server never
+answers a task with `runtime` from cache (P12) because only the worker knows its toolchain.
+
+```
+== toolchain v22   ✓ build 82ms   ✓ test
+== no change       ◆ build cached ✓ test
+== upgraded to v24 ✓ build 14ms  ran because `/tmp/painhunt/p17/bin/toolver` changed (v22.11.0 → v24.3.0)
+                   ✓ test
+```
+
+Covered by the unit test `runtime_outputs_are_part_of_the_key`.
+
+**Verdict: SOLVED** when the task declares its toolchain. Pit does not guess: without `runtime`
+(or the version in an `env` variable or a pinned version file listed in `inputs`), a toolchain
+upgrade is still invisible to the key. `pit init` does not add `runtime` yet.

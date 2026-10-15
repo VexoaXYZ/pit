@@ -86,6 +86,7 @@ export default {
 | `inputs` | Globs of tracked files the task reads (`!` excludes). Default: everything. Tighter inputs mean more cache hits and smaller merge queue lanes. |
 | `outputs` | Files the task produces. Uploaded on success and restored on a cache hit. |
 | `env` | Variables passed through and hashed into the cache key. |
+| `runtime` | Commands whose output is part of the cache key (`["node --version"]`), so a toolchain upgrade never reuses old results. |
 | `secrets` | Variables passed through as secrets: masked in logs (plain, base64, double base64), not in the cache key. |
 | `cache` | `"remote"` (default, shared by all workers), `"workspace"` (per warm workspace, for installs), or `false`. |
 | `backend` | `"host"` (default), `"sandbox"` (Linux PID, IPC, UTS and optional network namespaces), `"docker"`. |

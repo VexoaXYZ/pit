@@ -43,6 +43,8 @@ pub struct Worker {
     parallelism: usize,
     mirror_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     workspaces: Mutex<HashMap<String, Vec<WorkspaceSlot>>>,
+    /// `runtime` command outputs, per job (`group id \0 command`).
+    runtime_memo: Mutex<HashMap<String, String>>,
 }
 
 /// A persistent workspace. Jobs get the warmest free one for their repo.
@@ -147,6 +149,7 @@ impl Worker {
             parallelism: parallelism.max(1),
             mirror_locks: Default::default(),
             workspaces: Default::default(),
+            runtime_memo: Default::default(),
         })
     }
 
@@ -286,6 +289,10 @@ impl Worker {
         };
         hb.abort();
         drop(lease);
+        let prefix = format!("{}\0", job.group_id);
+        self.runtime_memo
+            .lock()
+            .retain(|k, _| !k.starts_with(&prefix));
         let status = result.status;
         client
             .post_empty(&format!("/api/groups/{}/finish", job.group_id), &result)
@@ -491,7 +498,9 @@ impl Worker {
         // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
         let client = self.client.with_lease(&job.lease);
         let def = &task.def;
-        let inputs = crate::graph::key_inputs(def, &job.os, files, dep_keys)?;
+        let runtime = self.measure_runtime(job, ws, def).await;
+        let inputs =
+            crate::graph::key_inputs_with_runtime(def, &job.os, files, dep_keys, &runtime)?;
         let key = inputs.key();
         // Identifies "this task" across runs, to find its last cached result.
         let scope = crate::cas::digest(
@@ -780,6 +789,48 @@ fn save_warm(ws: &Path, warm: &HashMap<String, String>) {
 }
 
 impl Worker {
+    /// Output of each of the task's `runtime` commands, run once per job.
+    async fn measure_runtime(
+        &self,
+        job: &Job,
+        ws: &Path,
+        def: &TaskDef,
+    ) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for cmd in &def.runtime {
+            let memo_key = format!("{}\0{cmd}", job.group_id);
+            if let Some(v) = self.runtime_memo.lock().get(&memo_key).cloned() {
+                out.insert(cmd.clone(), v);
+                continue;
+            }
+            let (shell, flag) = if cfg!(windows) {
+                ("cmd", "/C")
+            } else {
+                ("sh", "-c")
+            };
+            let run = tokio::process::Command::new(shell)
+                .args([flag, cmd])
+                .current_dir(ws)
+                .stdin(std::process::Stdio::null())
+                .output();
+            let value = match tokio::time::timeout(Duration::from_secs(15), run).await {
+                Ok(Ok(o)) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                }
+                Ok(Ok(o)) => format!(
+                    "exit {}: {}",
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Ok(Err(e)) => format!("error: {e}"),
+                Err(_) => "timed out".to_string(),
+            };
+            self.runtime_memo.lock().insert(memo_key, value.clone());
+            out.insert(cmd.clone(), value);
+        }
+        out
+    }
+
     async fn restore_outputs(&self, ws: &Path, def: &TaskDef, entry: &CacheEntry) -> Result<()> {
         // Fetch everything first so a missing blob leaves the workspace untouched.
         let mut blobs = Vec::with_capacity(entry.outputs.len());

@@ -71,6 +71,10 @@ pub fn resolve(
             .filter_map(|d| keys.get(d.as_str()).cloned())
             .collect();
         let key = key_inputs(def, &os, files, &dep_keys)?.key();
+        // Only the worker knows its toolchain; let it decide.
+        if !def.runtime.is_empty() {
+            return Ok(None);
+        }
         let result = match def.cache {
             CacheMode::Off => return Ok(None),
             CacheMode::Remote => match app.db.cache_peek(&key)? {
