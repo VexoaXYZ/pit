@@ -1212,10 +1212,13 @@ async fn sharded_tasks_run_each_shard_once() {
 async fn untrusted_runs_cannot_poison_trusted_ones() {
     let pit = start().await;
     let tmp = tempfile::tempdir().unwrap();
-    let origin = tmp.path().join("origin.git");
-    let work = tmp.path().join("work");
+    // Canonical, so the local run and the queue see one repo URL (macOS
+    // temp dirs sit behind the /var -> /private/var symlink).
+    let root = tmp.path().canonicalize().unwrap();
+    let origin = root.join("origin.git");
+    let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
-    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    sh(&root, "git init -q --bare -b main origin.git");
     // The build script is not an input, so a branch that edits it gets the
     // key main will compute.
     let config = serde_json::json!({ "tasks": {
