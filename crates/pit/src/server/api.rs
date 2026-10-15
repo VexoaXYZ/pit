@@ -279,19 +279,18 @@ fn read_task_log(app: &App, task_id: &str) -> anyhow::Result<String> {
     app.db.live_log(task_id)
 }
 
-/// Job updates must come from the group's current claim.
-fn check_lease(app: &App, group_id: &str, headers: &HeaderMap) -> ApiResult<()> {
-    let lease = headers
+fn lease(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(crate::client::LEASE_HEADER)
-        .and_then(|v| v.to_str().ok());
-    if app.db.lease_ok(group_id, lease)? {
-        Ok(())
-    } else {
-        Err(ApiError(
-            StatusCode::CONFLICT,
-            anyhow::anyhow!("group {group_id} is no longer claimed by this worker"),
-        ))
-    }
+        .and_then(|v| v.to_str().ok())
+}
+
+/// Job updates must come from the group's current claim.
+fn stale(group_id: &str) -> ApiError {
+    ApiError(
+        StatusCode::CONFLICT,
+        anyhow::anyhow!("group {group_id} is no longer claimed by this worker"),
+    )
 }
 
 async fn append_log(
@@ -301,8 +300,9 @@ async fn append_log(
     Json(chunk): Json<LogChunk>,
 ) -> ApiResult<StatusCode> {
     let (group_id, run_id, _) = app.db.task_group(&id)?;
-    check_lease(&app, &group_id, &headers)?;
-    app.db.append_log(&id, &chunk.text)?;
+    if !app.db.append_log(&id, lease(&headers), &chunk.text)? {
+        return Err(stale(&group_id));
+    }
     app.emit(
         "task.log",
         Some(&run_id),
@@ -320,8 +320,12 @@ async fn start_task(
     Json(req): Json<TaskStart>,
 ) -> ApiResult<StatusCode> {
     let (group_id, run_id, name) = app.db.task_group(&id)?;
-    check_lease(&app, &group_id, &headers)?;
-    app.db.start_task(&id, req.action_key.as_deref())?;
+    if !app
+        .db
+        .start_task(&id, lease(&headers), req.action_key.as_deref())?
+    {
+        return Err(stale(&group_id));
+    }
     app.emit(
         "task.started",
         Some(&run_id),
@@ -339,8 +343,9 @@ async fn finish_task(
     Json(r): Json<TaskResult>,
 ) -> ApiResult<StatusCode> {
     let (group_id, run_id, name) = app.db.task_group(&id)?;
-    check_lease(&app, &group_id, &headers)?;
-    app.db.finish_task(&id, &r)?;
+    if !app.db.finish_task(&id, lease(&headers), &r)? {
+        return Err(stale(&group_id));
+    }
     if r.log_digest.is_some() {
         app.db.drop_live_log(&id)?;
     }
@@ -359,7 +364,9 @@ async fn heartbeat(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<StatusCode> {
-    check_lease(&app, &id, &headers)?;
+    if !app.db.lease_ok(&id, lease(&headers))? {
+        return Err(stale(&id));
+    }
     app.db.heartbeat_group(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }

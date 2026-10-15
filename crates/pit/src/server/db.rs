@@ -200,6 +200,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// SQL condition: the task's group is running under the lease in `?4`.
+const LEASED: &str =
+    "EXISTS (SELECT 1 FROM groups_ WHERE groups_.id = tasks.group_id AND groups_.status = 'running' AND groups_.lease = ?4)";
+/// The same, with the lease in `?9`.
+const LEASED_9: &str =
+    "EXISTS (SELECT 1 FROM groups_ WHERE groups_.id = tasks.group_id AND groups_.status = 'running' AND groups_.lease = ?9)";
+
 fn queue_row(r: &Row) -> rusqlite::Result<QueueRow> {
     let affected: String = r.get("affected")?;
     Ok(QueueRow {
@@ -737,32 +744,42 @@ impl Db {
         .with_context(|| format!("unknown task {task_id}"))
     }
 
-    pub fn start_task(&self, id: &str, action_key: Option<&str>) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE tasks SET status = 'running', action_key = ?1, started_at = ?2 WHERE id = ?3",
-            params![action_key, now_ms(), id],
-        )?;
-        Ok(())
+    // Task writes are fenced by the group's lease in the same statement, so a
+    // worker that lost its claim cannot write between a check and the write.
+    // Each returns whether the write happened.
+
+    pub fn start_task(
+        &self,
+        id: &str,
+        lease: Option<&str>,
+        action_key: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            &format!("UPDATE tasks SET status = 'running', action_key = ?1, started_at = ?2 WHERE id = ?3 AND {LEASED}"),
+            params![action_key, now_ms(), id, lease],
+        )? > 0)
     }
 
-    pub fn finish_task(&self, id: &str, r: &TaskResult) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE tasks SET status = ?1, exit_code = ?2, action_key = COALESCE(?3, action_key), duration_ms = ?4,
-               log_digest = ?5, message = ?6, finished_at = ?7,
-               started_at = COALESCE(started_at, ?7 - ?4)
-             WHERE id = ?8",
-            params![r.status.as_str(), r.exit_code, r.action_key, r.duration_ms as i64, r.log_digest, r.message, now_ms(), id],
-        )?;
-        Ok(())
+    pub fn finish_task(&self, id: &str, lease: Option<&str>, r: &TaskResult) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            &format!(
+                "UPDATE tasks SET status = ?1, exit_code = ?2, action_key = COALESCE(?3, action_key), duration_ms = ?4,
+                   log_digest = ?5, message = ?6, finished_at = ?7,
+                   started_at = COALESCE(started_at, ?7 - ?4)
+                 WHERE id = ?8 AND {LEASED_9}"
+            ),
+            params![r.status.as_str(), r.exit_code, r.action_key, r.duration_ms as i64, r.log_digest, r.message, now_ms(), id, lease],
+        )? > 0)
     }
 
-    pub fn append_log(&self, task_id: &str, text: &str) -> Result<()> {
-        self.conn.lock().execute(
+    pub fn append_log(&self, task_id: &str, lease: Option<&str>, text: &str) -> Result<bool> {
+        Ok(self.conn.lock().execute(
             "INSERT INTO task_logs (task_id, seq, text)
-             VALUES (?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM task_logs WHERE task_id = ?1), ?2)",
-            params![task_id, text],
-        )?;
-        Ok(())
+             SELECT ?1, (SELECT COALESCE(MAX(seq), 0) + 1 FROM task_logs WHERE task_id = ?1), ?2
+             WHERE EXISTS (SELECT 1 FROM tasks JOIN groups_ ON groups_.id = tasks.group_id
+                           WHERE tasks.id = ?1 AND groups_.status = 'running' AND groups_.lease = ?3)",
+            params![task_id, text, lease],
+        )? > 0)
     }
 
     pub fn live_log(&self, task_id: &str) -> Result<String> {
