@@ -210,6 +210,9 @@ impl App {
             .load_config(&mirror, &req.sha, overlay.as_ref())
             .await?;
         let groups = crate::graph::plan(&config, &req.tasks)?;
+        if self.db.run(run_id)?.status.is_done() {
+            return Ok(()); // Cancelled while planning.
+        }
         if groups.is_empty() {
             self.db
                 .set_run_status(run_id, Status::Passed, Some("no tasks to run"))?;
@@ -248,6 +251,9 @@ impl App {
             return Ok(());
         }
         let groups = self.db.groups_for_run(run_id)?;
+        if groups.is_empty() {
+            return Ok(()); // Still planning.
+        }
         if groups.iter().all(|g| g.status.is_done()) {
             // Workers never report a skipped group; only a cancel does, and a
             // cancelled run must never count as green.

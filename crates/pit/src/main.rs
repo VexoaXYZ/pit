@@ -152,6 +152,14 @@ enum QueueCmd {
         #[arg(short = 'C', long, default_value = ".")]
         dir: PathBuf,
     },
+    /// Take a change out of the queue (by entry id or branch).
+    Remove {
+        entry: String,
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(short = 'C', long, default_value = ".")]
+        dir: PathBuf,
+    },
     /// Show the queue.
     List {
         #[command(flatten)]
@@ -295,6 +303,9 @@ async fn run(cli: Cli) -> Result<i32> {
                     target,
                 )
                 .await
+            }
+            QueueCmd::Remove { entry, conn, dir } => {
+                cli::queue_remove(&cli::client(&conn.server, conn.token)?, &dir, &entry).await
             }
             QueueCmd::List { conn } => {
                 cli::queue_list(&cli::client(&conn.server, conn.token)?).await

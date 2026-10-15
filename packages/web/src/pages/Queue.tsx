@@ -7,7 +7,11 @@ const QUEUE_ICON: Record<string, string> = {
   passed: "passed",
   landed: "passed",
   failed: "failed",
+  removing: "skipped",
+  removed: "skipped",
 };
+
+const FINISHED = ["landed", "failed", "removed"];
 
 function Entry({ e, now }: { e: QueueEntry; now: number }) {
   return (
@@ -63,8 +67,8 @@ export function QueuePage() {
   const q = useLive<QueueEntry[]>(api.queue);
   const now = useNow(15000);
   const entries = q.data ?? [];
-  const active = entries.filter((e) => e.status !== "landed" && e.status !== "failed");
-  const finished = entries.filter((e) => e.status === "landed" || e.status === "failed").sort((a, b) => b.updatedAt - a.updatedAt);
+  const active = entries.filter((e) => !FINISHED.includes(e.status));
+  const finished = entries.filter((e) => FINISHED.includes(e.status)).sort((a, b) => b.updatedAt - a.updatedAt);
   const lanes = new Map<string, QueueEntry[]>();
   for (const e of active) {
     const key = e.lane ?? "";

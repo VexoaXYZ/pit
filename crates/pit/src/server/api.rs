@@ -66,6 +66,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
         .route("/api/queue", get(queue_list).post(queue_add))
+        .route("/api/queue/{key}", axum::routing::delete(queue_remove))
         .merge(super::remote_cache::routes())
         .layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
@@ -176,15 +177,9 @@ async fn cancel_run(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    app.db.cancel_run(&id)?;
-    app.emit(
-        "run.updated",
-        Some(&id),
-        None,
-        None,
-        serde_json::Value::Null,
-    );
-    app.group_finished(&id).await?;
+    if app.db.cancel_run(&id)? {
+        app.run_finished(&id).await;
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -483,4 +478,22 @@ async fn queue_add(
     Json(req): Json<QueueAdd>,
 ) -> ApiResult<Json<QueueEntryView>> {
     Ok(Json(super::queue::add(&app, req).await?))
+}
+
+#[derive(Deserialize)]
+struct RepoQuery {
+    repo: Option<String>,
+}
+
+/// `DELETE /api/queue/{id or branch}?repo=<name>`
+async fn queue_remove(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    Query(q): Query<RepoQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let n = super::queue::remove(&app, &key, q.repo.as_deref(), "removed by request")?;
+    if n == 0 {
+        return Err(not_found(format!("active queue entry {key}")));
+    }
+    Ok(Json(serde_json::json!({ "removed": n })))
 }

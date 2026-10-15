@@ -89,7 +89,10 @@ async fn eval_ts(source: &[u8], scratch: &Path) -> Result<PitConfig> {
                 last_err = format!("{bin}: {e}");
                 continue;
             }
-            Err(_) => bail!("evaluating {CONFIG_TS} with {bin} timed out"),
+            Err(_) => {
+                let _ = std::fs::remove_file(&file);
+                bail!("evaluating {CONFIG_TS} with {bin} timed out")
+            }
         };
         let _ = std::fs::remove_file(&file);
         if !out.status.success() {

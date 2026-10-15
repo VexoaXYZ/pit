@@ -16,6 +16,22 @@ pub struct Client {
     http: reqwest::Client,
 }
 
+/// Percent-encodes one URL path segment, so caller-supplied ids cannot
+/// change which endpoint is called.
+pub fn seg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'~') && s != "." && s != ".."
+        {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 impl Client {
     pub fn new(base: &str, token: Option<String>) -> Result<Client> {
         Ok(Client {
@@ -98,6 +114,15 @@ impl Client {
             .with_context(|| self.unreachable())?;
         Self::check(resp).await?;
         Ok(())
+    }
+
+    pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let resp = self
+            .req(reqwest::Method::DELETE, path)
+            .send()
+            .await
+            .with_context(|| self.unreachable())?;
+        Ok(Self::check(resp).await?.json().await?)
     }
 
     pub async fn put_json<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
@@ -190,11 +215,13 @@ impl Client {
             .await
             .with_context(|| self.unreachable())?;
         let mut stream = Self::check(resp).await?.bytes_stream();
-        let mut buf = String::new();
+        // Bytes, not text: a multi-byte character can straddle two chunks.
+        let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk?));
-            while let Some(end) = buf.find("\n\n") {
-                let frame: String = buf.drain(..end + 2).collect();
+            buf.extend_from_slice(&chunk?);
+            while let Some(end) = buf.windows(2).position(|w| w == b"\n\n") {
+                let frame_bytes: Vec<u8> = buf.drain(..end + 2).collect();
+                let frame = String::from_utf8_lossy(&frame_bytes);
                 let data: String = frame
                     .lines()
                     .filter_map(|l| l.strip_prefix("data:"))
@@ -212,5 +239,16 @@ impl Client {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn path_segments_cannot_escape() {
+        assert_eq!(super::seg("ci.test"), "ci.test");
+        assert_eq!(super::seg("x/../../queue"), "x%2F..%2F..%2Fqueue");
+        assert_eq!(super::seg(".."), "%2E%2E");
+        assert_eq!(super::seg("a?b#c"), "a%3Fb%23c");
     }
 }

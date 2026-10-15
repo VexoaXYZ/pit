@@ -507,7 +507,10 @@ impl Db {
         let tx = c.transaction()?;
         let candidates: Vec<(String, String, String, String)> = {
             let mut st = tx.prepare(
-                "SELECT id, run_id, os, backends FROM groups_ WHERE status = 'queued' ORDER BY created_at LIMIT 200",
+                "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends FROM groups_
+                 JOIN runs ON runs.id = groups_.run_id
+                 WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
+                 ORDER BY groups_.created_at LIMIT 200",
             )?;
             let rows = st
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -656,7 +659,11 @@ impl Db {
         Ok(ids)
     }
 
-    pub fn cancel_run(&self, run_id: &str) -> Result<()> {
+    /// Cancels a run: it ends `failed` with message `cancelled` at once, and
+    /// its unclaimed groups are skipped. Groups already running finish on
+    /// their workers, but their results no longer change the run. Returns
+    /// whether the run was still active.
+    pub fn cancel_run(&self, run_id: &str) -> Result<bool> {
         let c = self.conn.lock();
         let now = now_ms();
         c.execute(
@@ -668,7 +675,12 @@ impl Db {
                AND group_id IN (SELECT id FROM groups_ WHERE run_id = ?2 AND status = 'skipped')",
             params![now, run_id],
         )?;
-        Ok(())
+        let changed = c.execute(
+            "UPDATE runs SET status = 'failed', message = 'cancelled', finished_at = ?1
+             WHERE id = ?2 AND status IN ('queued', 'running')",
+            params![now, run_id],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn task_group(&self, task_id: &str) -> Result<(String, String, String)> {
@@ -862,7 +874,7 @@ impl Db {
     pub fn queue_active(&self) -> Result<Vec<QueueRow>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
-            "SELECT * FROM queue WHERE status IN ('queued', 'testing', 'passed') ORDER BY created_at",
+            "SELECT * FROM queue WHERE status IN ('queued', 'testing', 'passed', 'removing') ORDER BY created_at",
         )?;
         let rows = st
             .query_map([], queue_row)?
@@ -899,6 +911,21 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    /// Asks the queue to drop an active entry, by id or by source branch
+    /// (`pr/12`, `my-branch`) within a repo. The next tick does the removal.
+    pub fn queue_request_removal(
+        &self,
+        key: &str,
+        repo_id: Option<&str>,
+        reason: &str,
+    ) -> Result<usize> {
+        Ok(self.conn.lock().execute(
+            "UPDATE queue SET status = 'removing', reason = ?1, updated_at = ?2
+             WHERE (id = ?3 OR (source = ?3 AND repo_id = ?4)) AND status IN ('queued', 'testing', 'passed')",
+            params![reason, now_ms(), key, repo_id],
+        )?)
     }
 
     pub fn queue_by_run(&self, run_id: &str) -> Result<Option<QueueRow>> {

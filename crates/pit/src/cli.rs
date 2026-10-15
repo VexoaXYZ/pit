@@ -81,8 +81,13 @@ pub async fn submit(
             },
         )
         .await?;
+    let run_id = created["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("server did not return a run id: {created}"))?
+        .to_string();
     Ok(Submitted {
-        run_id: created["id"].as_str().unwrap_or_default().to_string(),
+        run_id,
         url: created["url"].as_str().unwrap_or_default().to_string(),
         snapshot,
     })
@@ -328,7 +333,11 @@ pub async fn runs(client: &Client, limit: usize) -> Result<i32> {
 
 pub async fn logs(client: &Client, run: &str, task: &str) -> Result<i32> {
     let text = client
-        .get_text(&format!("/api/runs/{run}/tasks/{task}/log"))
+        .get_text(&format!(
+            "/api/runs/{}/tasks/{}/log",
+            crate::client::seg(run),
+            crate::client::seg(task)
+        ))
         .await?;
     print!("{text}");
     Ok(0)
@@ -366,6 +375,22 @@ pub async fn queue_add(
     if !entry.affected.is_empty() {
         println!("affected: {}", entry.affected.join(", "));
     }
+    Ok(0)
+}
+
+pub async fn queue_remove(client: &Client, dir: &Path, entry: &str) -> Result<i32> {
+    // Branch names are scoped to this repo; entry ids work from anywhere.
+    let repo = crate::snapshot::identity(dir).await.map(|id| id.name).ok();
+    let mut path = format!("/api/queue/{}", crate::client::seg(entry));
+    if let Some(repo) = repo {
+        path.push_str(&format!("?repo={}", crate::client::seg(&repo)));
+    }
+    let resp: serde_json::Value = client.delete(&path).await?;
+    println!(
+        "removed {} entr{}",
+        resp["removed"],
+        if resp["removed"] == 1 { "y" } else { "ies" }
+    );
     Ok(0)
 }
 

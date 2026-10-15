@@ -235,6 +235,8 @@ struct KeyMaterial<'a> {
     outputs: &'a [String],
     backend: Option<&'a str>,
     image: Option<&'a str>,
+    network: Option<bool>,
+    timeout: Option<u64>,
     env: Vec<(&'a str, String)>,
     deps: Vec<&'a str>,
     files: Vec<InputFile<'a>>,
@@ -264,7 +266,7 @@ pub fn action_key(
     let mut deps: Vec<&str> = dep_keys.iter().map(String::as_str).collect();
     deps.sort();
     let material = KeyMaterial {
-        v: 1,
+        v: 2,
         run: &task.run,
         os,
         arch: std::env::consts::ARCH,
@@ -272,6 +274,8 @@ pub fn action_key(
         outputs: &task.outputs,
         backend: task.backend.map(|b| b.as_str()),
         image: task.image.as_deref(),
+        network: task.network,
+        timeout: task.timeout,
         env,
         deps,
         files: matched,

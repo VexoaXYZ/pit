@@ -590,3 +590,80 @@ async fn tasks_do_not_inherit_pit_secrets() {
     let view = run(&pit, repo.path()).await;
     assert_eq!(view.status, Status::Passed, "task saw PIT_TEST_SECRET");
 }
+
+/// Removing a queued change stops it from landing, and the change behind it
+/// in its lane is retested and lands without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_queue_entry_never_lands() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    write(
+        &work,
+        "pit.config.json",
+        r#"{"tasks":{"a":{"run":"sleep 2","inputs":["a/**"]}}}"#,
+    );
+    write(&work, "a/base.txt", "a\n");
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    for (name, file) in [("first", "a/first.txt"), ("second", "a/second.txt")] {
+        sh(&work, &format!("git checkout -q -b {name} main"));
+        write(&work, file, "x\n");
+        sh(&work, &format!("git add -A && git commit -qm {name} && git push -q origin {name} && git checkout -q main"));
+    }
+    let url = origin.to_string_lossy().to_string();
+    let mut ids = vec![];
+    for b in ["first", "second"] {
+        let e: QueueEntryView = pit
+            .client
+            .post(
+                "/api/queue",
+                &QueueAdd {
+                    repo: "rm".into(),
+                    url: Some(url.clone()),
+                    branch: Some(b.into()),
+                    pr: None,
+                    target: None,
+                },
+            )
+            .await
+            .unwrap();
+        ids.push(e.id);
+    }
+    // Both overlap on task `a`: second is tested on top of first.
+    let removed: serde_json::Value = pit
+        .client
+        .delete(&format!("/api/queue/{}", ids[0]))
+        .await
+        .unwrap();
+    assert_eq!(removed["removed"], 1);
+
+    let entries = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let entries: Vec<QueueEntryView> = pit.client.get("/api/queue").await.unwrap();
+            if entries
+                .iter()
+                .all(|e| matches!(e.status.as_str(), "landed" | "failed" | "removed"))
+            {
+                return entries;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("queue did not settle");
+    let get = |s: &str| entries.iter().find(|e| e.source == s).unwrap().clone();
+    assert_eq!(get("first").status, "removed");
+    assert_eq!(get("second").status, "landed", "{entries:?}");
+    let main_files = sh(&origin, "git ls-tree -r --name-only main");
+    assert!(main_files.contains("a/second.txt"));
+    assert!(!main_files.contains("a/first.txt"), "removed change landed");
+    // Removing something that is not queued is a 404.
+    assert!(pit
+        .client
+        .delete::<serde_json::Value>(&format!("/api/queue/{}", ids[0]))
+        .await
+        .is_err());
+}

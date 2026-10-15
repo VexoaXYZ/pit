@@ -557,7 +557,8 @@ impl Worker {
             ("PIT_RUN_ID".into(), job.run_id.clone()),
             ("PIT_SHA".into(), job.sha.clone()),
         ];
-        for k in &def.env {
+        // Never hand Pit's own settings (API token) back through `env`.
+        for k in def.env.iter().filter(|k| !k.starts_with("PIT_")) {
             if let Ok(v) = std::env::var(k) {
                 env.push((k.clone(), v));
             }
@@ -650,11 +651,16 @@ fn save_warm(ws: &Path, warm: &HashMap<String, String>) {
 async fn forward_logs(client: Client, task_id: String, mut rx: mpsc::UnboundedReceiver<String>) {
     let path = format!("/api/tasks/{task_id}/log");
     let mut buf = String::new();
+    // Set when the buffer gets its first line, so steady output cannot keep
+    // pushing the flush back.
+    let mut deadline: Option<tokio::time::Instant> = None;
     loop {
+        let flush_at = deadline;
         tokio::select! {
             line = rx.recv() => match line {
                 Some(l) => {
                     buf.push_str(&l);
+                    deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_millis(50));
                     if buf.len() < 64 * 1024 {
                         continue;
                     }
@@ -666,8 +672,9 @@ async fn forward_logs(client: Client, task_id: String, mut rx: mpsc::UnboundedRe
                     return;
                 }
             },
-            _ = tokio::time::sleep(Duration::from_millis(50)), if !buf.is_empty() => {}
+            _ = async { tokio::time::sleep_until(flush_at.unwrap()).await }, if flush_at.is_some() => {}
         }
+        deadline = None;
         if !buf.is_empty() {
             let _ = client
                 .post_empty(

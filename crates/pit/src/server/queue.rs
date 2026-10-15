@@ -71,6 +71,22 @@ fn source_ref(source: &str) -> String {
     }
 }
 
+/// Requests removal of an entry (by id, or by branch / `pr/N` within `repo`)
+/// and wakes the queue to carry it out. Returns how many entries matched.
+pub fn remove(app: &App, key: &str, repo: Option<&str>, reason: &str) -> Result<usize> {
+    let repo_id = match repo {
+        Some(r) => Some(app.db.repo(r)?.id),
+        None => None,
+    };
+    let n = app
+        .db
+        .queue_request_removal(key, repo_id.as_deref(), reason)?;
+    if n > 0 {
+        app.queue_kick.notify_one();
+    }
+    Ok(n)
+}
+
 pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     let repo = app.db.upsert_repo(&req.repo, req.url.as_deref(), None)?;
     let mirror = app.fetch_mirror(&repo).await?;
@@ -190,7 +206,7 @@ async fn tick_target(
     }
     .await;
     for run in std::mem::take(&mut q.cancelled) {
-        app.group_finished(&run).await?;
+        app.run_finished(&run).await;
     }
     result
 }
@@ -212,8 +228,9 @@ impl Queue<'_> {
     fn requeue(&mut self, idx: usize, reason: &str) -> Result<()> {
         let e = &mut self.entries[idx];
         if let Some(run) = e.run_id.take() {
-            let _ = self.app.db.cancel_run(&run);
-            self.cancelled.push(run);
+            if self.app.db.cancel_run(&run).unwrap_or(false) {
+                self.cancelled.push(run);
+            }
         }
         e.status = "queued".into();
         e.lane = None;
@@ -235,7 +252,7 @@ impl Queue<'_> {
             .filter(|(_, e)| {
                 e.lane.as_deref() == Some(lane)
                     && e.position.unwrap_or(0) > pos
-                    && e.status != "landed"
+                    && matches!(e.status.as_str(), "testing" | "passed")
             })
             .map(|(i, _)| i)
             .collect();
@@ -245,11 +262,49 @@ impl Queue<'_> {
         Ok(())
     }
 
+    /// Takes an entry out of the queue for good. Later changes in its lane
+    /// were tested with it, so they are retested without it.
+    fn remove_entry(&mut self, i: usize, reason: &str) -> Result<()> {
+        let (lane, pos) = (
+            self.entries[i].lane.clone(),
+            self.entries[i].position.unwrap_or(0),
+        );
+        self.requeue(i, reason)?;
+        self.entries[i].status = "removed".into();
+        let e = self.entries[i].clone();
+        self.save(&e)?;
+        if let Some(lane) = lane {
+            self.requeue_after(
+                &lane,
+                pos,
+                "an earlier change in this lane was removed; retesting without it",
+            )?;
+        }
+        Ok(())
+    }
+
     async fn collect_results(&mut self) -> Result<()> {
-        // Entries whose branch moved since they were queued are retested.
         for i in 0..self.entries.len() {
+            if self.entries[i].status == "removing" {
+                let reason = self.entries[i]
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "removed".into());
+                self.remove_entry(i, &reason)?;
+            }
+        }
+        // Entries whose branch moved since they were queued are retested;
+        // entries whose branch is gone are dropped.
+        for i in 0..self.entries.len() {
+            if !matches!(
+                self.entries[i].status.as_str(),
+                "queued" | "testing" | "passed"
+            ) {
+                continue;
+            }
             let source = self.entries[i].source.clone();
             let Some(head) = git::rev_parse(&self.mirror, &source_ref(&source)).await? else {
+                self.remove_entry(i, "branch deleted")?;
                 continue;
             };
             if head != self.entries[i].head_sha && self.entries[i].status != "landed" {

@@ -233,73 +233,93 @@ export function RunPage({ id }: { id: string }) {
         );
       }, delay);
     };
-    const es = eventSource(`/api/runs/${encodeURIComponent(id)}/events`);
-    es.onmessage = (m) => {
-      let e: PitEvent;
-      try {
-        e = JSON.parse(m.data);
-      } catch {
-        return;
-      }
-      const now = Date.now();
-      switch (e.kind) {
-        case "snapshot":
-          setRun(e.data as RunView);
-          setError(undefined);
-          if (done((e.data as RunView).status)) es.close();
-          break;
-        case "task.log":
-          if (e.taskId) {
-            const tid = e.taskId;
-            setLogs((prev) => (prev[tid] === undefined ? prev : { ...prev, [tid]: prev[tid] + (e.data?.text ?? "") }));
+    let es: EventSource;
+    let reconnect: ReturnType<typeof setTimeout> | undefined;
+    const connect = () => {
+      es = eventSource(`/api/runs/${encodeURIComponent(id)}/events`);
+      es.onmessage = (m) => {
+        let e: PitEvent;
+        try {
+          e = JSON.parse(m.data);
+        } catch {
+          return;
+        }
+        const now = Date.now();
+        switch (e.kind) {
+          case "snapshot":
+            setRun(e.data as RunView);
+            setError(undefined);
+            if (done((e.data as RunView).status)) es.close();
+            break;
+          case "task.log":
+            if (e.taskId) {
+              const tid = e.taskId;
+              setLogs((prev) => (prev[tid] === undefined ? prev : { ...prev, [tid]: prev[tid] + (e.data?.text ?? "") }));
+            }
+            break;
+          case "task.started":
+            setRun((r) => patchTask(r, e.taskId, { status: "running", startedAt: now }));
+            if (e.taskId) {
+              const tid = e.taskId;
+              setLogs((prev) => (prev[tid] === undefined ? prev : { ...prev, [tid]: "" }));
+            }
+            refetch();
+            break;
+          case "task.finished":
+            setRun((r) =>
+              patchTask(r, e.taskId, {
+                status: e.data?.status,
+                durationMs: e.data?.durationMs ?? null,
+                exitCode: e.data?.exitCode ?? null,
+                finishedAt: now,
+              }),
+            );
+            refetch();
+            break;
+          case "group.started":
+            setRun((r) => patchGroup(r, e.groupId, { status: "running", worker: e.data?.worker ?? null, startedAt: now }));
+            refetch();
+            break;
+          case "run.finished":
+            es.close();
+            refetch(0);
+            break;
+          default:
+            refetch();
+        }
+      };
+      es.onerror = () => {
+        if (closed) return;
+        if (runRef.current) {
+          // The browser retries network errors itself but gives up on HTTP
+          // errors. If it gave up while the run is still going, catch up and
+          // reconnect so the page does not freeze on a stale "running".
+          if (es.readyState === EventSource.CLOSED && !done(runRef.current.status)) {
+            clearTimeout(reconnect);
+            reconnect = setTimeout(() => {
+              if (closed) return;
+              refetch(0);
+              connect();
+            }, 2000);
           }
-          break;
-        case "task.started":
-          setRun((r) => patchTask(r, e.taskId, { status: "running", startedAt: now }));
-          if (e.taskId) {
-            const tid = e.taskId;
-            setLogs((prev) => (prev[tid] === undefined ? prev : { ...prev, [tid]: "" }));
-          }
-          refetch();
-          break;
-        case "task.finished":
-          setRun((r) =>
-            patchTask(r, e.taskId, {
-              status: e.data?.status,
-              durationMs: e.data?.durationMs ?? null,
-              exitCode: e.data?.exitCode ?? null,
-              finishedAt: now,
-            }),
-          );
-          refetch();
-          break;
-        case "group.started":
-          setRun((r) => patchGroup(r, e.groupId, { status: "running", worker: e.data?.worker ?? null, startedAt: now }));
-          refetch();
-          break;
-        case "run.finished":
-          es.close();
-          refetch(0);
-          break;
-        default:
-          refetch();
-      }
+          return;
+        }
+        // No snapshot yet: find out why (404, 401, server down).
+        api.run(id).then(
+          (r) => !closed && setRun(r),
+          (err: Error) => {
+            if (closed) return;
+            setError(err);
+            es.close();
+          },
+        );
+      };
     };
-    es.onerror = () => {
-      if (closed || runRef.current) return;
-      // No snapshot yet: find out why (404, 401, server down).
-      api.run(id).then(
-        (r) => !closed && setRun(r),
-        (err: Error) => {
-          if (closed) return;
-          setError(err);
-          es.close();
-        },
-      );
-    };
+    connect();
     return () => {
       closed = true;
       clearTimeout(timer);
+      clearTimeout(reconnect);
       es.close();
     };
   }, [id]);

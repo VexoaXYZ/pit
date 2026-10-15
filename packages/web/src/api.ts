@@ -64,7 +64,7 @@ export interface Worker {
   currentRun: string | null;
 }
 
-export type QueueStatus = "queued" | "testing" | "passed" | "landed" | "failed";
+export type QueueStatus = "queued" | "testing" | "passed" | "landed" | "failed" | "removing" | "removed";
 
 export interface QueueEntry {
   id: string;

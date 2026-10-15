@@ -477,6 +477,18 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 .await?;
                 return Ok(serde_json::json!({ "queued": entry.id }));
             }
+            let unlabeled =
+                action == "unlabeled" && payload["label"]["name"].as_str() == Some(MERGE_LABEL);
+            if unlabeled || action == "closed" {
+                let reason = if unlabeled {
+                    "merge label removed"
+                } else {
+                    "pull request closed"
+                };
+                let n =
+                    super::queue::remove(app, &format!("pr/{number}"), Some(&repo.name), reason)?;
+                return Ok(serde_json::json!({ "dequeued": n }));
+            }
             if !matches!(action, "opened" | "synchronize" | "reopened") {
                 return Ok(serde_json::json!({ "ignored": action }));
             }

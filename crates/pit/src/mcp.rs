@@ -170,7 +170,11 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
             let task = args["task"].as_str().context("task is required")?;
             Ok((
                 client
-                    .get_text(&format!("/api/runs/{run}/tasks/{task}/log"))
+                    .get_text(&format!(
+                        "/api/runs/{}/tasks/{}/log",
+                        crate::client::seg(run),
+                        crate::client::seg(task)
+                    ))
                     .await?,
                 false,
             ))
