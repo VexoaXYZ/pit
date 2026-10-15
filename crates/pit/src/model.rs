@@ -53,6 +53,11 @@ pub struct GroupDef {
     /// Default container image for the `docker` backend.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Groups with the same lock run one at a time, across all runs and
+    /// repos on the server, e.g. integration tests that share a staging
+    /// database. Others wait in line; none are cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<String>,
     #[serde(default)]
     pub tasks: BTreeMap<String, TaskDef>,
 }

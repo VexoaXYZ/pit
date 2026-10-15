@@ -74,6 +74,12 @@ export interface GroupDef {
   os?: Os[];
   backend?: Backend;
   image?: string;
+  /**
+   * Groups with the same lock run one at a time across all runs and repos,
+   * e.g. integration tests sharing a staging database. The rest wait in line;
+   * none are cancelled.
+   */
+  lock?: string;
   tasks: Record<string, TaskDef>;
 }
 

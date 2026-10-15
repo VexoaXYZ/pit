@@ -187,6 +187,9 @@ pub struct WaitingGroup {
     pub os: String,
     pub needs: Vec<Backend>,
     pub message: Option<String>,
+    pub lock: Option<String>,
+    /// The run whose group holds `lock` now.
+    pub lock_holder: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +242,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has_kv_used {
         conn.execute_batch("ALTER TABLE kv ADD COLUMN last_used_at INTEGER")?;
+    }
+    let has_lock: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'lock_name'")?
+        .exists([])?;
+    if !has_lock {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lock_name TEXT")?;
     }
     let has_fresh: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'fresh'")?
@@ -692,6 +701,9 @@ impl Db {
                  JOIN runs ON runs.id = groups_.run_id
                  WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                    AND (groups_.os = 'any' OR groups_.os = ?1)
+                   AND (groups_.lock_name IS NULL OR NOT EXISTS (
+                     SELECT 1 FROM groups_ held WHERE held.status = 'running'
+                       AND held.lock_name = groups_.lock_name))
                  ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
                    groups_.created_at",
             )?;
@@ -1290,7 +1302,10 @@ impl Db {
     pub fn waiting_groups(&self, before: i64) -> Result<Vec<WaitingGroup>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
-            "SELECT groups_.id, groups_.run_id, groups_.name, groups_.os, groups_.backends, groups_.message
+            "SELECT groups_.id, groups_.run_id, groups_.name, groups_.os, groups_.backends, groups_.message,
+               groups_.lock_name,
+               (SELECT held.run_id FROM groups_ held WHERE held.status = 'running'
+                  AND held.lock_name = groups_.lock_name LIMIT 1)
              FROM groups_ JOIN runs ON runs.id = groups_.run_id
              WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                AND groups_.created_at < ?1",
@@ -1305,6 +1320,8 @@ impl Db {
                     os: r.get(3)?,
                     needs: serde_json::from_str(&backends).unwrap_or_default(),
                     message: r.get(5)?,
+                    lock: r.get(6)?,
+                    lock_holder: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1332,6 +1349,14 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    pub fn set_group_lock(&self, id: &str, lock: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE groups_ SET lock_name = ?1 WHERE id = ?2",
+            params![lock, id],
+        )?;
+        Ok(())
     }
 
     /// Records a line's latest result and returns the one before it.
@@ -1488,6 +1513,52 @@ mod tests {
         assert_eq!(job.group_id, linux);
         assert!(db.heartbeat_group(&job.group_id, Some(&job.lease)).unwrap());
         assert!(!db.heartbeat_group(&job.group_id, Some("stale")).unwrap());
+    }
+
+    #[test]
+    fn groups_sharing_a_lock_run_one_at_a_time() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let mut ids = vec![];
+        for _ in 0..2 {
+            let run = db
+                .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
+                .unwrap();
+            let g = db.insert_group(&run, "it", "linux", &[], &task).unwrap();
+            db.set_group_lock(&g, "staging-db").unwrap();
+            ids.push(g);
+        }
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+        };
+        let first = db.claim_group(&worker).unwrap().0.unwrap();
+        assert_eq!(first.group_id, ids[0]);
+        assert!(
+            db.claim_group(&worker).unwrap().0.is_none(),
+            "the lock is held"
+        );
+        let done = GroupResult {
+            status: Status::Passed,
+            message: None,
+            prepare_ms: 0,
+        };
+        assert!(db
+            .finish_group(&first.group_id, Some(&first.lease), &done)
+            .unwrap());
+        let second = db.claim_group(&worker).unwrap().0.unwrap();
+        assert_eq!(second.group_id, ids[1]);
     }
 
     #[test]

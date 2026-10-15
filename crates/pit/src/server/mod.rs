@@ -349,8 +349,12 @@ impl App {
                 .collect();
             backends.sort_by_key(|b| b.as_str());
             backends.dedup();
-            self.db
+            let gid = self
+                .db
                 .insert_group(run_id, &g.name, &g.os, &backends, &g.tasks)?;
+            if let Some(lock) = &g.lock {
+                self.db.set_group_lock(&gid, lock)?;
+            }
         }
         self.emit(
             "run.planned",
@@ -574,7 +578,10 @@ impl App {
             .map(|(w, _, _)| w)
             .collect();
         for g in self.db.waiting_groups(now - 3_000)? {
-            let reason = waiting_reason(&g.os, &g.needs, &online);
+            let reason = waiting_reason(&g.os, &g.needs, &online).or_else(|| {
+                let (lock, holder) = (g.lock.as_ref()?, g.lock_holder.as_ref()?);
+                Some(format!("waiting: lock `{lock}` is held by {holder}"))
+            });
             let ours = g
                 .message
                 .as_deref()

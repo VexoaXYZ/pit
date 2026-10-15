@@ -1510,3 +1510,52 @@ Covered by the e2e test `a_rerun_reruns_only_what_failed_and_says_why`.
 **Verdict: SOLVED.** A rerun costs only the failed task, and says why it ran. Not done: a task
 that is itself long (a 10-minute test suite) still reruns in full, since Pit's unit of work is the
 task. Splitting it (`shards`, P14) is the answer there.
+
+## P29. Two runs clobber a shared test environment
+
+**Pain.** Integration tests against a shared staging database, or deploys to one environment,
+break when two runs overlap. GitHub's `concurrency` groups were the answer, but for years a
+group could hold only one pending run: a third run cancelled the waiting one ("Canceling since a
+higher priority waiting request … exists"), and `cancel-in-progress: false` does not prevent
+that ([community#32376](https://github.com/orgs/community/discussions/32376),
+[#5435](https://github.com/orgs/community/discussions/5435),
+[#69704](https://github.com/orgs/community/discussions/69704),
+[GitHub docs](https://docs.github.com/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs),
+[RunsOn](https://runs-on.com/github-actions/concurrency/),
+[ZeroOne](https://laplusda.com/en/posts/github-actions-concurrency-pending-cancelled/)).
+GitHub added `queue: max` in May 2026, capped at 100 waiting runs. The older workaround was a
+dedicated self-hosted runner per resource.
+
+**Reproduction** (`/tmp/painhunt/p29`): two clones on branches `feature-a` and `feature-b`. Local
+runs on different branches do not supersede each other. Group `integration` runs one task: it
+writes its run id to a shared "staging DB" file, sleeps 3s, then checks the file still holds its
+id. `pit run` starts in both, half a second apart, on the 2-slot worker.
+
+**Before** (research/pain-hunt at P28): Pit had no way to serialize across runs. Both groups ran
+at once:
+
+```
+run A   e2e │ staging clobbered by run_ba85e6384f2b     failed
+run B   e2e │ staging data intact                       passed
+```
+
+**Fix** (research/pain-hunt): `lock: "<name>"` on a group, stored on each planned group (shards
+included). Claiming skips a queued group while any running group holds the same lock. The check
+runs inside the claim's SQLite transaction, so two workers cannot both take it. A waiting group
+says so through P23's waiting message.
+
+```
+run A   e2e │ staging data intact                                         passed in 4.5s
+run B   integration (any) waiting: lock `staging-db` is held by run_40901f683c52
+        e2e │ staging data intact                                         passed in 6.9s
+```
+
+Covered by the unit test `groups_sharing_a_lock_run_one_at_a_time`.
+
+**Verdict: SOLVED** for serializing shared resources. Waiting groups are never cancelled, with no
+queue cap, and the wait is explained. Not done:
+- **Group granularity.** The lock covers the whole group, setup included, so a lock on a large
+  group serializes more than it needs to. Put the locked tasks in their own group.
+- **No counting locks.** A lock admits one group at a time; "at most N at once" is not supported.
+- **Not tied to supersede.** A run superseded while it waits is cancelled as usual (P9), which is
+  what a newer push wants.

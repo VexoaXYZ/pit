@@ -89,6 +89,8 @@ pub struct PlannedGroup {
     pub os: String,
     /// Task name and definition, in dependency order.
     pub tasks: Vec<(String, TaskDef)>,
+    /// See `GroupDef::lock`.
+    pub lock: Option<String>,
 }
 
 /// Expands the config into schedulable groups. `selected` filters tasks by
@@ -128,7 +130,14 @@ pub fn plan(config: &PitConfig, selected: &[String]) -> Result<Vec<PlannedGroup>
             } else {
                 gname.clone()
             };
-            groups.extend(shard_groups(&name, os, &tasks));
+            groups.extend(
+                shard_groups(&name, os, &tasks)
+                    .into_iter()
+                    .map(|g| PlannedGroup {
+                        lock: group.lock.clone(),
+                        ..g
+                    }),
+            );
         }
     }
     if let Some(missing) = selected.iter().find(|s| !matched.contains(s.as_str())) {
@@ -152,6 +161,7 @@ fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<Planne
             name: name.to_string(),
             os: os.to_string(),
             tasks: tasks.to_vec(),
+            lock: None,
         }];
     }
     let by_name: BTreeMap<String, TaskDef> = tasks.iter().cloned().collect();
@@ -192,6 +202,7 @@ fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<Planne
                 name: format!("{name}#{k}"),
                 os: os.to_string(),
                 tasks,
+                lock: None,
             }
         })
         .collect()

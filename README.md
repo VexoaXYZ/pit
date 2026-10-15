@@ -122,6 +122,14 @@ Inputs come from declared dependencies. A package that reads another without lis
 in `package.json` needs that directory added by hand, or a change there will be a cache hit.
 [`bench/t3code.packages.pit.config.ts`](bench/t3code.packages.pit.config.ts) is a full example.
 
+### Shared resources
+
+`lock: "staging-db"` on a group makes groups with that lock run one at a time, across every run
+and repo on the server. Use it for integration tests that share a database, or deploys to one
+environment. Waiting groups stay queued, with no limit and no cancellations, and say what they
+are waiting for ("waiting: lock `staging-db` is held by run_…"). The lock covers the whole
+group, so keep it small.
+
 ### Schedules
 
 ```ts
