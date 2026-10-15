@@ -765,3 +765,60 @@ and it removes the repeated setup (31% of T3 Code's runner time) plus all work w
 not change. But code changes still cost their real compute, Pit's machines are a fixed cost you
 run and size yourself, and this hunt did not measure dollars against a real team's month of
 pushes.
+
+## P16. CI failure logs flood a coding agent's context and bury the error
+
+**Pain.** Agents degrade as tool output piles into their context window (accuracy reported to
+fall sharply past ~70% of capacity), and oversized tool payloads "bloat context windows with
+irrelevant entries, increasing token consumption and distracting the model"; the suggested fix
+is filtering and truncation, or keeping logs out of the main agent entirely
+([Medium](https://medium.com/@tidianestano/why-ai-coding-agents-fail-tool-runtime-explained-fca55582d744),
+[Medium](https://medium.com/@ai_transfer_lab/your-ai-coding-agent-is-going-to-fail-heres-why-and-what-actually-works-713efa1d2cff),
+[DEV](https://dev.to/msinfotech/why-do-ai-agents-fail-on-long-coding-tasks-1n1f),
+[DEV](https://dev.to/maximsaplin/ai-agent-failure-modes-beyond-hallucination-208g),
+[Connsulting](https://www.connsulting.io/blog/concentric-feedback-loops),
+[daily.dev](https://daily.dev/posts/ai-engineering-in-2026-agents-are-everywhere-but-humans-still-run-the-loops-t8knr6vxz),
+[nhimg](https://nhimg.org/articles/coding-agent-observability-exposes-where-autonomous-code-fails/),
+[TestSprite](https://www.testsprite.com/blog/why-your-ai-coding-agent-keeps-breaking-things-and-how-to-fix-it),
+[IAN](https://iancloud.ai/blog/agentic-devops-production-verification-loop-2026)).
+
+**Reproduction** (`/tmp/painhunt/p16`): two failing tasks driven through `pit mcp`'s `pit_run`,
+the way a coding agent calls it. `typecheck` prints 20,000 lines of progress with the one real
+error (`error TS2322`) at line 401; `lint` prints 3,000 lines and its error last.
+
+**Before** (research/pain-hunt at P15): the response carried the last 80 lines of each failed
+log.
+
+```
+response chars: 16760  ~tokens: 4190
+contains the TS error: False
+contains the lint error: True
+```
+
+The agent paid ~4,200 tokens for build noise and never saw the type error.
+
+**Fix** (research/pain-hunt): `excerpt::excerpt` keeps lines that look like errors (`error`,
+`fail`, `panic`, `exception`, `traceback`, `assert`, `fatal`, `✗`/`×`) with two lines of context,
+plus the last eight lines, within 40 lines; shortens lines over 240 characters; marks omitted
+stretches; and ignores "0 errors"-style summaries (but not "10 errors"). The MCP response ends
+each task with a pointer to the full log (`pit_logs`); the CLI's failure output uses the same
+excerpt.
+
+```
+response chars: 2597  ~tokens: 649
+contains the TS error: True | contains the lint error: True
+
+--- default.typecheck: exited with 2 ---
+… 398 lines omitted …
+src/billing/invoice.ts(42,7): error TS2322: Type 'string' is not assignable to type 'number'.
+… 19591 lines omitted …
+Found 1 error in 1 file.
+(full log: 20002 lines; pit_logs with runId run_668b4fa5efa8 and task default.typecheck)
+```
+
+About 6× fewer tokens, and both errors present. Covered by the unit tests
+`keeps_an_early_error_that_a_tail_would_miss` and `zero_error_summaries_are_not_errors`.
+
+**Verdict: SOLVED** for logs whose errors say "error" or "fail". It is keyword matching: a
+failure that prints none of those words falls back to the tail, and a log that prints "error"
+on every line uses the 40-line budget on the first ones.

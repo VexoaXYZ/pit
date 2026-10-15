@@ -321,8 +321,7 @@ pub async fn run(
                 }
                 if !verbose {
                     if let Ok(log) = client.get_text(&format!("/api/tasks/{}/log", t.id)).await {
-                        let lines: Vec<&str> = log.lines().collect();
-                        for line in &lines[lines.len().saturating_sub(40)..] {
+                        for line in crate::excerpt::excerpt(&log, 40).lines() {
                             eprintln!("    {} {line}", style.dim("│"));
                         }
                     }

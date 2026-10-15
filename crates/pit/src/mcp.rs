@@ -277,9 +277,14 @@ async fn summarize(client: &Client, view: &RunView, elapsed_ms: u64, url: &str) 
             message.unwrap_or_default()
         ));
         if let Ok(log) = client.get_text(&format!("/api/tasks/{id}/log")).await {
-            let lines: Vec<&str> = log.lines().collect();
-            s.push_str(&lines[lines.len().saturating_sub(80)..].join("\n"));
-            s.push('\n');
+            // Error lines and the tail, not the whole log: agents pay for every
+            // token, and a tail alone misses errors printed early.
+            s.push_str(&crate::excerpt::excerpt(&log, 40));
+            s.push_str(&format!(
+                "\n(full log: {} lines; pit_logs with runId {} and task {name})\n",
+                log.lines().count(),
+                view.id
+            ));
         }
     }
     s
