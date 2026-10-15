@@ -165,7 +165,11 @@ impl Worker {
         if slots.is_empty() {
             // Pick up workspaces left by a previous worker process.
             if let Ok(entries) = std::fs::read_dir(&dir) {
-                for e in entries.flatten() {
+                // Slots are numbered; anything else is not ours.
+                let numbered = entries
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().parse::<usize>().is_ok());
+                for e in numbered {
                     slots.push(WorkspaceSlot {
                         path: e.path(),
                         busy: false,
