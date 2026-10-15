@@ -230,6 +230,8 @@ struct ConfigMaterial<'a> {
     network: Option<bool>,
     timeout: Option<u64>,
     env: Vec<(&'a str, String)>,
+    /// Names only: secret values never enter the key.
+    secrets: &'a [String],
 }
 
 /// What an action key is made of, kept so a cache miss can say what changed.
@@ -284,6 +286,7 @@ pub fn key_inputs(
         network: task.network,
         timeout: task.timeout,
         env,
+        secrets: &task.secrets,
     };
     Ok(KeyInputs {
         v: 3,

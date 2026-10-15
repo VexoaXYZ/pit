@@ -1128,3 +1128,39 @@ async fn fully_cached_runs_do_not_wait_for_busy_workers() {
             .unwrap();
     }
 }
+
+/// Secrets are masked in task logs, including base64 and double-base64 forms,
+/// while the task still gets the real value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secrets_are_masked_in_logs() {
+    std::env::set_var("E2E_DEPLOY_TOKEN", "tok_live_e2e_51a2b3");
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({ "tasks": { "deploy": {
+        "run": "test \"$E2E_DEPLOY_TOKEN\" = tok_live_e2e_51a2b3 && echo plain=$E2E_DEPLOY_TOKEN && echo b64=$(printf %s \"$E2E_DEPLOY_TOKEN\" | base64) && echo b64x2=$(printf %s \"$E2E_DEPLOY_TOKEN\" | base64 | base64 | tr -d '\\n')",
+        "secrets": ["E2E_DEPLOY_TOKEN"],
+        "cache": false
+    } } });
+    write(repo.path(), "pit.config.json", &config.to_string());
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run(&pit, repo.path()).await;
+    assert_eq!(
+        view.status,
+        Status::Passed,
+        "the task must see the real value"
+    );
+    let task = &view.groups[0].tasks[0];
+    let log = pit
+        .client
+        .get_text(&format!("/api/tasks/{}/log", task.id))
+        .await
+        .unwrap();
+    assert!(!log.contains("tok_live_e2e_51a2b3"), "{log}");
+    assert!(
+        log.contains("plain=***") && log.contains("b64=***") && log.contains("b64x2=***"),
+        "{log}"
+    );
+}

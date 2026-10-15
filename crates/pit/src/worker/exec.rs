@@ -132,8 +132,10 @@ pub fn command(
                 a.extend(["-e".into(), "HOME=/tmp".into()]);
             }
             container = Some(name);
-            for (k, v) in env {
-                a.extend(["-e".into(), format!("{k}={v}")]);
+            // By name only: the docker client passes values from its own
+            // environment, so they never show up in `ps` on the worker.
+            for (k, _) in env {
+                a.extend(["-e".into(), k.clone()]);
             }
             a.push(task.image.clone().unwrap_or_else(|| "ubuntu:24.04".into()));
             a.extend(["sh".into(), "-c".into(), task.run.clone()]);

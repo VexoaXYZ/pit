@@ -623,3 +623,56 @@ passed in 98ms · 0 ran, 2 cached
 a slot. Keys depend on the worker's OS, arch and the values of declared `env` variables; the
 server uses its own, so a fleet of a different OS or arch, or tasks keyed on env values that
 differ on the server, simply go to a worker (a missed shortcut, never a wrong hit).
+
+## P13. Secrets leak into CI logs
+
+**Pain.** In March 2025 the `tj-actions/changed-files` action was compromised (CVE-2025-30066):
+its tags were repointed to a commit that dumped the runner's memory and printed every secret
+it found into the build log, double-base64-encoded so exact-match masking would not catch it.
+23,000 repositories used the action; Endor Labs found 218 that printed secrets (AWS keys,
+GitHub PATs, npm tokens, private keys) into logs, readable by anyone on public repos
+([GitHub Advisory](https://github.com/advisories/ghsa-mrrh-fwg8-r2c3),
+[Wiz](https://www.wiz.io/blog/github-action-tj-actions-changed-files-supply-chain-attack-cve-2025-30066),
+[StepSecurity](https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-action-is-compromised),
+[Unit 42](https://unit42.paloaltonetworks.com/github-actions-supply-chain-attack/),
+[Phoenix Security](https://phoenix.security/tj-actions-compromise/),
+[Cycode](https://cycode.com/blog/github-actions-supply-chain-attack/),
+[Medium](https://medium.com/@simardeep.oberoi/github-actions-supply-chain-attack-how-tj-actions-changed-files-leaked-secrets-and-what-you-need-9e2677e07f68),
+[ThreatIntelReport](https://threatintelreport.com/articles/github-actions-supply-chain-attack-tj-actions-changed-files-and-reviewdog-action-setup/),
+[Safeguard](https://safeguard.sh/resources/blog/tj-actionschanged-files-github-action-compromise)).
+
+**Reproduction** (`/tmp/painhunt/p13`): the worker has `DEPLOY_TOKEN=tok_live_9f8e7d6c5b4a`; a
+task that receives it prints it plain, base64, and double base64.
+
+**Before** (research/pain-hunt at P12): Pit had no masking at all; the token was in the live
+stream and the stored log, readable by anyone with dashboard access. (A second worker without the
+variable first produced empty output: the affinity from P11 had routed the run there.)
+
+```
+plain=tok_live_9f8e7d6c5b4a
+b64=dG9rX2xpdmVfOWY4ZTdkNmM1YjRh
+b64x2=ZEc5clgyeHBkbVZmT1dZNFpUZGtObU0xWWpSaAo=
+```
+
+**Fix** (research/pain-hunt): a task field `secrets: [names]`. Values are passed through
+like `env`, but only the names enter the cache key (rotating a secret does not invalidate the
+cache). Before a log line is streamed or stored, the worker replaces exact values and any
+base64 token (standard or URL-safe, padded or not) that decodes, up to three layers, to text
+containing a secret. Docker tasks now get variables by name (`-e NAME`), so values never
+appear in the `docker run` command line visible in `ps`.
+
+```
+    deploy │ plain=***
+    deploy │ b64=***
+    deploy │ b64x2=***
+```
+
+Covered by the unit test `masks_plain_and_encoded_secrets` and the e2e test
+`secrets_are_masked_in_logs` (the task still sees the real value).
+
+**Verdict: PARTIAL.** Pit now catches what GitHub's exact-match masking missed in the tj-actions
+attack, but masking is defense in depth: a task that can read a secret can always print it some
+other way (hex, split across lines) or send it over the network. The real protections are not
+running untrusted code with secrets (Pit does not run fork PRs automatically) and short-lived
+credentials. Logs stored before a variable was declared under `secrets` are not rewritten, and
+values declared under plain `env` are not masked.

@@ -7,6 +7,7 @@
 
 pub mod exec;
 pub mod files;
+pub mod mask;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -606,15 +607,25 @@ impl Worker {
         ];
         // Never hand Pit's own settings (API token) back through `env`. Windows
         // variable names are case-insensitive, so compare uppercased.
-        for k in def
+        let mut secret_values = Vec::new();
+        let wanted = def
             .env
             .iter()
-            .filter(|k| !k.to_ascii_uppercase().starts_with("PIT_"))
-        {
+            .map(|k| (k, false))
+            .chain(def.secrets.iter().map(|k| (k, true)));
+        for (k, secret) in wanted {
+            if k.to_ascii_uppercase().starts_with("PIT_") {
+                continue;
+            }
             if let Ok(v) = std::env::var(k) {
+                if secret {
+                    secret_values.push(v.clone());
+                }
                 env.push((k.clone(), v));
             }
         }
+        // Secrets never reach the server's logs, live or stored.
+        let masker = Arc::new(mask::Masker::new(secret_values));
         // The task's own retries, plus the job's automatic ones (merge queue).
         let attempts = 1 + def.retries.unwrap_or(0) + job.flake_retries;
         let mut log = String::new();
@@ -624,7 +635,12 @@ impl Worker {
         let outcome = loop {
             attempt += 1;
             let (tx, rx) = mpsc::unbounded_channel::<String>();
-            let forwarder = tokio::spawn(forward_logs(client.clone(), task.id.clone(), rx));
+            let forwarder = tokio::spawn(forward_logs(
+                client.clone(),
+                task.id.clone(),
+                rx,
+                masker.clone(),
+            ));
             let cmd = exec::command(def, backend, ws, &env);
             let result = exec::run(
                 cmd,
@@ -636,7 +652,7 @@ impl Worker {
             let _ = forwarder.await;
             let outcome = result?;
             duration_ms += outcome.duration.as_millis() as u64;
-            log.push_str(&outcome.log);
+            log.push_str(&masker.mask(&outcome.log));
             if outcome.cancelled {
                 // The group is no longer ours; nothing to report or cache.
                 return Ok((Status::Skipped, None));
@@ -805,7 +821,12 @@ impl Worker {
 
 /// Batches log lines to the server every 50ms so the CLI and dashboard see
 /// output live without a request per line.
-async fn forward_logs(client: Client, task_id: String, mut rx: mpsc::UnboundedReceiver<String>) {
+async fn forward_logs(
+    client: Client,
+    task_id: String,
+    mut rx: mpsc::UnboundedReceiver<String>,
+    masker: Arc<mask::Masker>,
+) {
     let path = format!("/api/tasks/{task_id}/log");
     let mut buf = String::new();
     // Set when the buffer gets its first line, so steady output cannot keep
@@ -824,7 +845,8 @@ async fn forward_logs(client: Client, task_id: String, mut rx: mpsc::UnboundedRe
                 }
                 None => {
                     if !buf.is_empty() {
-                        let _ = client.post_empty(&path, &LogChunk { text: std::mem::take(&mut buf) }).await;
+                        let text = masker.mask(&std::mem::take(&mut buf));
+                        let _ = client.post_empty(&path, &LogChunk { text }).await;
                     }
                     return;
                 }
@@ -833,14 +855,8 @@ async fn forward_logs(client: Client, task_id: String, mut rx: mpsc::UnboundedRe
         }
         deadline = None;
         if !buf.is_empty() {
-            let _ = client
-                .post_empty(
-                    &path,
-                    &LogChunk {
-                        text: std::mem::take(&mut buf),
-                    },
-                )
-                .await;
+            let text = masker.mask(&std::mem::take(&mut buf));
+            let _ = client.post_empty(&path, &LogChunk { text }).await;
         }
     }
 }

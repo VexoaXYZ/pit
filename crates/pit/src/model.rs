@@ -53,6 +53,11 @@ pub struct TaskDef {
     /// Environment variable names that are passed through and hashed.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Environment variable names passed through as secrets: masked in logs
+    /// (including base64-encoded forms) and left out of the cache key, so
+    /// rotating one does not invalidate cached results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
     #[serde(default)]
     pub cache: CacheMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]

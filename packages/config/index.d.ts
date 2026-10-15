@@ -26,6 +26,11 @@ export interface TaskDef {
   /** Environment variables to pass through. Their values are part of the cache key. */
   env?: string[];
   /**
+   * Environment variables to pass through as secrets: their values are masked
+   * in logs (plain and base64-encoded forms) and are not part of the cache key.
+   */
+  secrets?: string[];
+  /**
    * - `"remote"` (default): results are shared by every worker and `pit run`.
    * - `"workspace"`: remembered per warm workspace. Use for dependency installs.
    * - `false` or `"off"`: always run.
