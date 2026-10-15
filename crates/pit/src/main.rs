@@ -47,6 +47,10 @@ enum Command {
         /// recently used idle ones are removed past it. 0 means no limit.
         #[arg(long, env = "PIT_WORKSPACE_MAX_GB", default_value_t = 50.0)]
         workspace_max_gb: f64,
+        /// Required to claim jobs. Set it on the server and its workers so that
+        /// API token holders cannot act as workers and write trusted results.
+        #[arg(long, env = "PIT_WORKER_TOKEN", hide_env_values = true)]
+        worker_token: Option<String>,
     },
     /// Run the control plane.
     Server {
@@ -63,6 +67,10 @@ enum Command {
         /// past it. 0 means unlimited.
         #[arg(long, env = "PIT_CACHE_MAX_GB", default_value_t = 20.0)]
         cache_max_gb: f64,
+        /// Required to claim jobs. Set it on the server and its workers so that
+        /// API token holders cannot act as workers and write trusted results.
+        #[arg(long, env = "PIT_WORKER_TOKEN", hide_env_values = true)]
+        worker_token: Option<String>,
     },
     /// Run a worker that claims groups from a server.
     Worker {
@@ -80,6 +88,10 @@ enum Command {
         /// recently used idle ones are removed past it. 0 means no limit.
         #[arg(long, env = "PIT_WORKSPACE_MAX_GB", default_value_t = 50.0)]
         workspace_max_gb: f64,
+        /// Required to claim jobs. Set it on the server and its workers so that
+        /// API token holders cannot act as workers and write trusted results.
+        #[arg(long, env = "PIT_WORKER_TOKEN", hide_env_values = true)]
+        worker_token: Option<String>,
     },
     /// Run tasks on the working tree, including uncommitted changes.
     Run {
@@ -231,17 +243,19 @@ async fn run(cli: Cli) -> Result<i32> {
             token,
             cache_max_gb,
             workspace_max_gb,
+            worker_token,
         } => {
             let data = data.unwrap_or_else(default_data);
-            cli::up(
+            cli::up(cli::UpOpts {
                 addr,
                 data,
                 slots,
-                parallelism.unwrap_or_else(default_parallelism),
+                parallelism: parallelism.unwrap_or_else(default_parallelism),
                 token,
-                gb_to_bytes(cache_max_gb),
-                gb_to_bytes(workspace_max_gb),
-            )
+                cache_max_bytes: gb_to_bytes(cache_max_gb),
+                workspace_max_bytes: gb_to_bytes(workspace_max_gb),
+                worker_token,
+            })
             .await?;
             Ok(0)
         }
@@ -251,6 +265,7 @@ async fn run(cli: Cli) -> Result<i32> {
             token,
             public_url,
             cache_max_gb,
+            worker_token,
         } => {
             pit::server::serve(pit::server::ServerOpts {
                 data_dir: data.unwrap_or_else(default_data).join("server"),
@@ -258,6 +273,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 token,
                 public_url,
                 cache_max_bytes: gb_to_bytes(cache_max_gb),
+                worker_token,
             })
             .await?;
             Ok(0)
@@ -269,6 +285,7 @@ async fn run(cli: Cli) -> Result<i32> {
             slots,
             parallelism,
             workspace_max_gb,
+            worker_token,
         } => {
             pit::worker::run(pit::worker::WorkerOpts {
                 server: conn.server,
@@ -278,6 +295,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 slots,
                 parallelism: parallelism.unwrap_or_else(default_parallelism),
                 workspace_max_bytes: gb_to_bytes(workspace_max_gb),
+                worker_token,
             })
             .await?;
             Ok(0)

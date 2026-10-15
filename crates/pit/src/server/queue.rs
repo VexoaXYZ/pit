@@ -507,7 +507,10 @@ impl Queue<'_> {
                     trigger: Some("post-merge".into()),
                     git_ref: Some(self.target.to_string()),
                     no_cache: false,
-                    trusted: super::trusted_branch(self.target, None),
+                    trusted: super::trusted_branch(
+                        self.target,
+                        default_branch(&self.mirror).await.ok().as_deref(),
+                    ),
                 },
                 None,
             )
@@ -640,7 +643,10 @@ impl Queue<'_> {
                         git_ref: Some(format!("queue/{}", e.source)),
                         no_cache: false,
                         // Queueing is the decision to land it on the target.
-                        trusted: super::trusted_branch(self.target, None),
+                        trusted: super::trusted_branch(
+                            self.target,
+                            default_branch(&self.mirror).await.ok().as_deref(),
+                        ),
                     },
                     e.pr,
                 )

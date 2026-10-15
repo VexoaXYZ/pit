@@ -425,8 +425,21 @@ async fn workers(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Valu
 /// Long-poll: returns a job the moment one is claimable, or `idle` after 20s.
 async fn claim(
     State(app): State<Arc<App>>,
+    headers: HeaderMap,
     Json(info): Json<WorkerInfo>,
 ) -> ApiResult<Json<ClaimResponse>> {
+    let required = app.worker_token.lock().clone();
+    if let Some(required) = required {
+        let given = headers
+            .get(crate::client::WORKER_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        if given != Some(required.as_str()) {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                anyhow::anyhow!("claiming jobs needs the worker token (PIT_WORKER_TOKEN)"),
+            ));
+        }
+    }
     app.db.touch_worker(&info)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -471,13 +484,28 @@ async fn claim(
 }
 
 /// Trust comes from the job's lease, never from the request: only a worker
-/// running a trusted run's group holds one.
+/// running a trusted run's group holds one. A lease that is no longer live
+/// (the run was cancelled or requeued) is refused rather than treated as
+/// untrusted, which would let a trusted job read untrusted results.
+fn cache_trust(app: &App, headers: &HeaderMap) -> ApiResult<bool> {
+    match lease(headers) {
+        None => Ok(false),
+        Some(l) => match app.db.lease_trust(l)? {
+            Some(trusted) => Ok(trusted),
+            None => Err(ApiError(
+                StatusCode::CONFLICT,
+                anyhow::anyhow!("this job's lease is no longer live"),
+            )),
+        },
+    }
+}
+
 async fn cache_get(
     State(app): State<Arc<App>>,
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<CacheEntry>> {
-    let trusted = app.db.lease_trusted(lease(&headers))?;
+    let trusted = cache_trust(&app, &headers)?;
     app.db
         .cache_find(&key, trusted)?
         .map(|stored| app.db.cache_get(&stored))
@@ -514,7 +542,7 @@ async fn cache_put(
             );
         }
     }
-    let trusted = app.db.lease_trusted(lease(&headers))?;
+    let trusted = cache_trust(&app, &headers)?;
     let stored = app.db.cache_put(&key, trusted, &entry)?;
     if let Some(scope) = q.scope.filter(|s| crate::cas::is_digest(s)) {
         app.db.kv_put("last", &scope, &stored)?;

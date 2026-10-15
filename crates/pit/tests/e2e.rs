@@ -27,6 +27,7 @@ async fn start() -> Pit {
         slots: 4,
         parallelism: 4,
         workspace_max_bytes: 0,
+        worker_token: None,
     }));
     let client = Client::new(&base, None).unwrap();
     for _ in 0..100 {
@@ -348,6 +349,7 @@ async fn github_webhook_runs_commit_and_reports_statuses() {
         slots: 2,
         parallelism: 2,
         workspace_max_bytes: 0,
+        worker_token: None,
     }));
 
     let repo = tempfile::tempdir().unwrap();
@@ -1295,4 +1297,32 @@ async fn untrusted_runs_cannot_poison_trusted_ones() {
             .contains("untrusted run"),
         "{build:?}"
     );
+}
+
+/// Trust cannot be borrowed: claiming needs the worker token when one is set,
+/// and a cache request with a lease no running group holds is refused rather
+/// than served untrusted results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_needs_a_worker_token_and_a_live_lease() {
+    let pit = start().await;
+    *pit.app.worker_token.lock() = Some("w-secret".into());
+    let info = serde_json::json!({ "name": "rogue", "os": "linux", "arch": "x86_64", "cpus": 1, "backends": ["host"], "kvm": false });
+    let base = &pit.client.base;
+    let http = reqwest::Client::new();
+    let claim = |token: Option<&'static str>| {
+        let mut r = http.post(format!("{base}/api/workers/claim")).json(&info);
+        if let Some(t) = token {
+            r = r.header(pit::client::WORKER_TOKEN_HEADER, t);
+        }
+        r.send()
+    };
+    assert_eq!(claim(None).await.unwrap().status(), 403);
+    assert_eq!(claim(Some("wrong")).await.unwrap().status(), 403);
+    let dead = http
+        .get(format!("{base}/api/cache/{}", "0".repeat(64)))
+        .header(pit::client::LEASE_HEADER, "not-a-live-lease")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dead.status(), 409);
 }

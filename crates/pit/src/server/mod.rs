@@ -44,12 +44,18 @@ pub struct App {
     /// Totals since start, for `/api/stats`.
     pub evicted_entries: AtomicU64,
     pub freed_bytes: AtomicU64,
+    /// See `ServerOpts::worker_token`.
+    pub worker_token: parking_lot::Mutex<Option<String>>,
 }
 
 pub struct ServerOpts {
     pub data_dir: PathBuf,
     pub addr: SocketAddr,
     pub token: Option<String>,
+    /// Required to claim jobs, if set. Claiming hands out leases, and a
+    /// trusted run's lease writes the cache main reads, so without it every
+    /// API token holder can act as a trusted worker.
+    pub worker_token: Option<String>,
     pub public_url: Option<String>,
     /// CAS size limit in bytes; 0 means unlimited.
     pub cache_max_bytes: u64,
@@ -83,6 +89,7 @@ impl App {
             queue_lock: Default::default(),
             queue_kick: Notify::new(),
             cache_max_bytes: AtomicU64::new(0),
+            worker_token: Default::default(),
             gc_grace_ms: AtomicU64::new(2 * 60 * 1000),
             evicted_entries: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
@@ -425,8 +432,14 @@ impl App {
 /// branches, `pit run`) read trusted results but write a separate cache that
 /// trusted runs never read, so a branch cannot plant a result or a file that
 /// main later picks up (cache poisoning, CVE-2025-36852).
+///
+/// Only the default branch is trusted. When it is not known, `main`, `master`
+/// and `trunk` are.
 pub fn trusted_branch(branch: &str, default_branch: Option<&str>) -> bool {
-    Some(branch) == default_branch || matches!(branch, "main" | "master" | "trunk")
+    match default_branch {
+        Some(d) => branch == d,
+        None => matches!(branch, "main" | "master" | "trunk"),
+    }
 }
 
 /// Whether a new run with this trigger and ref replaces older ones.
@@ -444,6 +457,7 @@ pub async fn serve(opts: ServerOpts) -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("http://{}", opts.addr));
     let app = App::new(&opts.data_dir, opts.token.clone(), public_url)?;
+    *app.worker_token.lock() = opts.worker_token.clone();
     app.cache_max_bytes
         .store(opts.cache_max_bytes, std::sync::atomic::Ordering::Relaxed);
     serve_app(app, opts.addr).await
@@ -504,4 +518,19 @@ pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) ->
     tracing::info!("pit server listening on {}", app.public_url);
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::trusted_branch;
+
+    #[test]
+    fn only_the_default_branch_is_trusted() {
+        assert!(trusted_branch("develop", Some("develop")));
+        // A known default branch overrides the usual names.
+        assert!(!trusted_branch("master", Some("main")));
+        assert!(!trusted_branch("trunk", Some("main")));
+        assert!(trusted_branch("main", None));
+        assert!(!trusted_branch("feature", None));
+    }
 }

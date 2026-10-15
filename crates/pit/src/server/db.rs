@@ -223,10 +223,14 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_trusted {
         // Results cached before trust existed may have come from anywhere;
         // keep them, but only for untrusted runs.
+        // One transaction: a crash must not leave the column without the
+        // demotion, or the next start would skip it.
         conn.execute_batch(
-            "ALTER TABLE runs ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0;
+            "BEGIN;
+             ALTER TABLE runs ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0;
              UPDATE cache SET action_key = 'u:' || action_key WHERE action_key NOT LIKE 'u:%';
-             UPDATE kv SET digest = 'u:' || digest WHERE ns = 'last' AND digest NOT LIKE 'u:%';",
+             UPDATE kv SET digest = 'u:' || digest WHERE ns = 'last' AND digest NOT LIKE 'u:%';
+             COMMIT;",
         )?;
     }
     Ok(())
@@ -1059,10 +1063,9 @@ impl Db {
         Ok(None)
     }
 
-    /// Whether the group holding this lease belongs to a trusted run.
-    /// Unknown or missing leases are untrusted.
-    pub fn lease_trusted(&self, lease: Option<&str>) -> Result<bool> {
-        let Some(lease) = lease else { return Ok(false) };
+    /// Whether the group holding this live lease belongs to a trusted run;
+    /// `None` if no running group holds it.
+    pub fn lease_trust(&self, lease: &str) -> Result<Option<bool>> {
         Ok(self
             .conn
             .lock()
@@ -1073,7 +1076,7 @@ impl Db {
                 |r| r.get::<_, i64>(0),
             )
             .optional()?
-            .is_some_and(|t| t != 0))
+            .map(|t| t != 0))
     }
 
     pub fn kv_get(&self, ns: &str, key: &str) -> Result<Option<String>> {
@@ -1495,9 +1498,8 @@ mod stats_tests {
         assert_eq!(db.cache_put("k", true, &entry(2)).unwrap(), "k");
         assert_eq!(db.cache_find("k", true).unwrap().as_deref(), Some("k"));
         assert_eq!(db.cache_find("k", false).unwrap().as_deref(), Some("k"));
-        // Without a live lease, a request is untrusted.
-        assert!(!db.lease_trusted(None).unwrap());
-        assert!(!db.lease_trusted(Some("forged")).unwrap());
+        // A lease no running group holds proves nothing.
+        assert_eq!(db.lease_trust("forged").unwrap(), None);
     }
 
     #[test]

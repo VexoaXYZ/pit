@@ -15,20 +15,37 @@ pub fn client(server: &str, token: Option<String>) -> Result<Client> {
     Client::new(server, token)
 }
 
+pub struct UpOpts {
+    pub addr: SocketAddr,
+    pub data: PathBuf,
+    pub slots: usize,
+    pub parallelism: usize,
+    pub token: Option<String>,
+    pub cache_max_bytes: u64,
+    pub workspace_max_bytes: u64,
+    pub worker_token: Option<String>,
+}
+
 /// Server and worker in one process.
-pub async fn up(
-    addr: SocketAddr,
-    data: PathBuf,
-    slots: usize,
-    parallelism: usize,
-    token: Option<String>,
-    cache_max_bytes: u64,
-    workspace_max_bytes: u64,
-) -> Result<()> {
+pub async fn up(opts: UpOpts) -> Result<()> {
+    let UpOpts {
+        addr,
+        data,
+        slots,
+        parallelism,
+        token,
+        cache_max_bytes,
+        workspace_max_bytes,
+        worker_token,
+    } = opts;
+    // The built-in worker always proves itself; other workers need the same
+    // PIT_WORKER_TOKEN to join.
+    let worker_token = worker_token.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let public = format!("http://{addr}");
     let app = crate::server::App::new(&data.join("server"), token.clone(), public.clone())?;
     app.cache_max_bytes
         .store(cache_max_bytes, std::sync::atomic::Ordering::Relaxed);
+    *app.worker_token.lock() = Some(worker_token.clone());
     let server = tokio::spawn(crate::server::serve_app(app, addr));
     // Wait for the listener before the worker starts polling.
     let probe = Client::new(&public, token.clone())?;
@@ -48,6 +65,7 @@ pub async fn up(
         slots,
         parallelism,
         workspace_max_bytes,
+        worker_token: Some(worker_token),
     }));
     tokio::select! {
         r = server => r??,

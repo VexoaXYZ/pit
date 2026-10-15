@@ -1066,6 +1066,26 @@ by the e2e test `untrusted_runs_cannot_poison_trusted_ones` and the unit test
 **Cost.** The first trusted run after a change rebuilds what a PR already built. That is the
 same trade GitHub makes by scoping caches to branches.
 
+**Hardened after an independent review** of the fix. The reviewer found no path from an
+untrusted result to a trusted run in the normal case, but it found five gaps, all now fixed:
+1. **A dead lease read untrusted results.** If a trusted run was cancelled or requeued while a
+   task was running, the task's next cache read counted as untrusted and could see branch
+   results. A lease that is no longer live now gets 409.
+2. **Any API token holder could act as a worker.** Holding the token was enough to claim a
+   trusted job and write trusted results with its lease. Claiming now needs `PIT_WORKER_TOKEN`
+   when it is set, and `pit up` sets one for its built-in worker. A claim made with only the
+   API token got 403 on the live server.
+3. **The wrong branches were trusted.** `master` and `trunk` were trusted even when GitHub
+   reported `main` as the default branch. Now only the known default branch is trusted, and
+   queue runs use the mirror's default branch.
+4. **Old workspaces became trusted.** Warm workspaces from before this change, which branch
+   runs had shared, would have become the trusted pool. Both pools now have new names
+   (`~trusted`, `~untrusted`), and the old directories age out (P19).
+5. **The migration was not atomic.** It now runs in one transaction.
+
+New tests: `trust_needs_a_worker_token_and_a_live_lease` (e2e) and
+`only_the_default_branch_is_trusted` (unit).
+
 **Verdict: PARTIAL.**
 - **Closed:** cache entries and warm workspaces. These are the paths Cacheract and CREEP use.
 - **Open: the host backend.** A task on `host` runs as the worker's user and can still write
@@ -1074,4 +1094,8 @@ same trade GitHub makes by scoping caches to branches.
 - **Open: the Turborepo and Bazel caches.** They are still one shared namespace, so tools that
   write through them need read-only tokens for PRs. Pit has no per-run tokens.
 - **Open: the API token.** Anyone holding it can queue a change, and queue runs are trusted.
-  That adds no new power, since queueing is how code reaches main.
+  That adds no new power, since queueing is how code reaches main. Without
+  `PIT_WORKER_TOKEN` set, they can also claim jobs as a worker.
+- **Open: unusual default branches.** For queue runs the default branch is guessed from the
+  mirror (`main`, then `master`, then `trunk`), so a repo whose default is `develop` gets
+  untrusted queue runs.

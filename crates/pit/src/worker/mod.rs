@@ -37,6 +37,8 @@ pub struct WorkerOpts {
     /// Disk budget for warm workspaces; least recently used idle ones are
     /// removed past it. 0 means no size limit.
     pub workspace_max_bytes: u64,
+    /// Sent when claiming jobs, if the server requires one.
+    pub worker_token: Option<String>,
 }
 
 pub struct Worker {
@@ -88,6 +90,7 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
     )
     .await?;
     worker.workspace_max_bytes = opts.workspace_max_bytes;
+    worker.client = worker.client.with_worker_token(opts.worker_token.clone());
     let worker = Arc::new(worker);
     tracing::info!(
         "pit worker {} ({} {}, {} cpus, backends: {}) serving {} with {} slot(s)",
@@ -171,11 +174,14 @@ impl Worker {
     /// a branch leaves behind (a planted `node_modules` entry) must not be
     /// there when main runs. Creates a workspace if all are busy.
     fn lease_workspace(&self, repo: &str, group: &str, trusted: bool) -> WorkspaceLease<'_> {
-        let pool = if trusted {
-            safe_name(group)
-        } else {
-            format!("{}~untrusted", safe_name(group))
-        };
+        // Both are suffixed: workspaces from before trust existed were
+        // shared with branch runs, so neither pool reuses them (they age out,
+        // see `disk`).
+        let pool = format!(
+            "{}~{}",
+            safe_name(group),
+            if trusted { "trusted" } else { "untrusted" }
+        );
         let dir = self
             .data_dir
             .join("workspaces")
