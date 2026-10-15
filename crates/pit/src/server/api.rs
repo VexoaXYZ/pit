@@ -357,6 +357,8 @@ async fn finish_task(
     if r.log_digest.is_some() {
         app.db.drop_live_log(&id)?;
     }
+    // Its single-flight claims (see `cache_claim`) end with it.
+    app.inflight.lock().retain(|_, holder| *holder != id);
     app.emit(
         "task.finished",
         Some(&run_id),
@@ -593,13 +595,18 @@ async fn cache_claim(
 ) -> ApiResult<Json<serde_json::Value>> {
     let trusted = cache_trust(&app, &headers)?;
     let slot = format!("{}:{key}", u8::from(trusted));
-    let holder = app.inflight.lock().get(&slot).cloned();
-    if let Some(holder) = holder.filter(|h| *h != body.task) {
-        if let Some(run) = app.db.running_task_run(&holder)? {
+    // Check and claim under one guard, so two claims cannot both win.
+    let mut inflight = app.inflight.lock();
+    // The result may have landed since the caller looked: go get it.
+    if app.db.cache_find(&key, trusted)?.is_some() {
+        return Ok(Json(serde_json::json!({ "wait": true })));
+    }
+    if let Some(holder) = inflight.get(&slot).filter(|h| **h != body.task) {
+        if let Some(run) = app.db.running_task_run(holder)? {
             return Ok(Json(serde_json::json!({ "wait": true, "run": run })));
         }
     }
-    app.inflight.lock().insert(slot, body.task);
+    inflight.insert(slot, body.task);
     Ok(Json(serde_json::json!({ "wait": false })))
 }
 

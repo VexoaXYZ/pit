@@ -1414,7 +1414,7 @@ async fn schedules_start_one_run_per_slot() {
     sh(&root, "git init -q --bare -b main origin.git");
     let config = serde_json::json!({
         "tasks": { "check": { "run": "true", "cache": false } },
-        "schedules": { "nightly": { "cron": "17 3 * * *", "fresh": true, "noCache": true } },
+        "schedules": { "nightly": { "cron": "17 3,4 * * *", "fresh": true, "noCache": true } },
     });
     write(&work, "pit.config.json", &config.to_string());
     sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
@@ -1439,6 +1439,14 @@ async fn schedules_start_one_run_per_slot() {
         .await
         .unwrap();
     assert_eq!(scheduled().await, 1, "one run per slot");
+    // A slow tick that skips over 04:17 still fires it on the next one.
+    pit::server::schedule::tick(&pit.app, at(4, 15))
+        .await
+        .unwrap();
+    pit::server::schedule::tick(&pit.app, at(4, 19))
+        .await
+        .unwrap();
+    assert_eq!(scheduled().await, 2, "the missed minute was caught up");
 
     // A bad cron is a config error, like any other typo.
     let bad = serde_json::json!({

@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS kv (
 -- The last result of each notified line (see server::notify).
 CREATE TABLE IF NOT EXISTS notify_state (
   key TEXT PRIMARY KEY,
-  status TEXT NOT NULL
+  status TEXT NOT NULL,
+  run_created_at INTEGER NOT NULL DEFAULT 0
 );
 
 -- The minute each schedule last fired, so it fires once per slot.
@@ -248,6 +249,20 @@ fn migrate(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has_lock {
         conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lock_name TEXT")?;
+    }
+    let has_lock_until: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'lock_until'")?
+        .exists([])?;
+    if !has_lock_until {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lock_until INTEGER")?;
+    }
+    let notify_ordered: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('notify_state') WHERE name = 'run_created_at'")?
+        .exists([])?;
+    if !notify_ordered {
+        conn.execute_batch(
+            "ALTER TABLE notify_state ADD COLUMN run_created_at INTEGER NOT NULL DEFAULT 0",
+        )?;
     }
     let has_fresh: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'fresh'")?
@@ -602,13 +617,27 @@ impl Db {
         backends: &[Backend],
         tasks: &[(String, TaskDef)],
     ) -> Result<String> {
+        self.insert_locked_group(run_id, name, os, backends, tasks, None)
+    }
+
+    /// `insert_group` with a lock (see `GroupDef::lock`), set in the same
+    /// statement so the group is never claimable without it.
+    pub fn insert_locked_group(
+        &self,
+        run_id: &str,
+        name: &str,
+        os: &str,
+        backends: &[Backend],
+        tasks: &[(String, TaskDef)],
+        lock: Option<&str>,
+    ) -> Result<String> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         let gid = new_id("grp");
         let now = now_ms();
         tx.execute(
-            "INSERT INTO groups_ (id, run_id, name, os, backends, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
-            params![gid, run_id, name, os, serde_json::to_string(backends)?, now],
+            "INSERT INTO groups_ (id, run_id, name, os, backends, status, created_at, lock_name) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+            params![gid, run_id, name, os, serde_json::to_string(backends)?, now, lock],
         )?;
         for (pos, (tname, def)) in tasks.iter().enumerate() {
             tx.execute(
@@ -702,12 +731,12 @@ impl Db {
                  WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                    AND (groups_.os = 'any' OR groups_.os = ?1)
                    AND (groups_.lock_name IS NULL OR NOT EXISTS (
-                     SELECT 1 FROM groups_ held WHERE held.status = 'running'
-                       AND held.lock_name = groups_.lock_name))
+                     SELECT 1 FROM groups_ held WHERE held.lock_name = groups_.lock_name
+                       AND (held.status = 'running' OR held.lock_until > ?2)))
                  ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
                    groups_.created_at",
             )?;
-            let mut rows = st.query_map(params![worker.os], |r| {
+            let mut rows = st.query_map(params![worker.os, now], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -742,7 +771,9 @@ impl Db {
         };
         let lease = new_id("lease");
         tx.execute(
-            "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2, lease = ?4 WHERE id = ?3",
+            "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2, lease = ?4,
+               message = CASE WHEN message LIKE 'waiting:%' THEN NULL ELSE message END
+             WHERE id = ?3",
             params![worker.name, now, gid, lease],
         )?;
         let (run, repo_name, url, group_name): (RunRow, String, String, String) = tx.query_row(
@@ -919,6 +950,13 @@ impl Db {
         if changed == 0 {
             return Ok(false);
         }
+        // A running group's worker learns of the cancel on its next
+        // heartbeat and then stops its tasks; keep its lock until then.
+        c.execute(
+            "UPDATE groups_ SET lock_until = ?1 + 10000
+             WHERE run_id = ?2 AND status = 'running' AND lock_name IS NOT NULL",
+            params![now, run_id],
+        )?;
         c.execute(
             "UPDATE groups_ SET status = 'skipped', finished_at = ?1, lease = NULL
              WHERE run_id = ?2 AND status IN ('queued', 'running')",
@@ -1304,14 +1342,14 @@ impl Db {
         let mut st = c.prepare(
             "SELECT groups_.id, groups_.run_id, groups_.name, groups_.os, groups_.backends, groups_.message,
                groups_.lock_name,
-               (SELECT held.run_id FROM groups_ held WHERE held.status = 'running'
-                  AND held.lock_name = groups_.lock_name LIMIT 1)
+               (SELECT held.run_id FROM groups_ held WHERE held.lock_name = groups_.lock_name
+                  AND (held.status = 'running' OR held.lock_until > ?2) LIMIT 1)
              FROM groups_ JOIN runs ON runs.id = groups_.run_id
              WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                AND groups_.created_at < ?1",
         )?;
         let rows = st
-            .query_map(params![before], |r| {
+            .query_map(params![before, now_ms()], |r| {
                 let backends: String = r.get(4)?;
                 Ok(WaitingGroup {
                     id: r.get(0)?,
@@ -1364,30 +1402,28 @@ impl Db {
             .optional()?)
     }
 
-    pub fn set_group_lock(&self, id: &str, lock: &str) -> Result<()> {
-        self.conn.lock().execute(
-            "UPDATE groups_ SET lock_name = ?1 WHERE id = ?2",
-            params![lock, id],
-        )?;
-        Ok(())
+    /// A line's last recorded result and the creation time of its run.
+    pub fn notify_state(&self, key: &str) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT status, run_created_at FROM notify_state WHERE key = ?1",
+                params![key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 
-    /// Records a line's latest result and returns the one before it.
-    pub fn swap_notify_state(&self, key: &str, status: &str) -> Result<Option<String>> {
-        let c = self.conn.lock();
-        let previous: Option<String> = c
-            .query_row(
-                "SELECT status FROM notify_state WHERE key = ?1",
-                params![key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        c.execute(
-            "INSERT INTO notify_state (key, status) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET status = ?2",
-            params![key, status],
+    /// Records a line's result, unless a newer run already did.
+    pub fn record_notify_state(&self, key: &str, status: &str, run_created_at: i64) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO notify_state (key, status, run_created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET status = ?2, run_created_at = ?3
+             WHERE run_created_at <= ?3",
+            params![key, status, run_created_at],
         )?;
-        Ok(previous)
+        Ok(())
     }
 
     /// Claims a schedule slot. False if this minute already fired.
@@ -1544,8 +1580,9 @@ mod tests {
             let run = db
                 .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
                 .unwrap();
-            let g = db.insert_group(&run, "it", "linux", &[], &task).unwrap();
-            db.set_group_lock(&g, "staging-db").unwrap();
+            let g = db
+                .insert_locked_group(&run, "it", "linux", &[], &task, Some("r:staging-db"))
+                .unwrap();
             ids.push(g);
         }
         let worker = WorkerInfo {
@@ -1572,6 +1609,32 @@ mod tests {
             .unwrap());
         let second = db.claim_group(&worker).unwrap().0.unwrap();
         assert_eq!(second.group_id, ids[1]);
+
+        // Cancelling a holder does not free the lock at once: its worker
+        // is still stopping the tasks.
+        let run = db
+            .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
+            .unwrap();
+        let third = db
+            .insert_locked_group(&run, "it", "linux", &[], &task, Some("r:staging-db"))
+            .unwrap();
+        assert!(db.cancel_run_because(&second.run_id, "cancelled").unwrap());
+        assert!(db.claim_group(&worker).unwrap().0.is_none(), "still held");
+        db.conn
+            .lock()
+            .execute("UPDATE groups_ SET lock_until = 0", [])
+            .unwrap();
+        assert_eq!(db.claim_group(&worker).unwrap().0.unwrap().group_id, third);
+    }
+
+    #[test]
+    fn an_older_run_cannot_overwrite_a_newer_notify_state() {
+        let db = Db::memory().unwrap();
+        db.record_notify_state("k", "passed", 200).unwrap();
+        db.record_notify_state("k", "failed", 100).unwrap();
+        assert_eq!(db.notify_state("k").unwrap(), Some(("passed".into(), 200)));
+        db.record_notify_state("k", "failed", 300).unwrap();
+        assert_eq!(db.notify_state("k").unwrap(), Some(("failed".into(), 300)));
     }
 
     #[test]

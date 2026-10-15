@@ -53,6 +53,8 @@ pub struct App {
     /// Action keys being computed right now: trust scope and key to the
     /// task doing it. See `api::cache_claim`.
     pub inflight: parking_lot::Mutex<HashMap<String, String>>,
+    /// The last minute `schedule::tick` evaluated.
+    pub schedule_minute: parking_lot::Mutex<Option<i64>>,
 }
 
 pub struct ServerOpts {
@@ -102,6 +104,7 @@ impl App {
             worker_token: Default::default(),
             notify_url: Default::default(),
             inflight: Default::default(),
+            schedule_minute: Default::default(),
             gc_grace_ms: AtomicU64::new(2 * 60 * 1000),
             evicted_entries: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
@@ -353,12 +356,16 @@ impl App {
                 .collect();
             backends.sort_by_key(|b| b.as_str());
             backends.dedup();
-            let gid = self
-                .db
-                .insert_group(run_id, &g.name, &g.os, &backends, &g.tasks)?;
-            if let Some(lock) = &g.lock {
-                self.db.set_group_lock(&gid, lock)?;
-            }
+            // Locks are per repo: one repo's runs cannot hold another's.
+            let lock = g.lock.as_ref().map(|l| format!("{}:{l}", repo.id));
+            self.db.insert_locked_group(
+                run_id,
+                &g.name,
+                &g.os,
+                &backends,
+                &g.tasks,
+                lock.as_deref(),
+            )?;
         }
         self.emit(
             "run.planned",
@@ -584,6 +591,7 @@ impl App {
         for g in self.db.waiting_groups(now - 3_000)? {
             let reason = waiting_reason(&g.os, &g.needs, &online).or_else(|| {
                 let (lock, holder) = (g.lock.as_ref()?, g.lock_holder.as_ref()?);
+                let lock = lock.split_once(':').map_or(lock.as_str(), |(_, l)| l);
                 Some(format!("waiting: lock `{lock}` is held by {holder}"))
             });
             let ours = g

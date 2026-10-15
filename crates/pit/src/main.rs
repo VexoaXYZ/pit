@@ -228,13 +228,19 @@ fn default_parallelism() -> usize {
 async fn main() {
     // Rust ignores SIGPIPE, so `pit runs | head` would panic on a closed
     // pipe. Exit quietly instead, like other command-line tools.
-    #[cfg(unix)]
-    // SAFETY: restoring the default disposition of a signal, before any
-    // other thread could depend on it.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
     let cli = Cli::parse();
+    // Not for the daemons: a closed log pipe must not kill a server or worker.
+    #[cfg(unix)]
+    if !matches!(
+        cli.command,
+        Command::Up { .. } | Command::Server { .. } | Command::Worker { .. }
+    ) {
+        // SAFETY: restoring the default disposition of a signal, before any
+        // other thread could depend on it.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     let quiet = matches!(cli.command, Command::Mcp { .. });
     tracing_subscriber::fmt()
         .with_env_filter(

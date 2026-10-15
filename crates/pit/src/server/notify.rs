@@ -63,8 +63,15 @@ async fn notify(app: &Arc<App>, run_id: &str) -> anyhow::Result<()> {
     };
     let git_ref = run.git_ref.clone().unwrap_or_default();
     let key = format!("{}:{git_ref}:{line}", run.repo_id);
-    let previous = app.db.swap_notify_state(&key, state)?;
-    let Some(change) = change(previous.as_deref(), state) else {
+    let created_at = view.created_at;
+    let previous = app.db.notify_state(&key)?;
+    // Main pushes are never superseded, so runs can finish out of order;
+    // an older commit's result says nothing about the line now.
+    if previous.as_ref().is_some_and(|(_, at)| *at > created_at) {
+        return Ok(());
+    }
+    let Some(change) = change(previous.as_ref().map(|(s, _)| s.as_str()), state) else {
+        app.db.record_notify_state(&key, state, created_at)?;
         return Ok(());
     };
     let failed: Vec<String> = view
@@ -108,6 +115,8 @@ async fn notify(app: &Arc<App>, run_id: &str) -> anyhow::Result<()> {
     if !resp.status().is_success() {
         anyhow::bail!("{url} answered {}", resp.status());
     }
+    // Only now: a failed post leaves the state, so the next run retries it.
+    app.db.record_notify_state(&key, state, created_at)?;
     tracing::info!("notified: {text}");
     Ok(())
 }

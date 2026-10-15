@@ -1614,3 +1614,37 @@ same inputs. Not done:
   waiting can delay other groups.
 - **Workspace-cached tasks are not single-flighted.** `install` is per workspace, so each shard
   still installs (or finds its warm workspace already installed).
+
+## Review of P21–P30
+
+An independent reviewer read every change from P21 to P30. It found nothing critical but ten real
+bugs. All are fixed (`cargo test`: 47 unit, 23 e2e), and P29 and P30 were re-checked live
+afterwards: one build for three shards, and two locked runs one after the other, both intact.
+
+1. **Single flight was check-then-act.** The claim was read and written under two separate lock
+   acquisitions, so two simultaneous misses could both win and both build: exactly what P30 was
+   meant to stop. Takeovers had the same race. Check and claim now happen under one guard, and
+   the guard also re-checks the cache.
+2. **Locks were global across repos.** Any repo's runs could hold, and starve, another repo's
+   lock. Locks are now per repo. Inside a repo, a run can still hold its lock up to its task
+   timeouts (fork PRs never run automatically).
+3. **Cancelling released a lock while the work was still running.** The group was marked
+   skipped at once, but its worker only stops at its next heartbeat. A cancelled holder now keeps
+   the lock for a 10-second grace period. Unit test added.
+4. **Schedules could switch off silently.** A config error, even a transient timeout, was cached
+   as "no schedules" until the next commit. Errors are now logged and not cached.
+5. **Schedules could miss a minute.** A tick only checked the minute it started in, so a tick
+   slower than 30s skipped minutes, and one failing schedule aborted the rest of the tick. Each
+   tick now covers every minute since the last one (at most ten), and errors are logged per
+   schedule. The e2e test checks the catch-up.
+6. **Notify could drop or invert transitions.** State was recorded before the post, so a failed
+   post lost the message. Out-of-order main runs could also report "broken" while main was green.
+   State is now recorded only after a successful post, and runs older than the last recorded one
+   are ignored. Unit test added.
+7. **A locked group was briefly claimable without its lock.** The lock was set in a second
+   statement; it is now inserted with the group.
+8. **The SIGPIPE change applied to the daemons.** A closed log pipe would have killed a server
+   or worker. It is now restored for client commands only.
+9. **The single-flight table grew forever.** Entries are now removed when their task finishes.
+10. **Stale "waiting:" messages stayed on running groups.** They are now cleared when the group
+    is claimed.
