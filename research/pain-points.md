@@ -9,7 +9,6 @@ against Pit on one machine, and a verdict backed by what was measured. Verdicts:
 | # | Pain point | Sources |
 | --- | --- | --- |
 | B1 | Push-and-pray dev loop: `git commit -m "try fix"`, wait 10 minutes, repeat; no way to run CI config locally | [HN 46908491](https://news.ycombinator.com/item?id=46908491), [Lobsters](https://lobste.rs/s/hkqnro/github_actions_is_slowly_killing_your) |
-| B3 | Logs of long builds (>10,000 lines) freeze the browser | [HN 46908491](https://news.ycombinator.com/item?id=46908491) |
 | B4 | Docker layer cache does not persist between runs | [Medium](https://medium.com/@akhilesh-mishra/your-github-actions-runners-are-slow-and-you-are-paying-too-much-for-them-5406577314fe) |
 | B5 | `actions/checkout` fails intermittently; release jobs scheduled twice | [HN 46614558](https://news.ycombinator.com/item?id=46614558) |
 | B6 | Bills keep climbing; teams move CI to one box for a warm cache | [HN 49612772](https://news.ycombinator.com/item?id=49612772) |
@@ -120,3 +119,38 @@ Covered by the e2e test `merge_queue_retries_flakes_once_and_flags_them`.
 
 **Verdict: SOLVED** for ejection. Flaky tests still cost a retry each time they flake;
 Pit reports and counts them, but does not quarantine them automatically.
+
+## P3. Long logs freeze the browser
+
+**Pain.** GitHub Actions' log viewer locks up on long builds: "logs from long builds
+(>10,000 lines) freeze the browser" ([HN 46908491](https://news.ycombinator.com/item?id=46908491)).
+
+**Reproduction** (`/tmp/painhunt/p3`): a task printing 200,000 lines (3.7 MB). Open its log
+on the run page in headless Chromium 1243 at 1280×900, measuring main-thread long tasks
+with a `PerformanceObserver` (`/tmp/shots/logperf.mjs`).
+
+**Before** (feat/pit-mvp): the panel rendered the whole log as one text node, and while a
+task streamed it rebuilt and re-stripped the whole string on every chunk.
+
+```
+{"visibleAfterMs":2769,"longTasks":3,"worstMs":1836,"totalBlockedMs":2238}
+```
+
+**Fix** (research/pain-hunt): logs over 2,000 lines render virtualized: fixed 18 px lines,
+only the lines in view plus a margin are in the DOM, colour codes are stripped only for
+those, and the panel shows the line count. Short logs keep the wrapped view.
+
+```
+{"visibleAfterMs":700,"longTasks":2,"worstMs":199,"totalBlockedMs":271}
+```
+
+Worst freeze 1,836 ms → 199 ms; time to visible 2.8 s → 0.7 s. The panel opens at the tail
+("done", "200,002 lines").
+
+**Run overhead from log volume** (warm runs, same task): 0 lines 258 ms total; 20,000 lines
+710 ms; 200,000 lines 901 ms, of which ~0.5 s is draining and uploading the 3.7 MB log after
+the process exits. A first run on a new repo took 3.0 s, mostly mirror and workspace setup.
+
+**Verdict: SOLVED** for the browser freeze at 200k lines. Long lines do not wrap in the
+virtualized view (they scroll horizontally), and logs over 8 MB are still truncated
+(head kept) by the worker.
