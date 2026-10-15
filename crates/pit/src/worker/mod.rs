@@ -54,13 +54,13 @@ struct WorkspaceSlot {
 /// Returns its workspace to the pool when the job ends.
 struct WorkspaceLease<'a> {
     worker: &'a Worker,
-    repo: String,
+    pool: String,
     path: PathBuf,
 }
 
 impl Drop for WorkspaceLease<'_> {
     fn drop(&mut self) {
-        if let Some(slots) = self.worker.workspaces.lock().get_mut(&self.repo) {
+        if let Some(slots) = self.worker.workspaces.lock().get_mut(&self.pool) {
             if let Some(s) = slots.iter_mut().find(|s| s.path == self.path) {
                 s.busy = false;
                 s.last_used = Instant::now();
@@ -149,14 +149,21 @@ impl Worker {
         })
     }
 
-    /// The most recently used free workspace for `repo`, so dependencies and
-    /// build output from the last run are still there. Creates one if all are busy.
-    fn lease_workspace(&self, repo: &str) -> WorkspaceLease<'_> {
+    /// The most recently used free workspace for this repo and group, so the
+    /// group's dependencies and build output from its last run are still
+    /// there. Groups do different work (a Rust build, a JS install), so they
+    /// never share warm state. Creates a workspace if all are busy.
+    fn lease_workspace(&self, repo: &str, group: &str) -> WorkspaceLease<'_> {
+        let dir = self
+            .data_dir
+            .join("workspaces")
+            .join(safe_name(repo))
+            .join(safe_name(group));
+        let key = dir.to_string_lossy().to_string();
         let mut pools = self.workspaces.lock();
-        let slots = pools.entry(repo.to_string()).or_default();
+        let slots = pools.entry(key.clone()).or_default();
         if slots.is_empty() {
             // Pick up workspaces left by a previous worker process.
-            let dir = self.data_dir.join("workspaces").join(safe_name(repo));
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for e in entries.flatten() {
                     slots.push(WorkspaceSlot {
@@ -184,11 +191,7 @@ impl Worker {
                             .any(|s| s.path.file_name() == Some(i.to_string().as_ref()))
                     })
                     .unwrap_or_default();
-                let path = self
-                    .data_dir
-                    .join("workspaces")
-                    .join(safe_name(repo))
-                    .join(index.to_string());
+                let path = dir.join(index.to_string());
                 slots.push(WorkspaceSlot {
                     path: path.clone(),
                     busy: true,
@@ -199,7 +202,7 @@ impl Worker {
         };
         WorkspaceLease {
             worker: self,
-            repo: repo.to_string(),
+            pool: key,
             path,
         }
     }
@@ -240,7 +243,7 @@ impl Worker {
                 }
             })
         };
-        let lease = self.lease_workspace(&job.repo);
+        let lease = self.lease_workspace(&job.repo, &job.group);
         let ws = lease.path.clone();
         let prep_start = Instant::now();
         let prepared = self.prepare(&job, &ws).await;
