@@ -13,7 +13,6 @@ against Pit on one machine, and a verdict backed by what was measured. Verdicts:
 | B5 | `actions/checkout` fails intermittently; release jobs scheduled twice | [HN 46614558](https://news.ycombinator.com/item?id=46614558) |
 | B6 | Bills keep climbing; teams move CI to one box for a warm cache | [HN 49612772](https://news.ycombinator.com/item?id=49612772) |
 | B7 | GitHub outages stop all CI (4 hours in Feb 2026, 7.5 hours in Aug 2026) | [NERVICO](https://nervico.com/en/blog/github-actions-alternatives-ci-cd/) |
-| B8 | Pit's own cache never evicts, so disk grows without bound (found in P1) | this file, P1 |
 
 ## P1. Cache misses are silent, and eviction makes them random
 
@@ -58,9 +57,10 @@ The reason is also on the task in the API and dashboard. Covered by the unit tes
 `explains_why_a_task_missed_the_cache` and assertions in the e2e test
 `local_runs_cache_restore_outputs_and_ship_overlays`.
 
-**Verdict: PARTIAL.** Silent misses: **SOLVED**. Random eviction: does not happen, but only
-because Pit never evicts at all, so its disk grows without bound (B8). A size-capped,
-least-recently-used eviction that reports what it evicted is still to do.
+**Verdict: SOLVED** (updated after P4). Silent misses: explained. Eviction: Pit now evicts
+least recently used results under a size limit (P4), and a task whose last result was
+evicted says so ("ran because its earlier result was evicted to keep the cache under its
+size limit").
 
 ## P2. A flaky test ejects innocent changes from the merge queue
 
@@ -154,3 +154,63 @@ the process exits. A first run on a new repo took 3.0 s, mostly mirror and works
 **Verdict: SOLVED** for the browser freeze at 200k lines. Long lines do not wrap in the
 virtualized view (they scroll horizontally), and logs over 8 MB are still truncated
 (head kept) by the worker.
+
+## P4. A self-hosted cache grows until the disk is full
+
+**Pain.** Self-hosted Turborepo cache servers do not evict: Garden Snail "does not remove old
+artifacts" and suggests S3 object expiration ([garden-snail](https://github.com/pkarolyi/garden-snail));
+guides for ducktors/turborepo-remote-cache size the disk by artifacts × builds × retention days
+and leave cleanup to storage lifecycle rules ([computingforgeeks](https://computingforgeeks.com/self-hosted-turborepo-remote-cache/),
+[turborepo-remote-cache](https://www.npmjs.com/package/turborepo-remote-cache)). bazel-remote is
+the counterexample: a max cache size (5 GiB default) enforced by deleting least recently used
+files ([bazel-remote](https://github.com/buchgr/bazel-remote)). It is also the other half of P1:
+GitHub's 10 GB cap evicts silently.
+
+**Reproduction** (`/tmp/painhunt/p4`): a task whose output is 2 MB of random bytes, keyed on
+`src/v`; build 15 versions.
+
+**Before** (feat/pit-mvp): no size option at all.
+
+```
+CAS grew by 30 MB over 15 builds; total 37 MB
+{'cacheEntries': 55, 'casBlobs': 171, 'casBytes': 37153062}
+```
+
+**Fix** (research/pain-hunt): `--cache-max-gb` (default 20, `0` unlimited). Every 60 s, if the
+CAS is over the limit, Pit sweeps blobs nothing refers to, then evicts least recently used
+cache entries and Turborepo/Bazel artifacts a tenth at a time until usage is under 90% of the
+limit. Kept: blobs younger than 2 minutes (an upload about to be referenced looks unreferenced
+for a moment) and logs and overlays of runs from the last 14 days. Evictions are logged,
+emitted as `cache.evicted`, and counted in `/api/stats`; `POST /api/gc` collects on demand. A
+worker whose cache hit loses its outputs to eviction mid-restore runs the task instead of
+failing.
+
+**A bug the live run caught.** The first version kept evicting while the only bytes over the
+limit were young blobs it could not delete yet, so it evicted every entry, newest included,
+and the next pass emptied the cache:
+
+```
+right after 15 more 2MB builds (new blobs are inside the 2 min grace):
+  casBytes=46.6MB limit=20MB entries=20 evicted=50
+after grace + periodic gc:
+  casBytes=6.6MB limit=20MB entries=0 evicted=70
+```
+
+Fixed: young blobs do not count toward the target, so the collector waits for them instead.
+Same experiment after the fix, on the live server with a 20 MB limit:
+
+```
+right after 15 builds of 2MB each:          casBytes=36.6MB entries=15 evicted=0
+next periodic gc, blobs still inside grace: casBytes=36.6MB entries=15 evicted=0
+after the grace period:                     casBytes=16.6MB entries=5  evicted=10
+newest build cached?   ◆ artifact   cached
+cache gc: evicted 10 entries, deleted 20 blobs, freed 20001830 bytes (36649291 -> 16647461, limit 20000000)
+```
+
+Covered by the e2e tests `cache_is_kept_under_its_size_limit` (oldest evicted, newest still a
+hit, evicted rerun explained) and `gc_does_not_empty_the_cache_for_blobs_it_cannot_free_yet`
+(fails on the first version).
+
+**Verdict: SOLVED**, with a limit: the store can exceed the cap for up to about three minutes
+(2 minute grace plus the 60 s check) when builds upload faster than that. Unlike bazel-remote,
+there is no hard limit that rejects uploads.
