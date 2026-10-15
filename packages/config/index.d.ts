@@ -88,4 +88,44 @@ export interface PitConfig {
   tasks?: Record<string, TaskDef>;
 }
 
-export declare function defineConfig(config: PitConfig): PitConfig;
+/** A JavaScript workspace package (pnpm, npm, Yarn or Bun workspaces). */
+export interface WorkspacePackage {
+  /** `name` from its package.json. */
+  name: string;
+  /** Directory relative to the repo root, e.g. `packages/shared`. */
+  dir: string;
+  /** Names of its package.json scripts. */
+  scripts: string[];
+  /** Workspace packages it depends on directly. */
+  deps: string[];
+  /**
+   * Input globs for a task on this package: its own directory and those of
+   * every workspace package it depends on, directly or not.
+   */
+  inputs: string[];
+}
+
+/** What a config that exports a function receives. */
+export interface PitContext {
+  /** The repo's workspace packages at the commit being run. */
+  packages: WorkspacePackage[];
+}
+
+/**
+ * The default export: a config, or a function of the repo that returns one.
+ * A function can generate one task per package, so a change reruns only the
+ * packages it can affect:
+ *
+ * ```ts
+ * export default ({ packages }: PitContext): PitConfig => ({
+ *   tasks: Object.fromEntries(
+ *     packages
+ *       .filter((p) => p.scripts.includes("typecheck"))
+ *       .map((p) => [`typecheck:${p.name}`, { run: `pnpm --filter ${p.name} typecheck`, inputs: p.inputs }]),
+ *   ),
+ * });
+ * ```
+ */
+export type PitConfigExport = PitConfig | ((ctx: PitContext) => PitConfig | Promise<PitConfig>);
+
+export declare function defineConfig(config: PitConfigExport): PitConfigExport;

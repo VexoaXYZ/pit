@@ -18,10 +18,11 @@ pub const CONFIG_FILES: &[&str] = &[CONFIG_TS, CONFIG_JSON];
 
 const EVAL_SCRIPT: &str = r#"
 const { pathToFileURL } = require("node:url");
-import(pathToFileURL(process.argv[process.argv.length - 1]).href).then(
+const ctx = JSON.parse(require("node:fs").readFileSync(process.argv[process.argv.length - 1], "utf8"));
+import(pathToFileURL(process.argv[process.argv.length - 2]).href).then(
   (m) => {
     let c = m.default ?? m.config ?? m;
-    if (typeof c === "function") c = c();
+    if (typeof c === "function") c = c(ctx);
     return Promise.resolve(c).then((v) => process.stdout.write(JSON.stringify(v)));
   },
   (e) => { console.error(String(e && e.stack || e)); process.exit(1); },
@@ -46,34 +47,55 @@ fn cache() -> &'static Mutex<HashMap<String, PitConfig>> {
 }
 
 /// Parses config source. `name` is the file name it came from, which decides
-/// whether it is JSON or TypeScript. Results are memoized by content hash.
-pub async fn parse(name: &str, source: &[u8], scratch: &Path) -> Result<PitConfig> {
-    let key = format!("{name}:{}", crate::cas::digest(source));
+/// whether it is JSON or TypeScript. A TypeScript config that exports a
+/// function is called with `ctx` (see `workspace`). Results are memoized by
+/// content hash.
+pub async fn parse(
+    name: &str,
+    source: &[u8],
+    scratch: &Path,
+    ctx: &crate::workspace::Context,
+) -> Result<PitConfig> {
+    let ctx = serde_json::to_vec(ctx)?;
+    let key = format!(
+        "{name}:{}:{}",
+        crate::cas::digest(source),
+        crate::cas::digest(&ctx)
+    );
     if let Some(c) = cache().lock().get(&key) {
         return Ok(c.clone());
     }
     let config = if name.ends_with(".json") {
         serde_json::from_slice::<PitConfig>(source).context("parsing pit.config.json")?
     } else {
-        eval_ts(source, scratch).await?
+        eval_ts(source, &ctx, scratch).await?
     };
     let config = normalize(config)?;
     cache().lock().insert(key, config.clone());
     Ok(config)
 }
 
-async fn eval_ts(source: &[u8], scratch: &Path) -> Result<PitConfig> {
+async fn eval_ts(source: &[u8], ctx: &[u8], scratch: &Path) -> Result<PitConfig> {
     std::fs::create_dir_all(scratch)?;
     // `.mts` makes both Node and Bun treat the file as an ES module.
     // Unique per evaluation: two plans of the same commit may run at once.
-    let file = scratch.join(format!("{}.mts", crate::model::new_id("pit-config")));
+    let id = crate::model::new_id("pit-config");
+    let file = scratch.join(format!("{id}.mts"));
+    let ctx_file = scratch.join(format!("{id}.json"));
     std::fs::write(&file, source)?;
+    std::fs::write(&ctx_file, ctx)?;
     let file_arg = file.to_string_lossy().to_string();
+    let result = eval_files(&file_arg, &ctx_file.to_string_lossy()).await;
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_file(&ctx_file);
+    result
+}
 
+async fn eval_files(file_arg: &str, ctx_arg: &str) -> Result<PitConfig> {
     let mut last_err = String::new();
     for (bin, args) in runtimes() {
         let mut cmd = tokio::process::Command::new(&bin);
-        cmd.args(&args).arg(EVAL_SCRIPT).arg(&file_arg);
+        cmd.args(&args).arg(EVAL_SCRIPT).arg(file_arg).arg(ctx_arg);
         cmd.stdin(Stdio::null()).kill_on_drop(true);
         // The config is repository code. It gets none of Pit's secrets.
         cmd.env_clear();
@@ -90,11 +112,9 @@ async fn eval_ts(source: &[u8], scratch: &Path) -> Result<PitConfig> {
                 continue;
             }
             Err(_) => {
-                let _ = std::fs::remove_file(&file);
                 bail!("evaluating {CONFIG_TS} with {bin} timed out")
             }
         };
-        let _ = std::fs::remove_file(&file);
         if !out.status.success() {
             bail!(
                 "evaluating {CONFIG_TS} with {bin} failed:\n{}",
@@ -104,7 +124,6 @@ async fn eval_ts(source: &[u8], scratch: &Path) -> Result<PitConfig> {
         return serde_json::from_slice(&out.stdout)
             .with_context(|| format!("{CONFIG_TS} must default-export a config object"));
     }
-    let _ = std::fs::remove_file(&file);
     bail!(
         "no JavaScript runtime found to evaluate {CONFIG_TS} (tried node and bun; set PIT_JS_RUNTIME, \
          or use {CONFIG_JSON}): {last_err}"
@@ -174,18 +193,6 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
     Ok(config)
 }
 
-/// Reads the config from a checked-out directory.
-pub async fn load_dir(dir: &Path, scratch: &Path) -> Result<PitConfig> {
-    for name in CONFIG_FILES {
-        let path = dir.join(name);
-        if path.exists() {
-            let src = std::fs::read(&path)?;
-            return parse(name, &src, scratch).await;
-        }
-    }
-    bail!("no {CONFIG_TS} or {CONFIG_JSON} in {}", dir.display())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,12 +203,59 @@ mod tests {
         let bad = br#"{"tasks":{"test":{"run":"true","imputs":["src/**"]}}}"#;
         let err = format!(
             "{:#}",
-            parse(CONFIG_JSON, bad, dir.path()).await.unwrap_err()
+            parse(CONFIG_JSON, bad, dir.path(), &Default::default())
+                .await
+                .unwrap_err()
         );
         assert!(err.contains("unknown field `imputs`"), "{err}");
         let bad_group = br#"{"groups":{"ci":{"oss":["linux"],"tasks":{}}}}"#;
-        assert!(parse(CONFIG_JSON, bad_group, dir.path()).await.is_err());
+        assert!(
+            parse(CONFIG_JSON, bad_group, dir.path(), &Default::default())
+                .await
+                .is_err()
+        );
         let good = br#"{"tasks":{"test":{"run":"true","inputs":["src/**"],"cache":false}}}"#;
-        assert!(parse(CONFIG_JSON, good, dir.path()).await.is_ok());
+        assert!(parse(CONFIG_JSON, good, dir.path(), &Default::default())
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_config_function_gets_the_workspace_packages() {
+        if runtimes().iter().all(|(bin, _)| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .output()
+                .is_err()
+        }) {
+            eprintln!("skipped: no JavaScript runtime");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let src = br#"
+import type { PitConfig, PitContext } from "@pit-ci/config";
+export default ({ packages }: PitContext): PitConfig => ({
+  tasks: Object.fromEntries(
+    packages
+      .filter((p) => p.scripts.includes("typecheck"))
+      .map((p) => [`typecheck:${p.name}`, { run: "npm run typecheck", inputs: p.inputs }]),
+  ),
+});
+"#;
+        let ctx = crate::workspace::Context {
+            packages: vec![crate::workspace::Package {
+                name: "web".into(),
+                dir: "apps/web".into(),
+                scripts: vec!["typecheck".into()],
+                deps: vec![],
+                inputs: vec!["apps/web/**".into()],
+            }],
+        };
+        let config = parse(CONFIG_TS, src, dir.path(), &ctx).await.unwrap();
+        let task = &config.groups["default"].tasks["typecheck:web"];
+        assert_eq!(
+            task.inputs.as_deref(),
+            Some(&["apps/web/**".to_string()][..])
+        );
     }
 }

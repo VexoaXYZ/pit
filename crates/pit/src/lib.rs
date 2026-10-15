@@ -18,3 +18,4 @@ pub mod model;
 pub mod server;
 pub mod snapshot;
 pub mod worker;
+pub mod workspace;

@@ -152,19 +152,63 @@ impl App {
     ) -> Result<PitConfig> {
         let scratch = self.data_dir.join("tmp");
         for name in crate::config::CONFIG_FILES {
-            if let Some(entry) = overlay.and_then(|o| o.entries.iter().find(|e| e.path == *name)) {
-                let Some(d) = &entry.digest else { continue };
-                let src = self
-                    .cas
-                    .get(d)?
-                    .context("overlay config blob missing from CAS")?;
-                return crate::config::parse(name, &src, &scratch).await;
-            }
-            if let Some(src) = crate::git::show_file(mirror, sha, name).await? {
-                return crate::config::parse(name, &src, &scratch).await;
-            }
+            let src = match overlay.and_then(|o| o.entries.iter().find(|e| e.path == *name)) {
+                Some(entry) => {
+                    let Some(d) = &entry.digest else { continue };
+                    self.cas
+                        .get(d)?
+                        .context("overlay config blob missing from CAS")?
+                }
+                None => match crate::git::show_file(mirror, sha, name).await? {
+                    Some(src) => src,
+                    None => continue,
+                },
+            };
+            let ctx = if name.ends_with(".ts") {
+                self.workspace_context(mirror, sha, overlay).await?
+            } else {
+                Default::default()
+            };
+            return crate::config::parse(name, &src, &scratch, &ctx).await;
         }
         bail!("no {} at {sha}", crate::config::CONFIG_TS)
+    }
+
+    /// The workspace packages at this commit plus overlay, for configs that
+    /// export a function.
+    async fn workspace_context(
+        &self,
+        mirror: &Path,
+        sha: &str,
+        overlay: Option<&Overlay>,
+    ) -> Result<crate::workspace::Context> {
+        let files: Vec<String> = resolve::file_index(mirror, sha, overlay)
+            .await?
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        // Only the workspace manifests are read, so fetch just those.
+        let wanted: Vec<&String> = files
+            .iter()
+            .filter(|p| {
+                !p.contains("node_modules/")
+                    && (p.ends_with("package.json") || *p == "pnpm-workspace.yaml")
+            })
+            .collect();
+        let mut contents = HashMap::new();
+        for path in wanted {
+            let from_overlay = overlay.and_then(|o| o.entries.iter().find(|e| &e.path == path));
+            let bytes = match from_overlay.and_then(|e| e.digest.as_ref()) {
+                Some(d) => self.cas.get(d)?,
+                None => crate::git::show_file(mirror, sha, path).await?,
+            };
+            if let Some(b) = bytes {
+                contents.insert(path.clone(), b);
+            }
+        }
+        Ok(crate::workspace::Context {
+            packages: crate::workspace::packages(&files, |p| contents.get(p).cloned()),
+        })
     }
 
     pub fn load_overlay(&self, digest: &str) -> Result<Overlay> {
