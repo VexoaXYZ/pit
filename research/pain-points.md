@@ -9,7 +9,6 @@ against Pit on one machine, and a verdict backed by what was measured. Verdicts:
 | # | Pain point | Sources |
 | --- | --- | --- |
 | B1 | Push-and-pray dev loop: `git commit -m "try fix"`, wait 10 minutes, repeat; no way to run CI config locally | [HN 46908491](https://news.ycombinator.com/item?id=46908491), [Lobsters](https://lobste.rs/s/hkqnro/github_actions_is_slowly_killing_your) |
-| B4 | Docker layer cache does not persist between runs | [Medium](https://medium.com/@akhilesh-mishra/your-github-actions-runners-are-slow-and-you-are-paying-too-much-for-them-5406577314fe) |
 | B5 | `actions/checkout` fails intermittently; release jobs scheduled twice | [HN 46614558](https://news.ycombinator.com/item?id=46614558) |
 | B6 | Bills keep climbing; teams move CI to one box for a warm cache | [HN 49612772](https://news.ycombinator.com/item?id=49612772) |
 | B7 | GitHub outages stop all CI (4 hours in Feb 2026, 7.5 hours in Aug 2026) | [NERVICO](https://nervico.com/en/blog/github-actions-alternatives-ci-cd/) |
@@ -214,3 +213,62 @@ hit, evicted rerun explained) and `gc_does_not_empty_the_cache_for_blobs_it_cann
 **Verdict: SOLVED**, with a limit: the store can exceed the cap for up to about three minutes
 (2 minute grace plus the 60 s check) when builds upload faster than that. Unlike bazel-remote,
 there is no hard limit that rejects uploads.
+
+## P5. Docker builds start cold on every run
+
+**Pain.** Hosted runners are discarded after each job, so Buildx "rebuilds the full Dockerfile
+from layer zero" unless `cache-from` and `cache-to` point at an external backend
+([Blacksmith](https://www.blacksmith.sh/blog/cache-is-king-a-guide-for-docker-layer-caching-in-github-actions),
+[RunsOn](https://runs-on.com/github-actions/docker-layer-caching/),
+[Ken Muse](https://www.kenmuse.com/blog/implementing-docker-layer-caching-in-github-actions/)).
+Even then the gha backend shares the 10 GB Actions budget and gets evicted, multi-stage builds
+need `mode=max`, and `RUN --mount=type=cache` contents are not carried to the next runner at all
+([devopsboys](https://devopsboys.com/blog/docker-build-slow-no-cache-fix-2026),
+[Dash0](https://www.dash0.com/faq/cache-docker-images-github-actions),
+[devopskit](https://devopskit.in/blog/docker-build-slow-github-actions-fix/),
+[DEPT](https://engineering.deptagency.com/how-to-speed-up-docker-builds-in-github-actions)).
+"Why your Docker build takes 11 minutes in CI when it takes 20 seconds locally"
+([DEV.to](https://dev.to/libme/why-your-docker-build-takes-11-minutes-in-ci-when-it-takes-20-seconds-locally-3foe)).
+Listed in the backlog from [Medium](https://medium.com/@akhilesh-mishra/your-github-actions-runners-are-slow-and-you-are-paying-too-much-for-them-5406577314fe).
+
+**Reproduction** (`/tmp/painhunt/p5`): a Dockerfile with an 8 s dependency layer, a
+`--mount=type=cache` step that takes 4 s when its cache is cold, then `COPY src`. A Pit host
+task runs `docker build` (BuildKit; `docker-buildx` had to be installed on this box), with
+Pit's own task cache off so only Docker's cache is measured. Change `src/` between runs
+without committing.
+
+**Result** (no Pit changes needed):
+
+```
+== run 1 (cold daemon)
+    #8 DONE 8.8s                                  (dependency layer)
+    #9 5.648 cache mount: cold
+passed in 29.9s
+== run 2 (source changed, uncommitted)
+    #8 CACHED
+    #9 CACHED
+passed in 6.0s
+```
+
+With the cache-mount step moved after `COPY` so it reruns on every change:
+
+```
+== source a   cache mount: warm   WALL 7.09s
+== source b   cache mount: warm   WALL 5.15s
+== source c   cache mount: warm   WALL 5.81s
+```
+
+**Two things found.**
+- A test task that pipes `docker build` into `grep | tail` reports success even when the
+  build fails (the shell returns the last command's status). That bit this reproduction
+  once; it is a config mistake, not a Pit bug, but worth knowing.
+- Pit's default remote cache is wrong for `docker build`: the image is not a declared
+  output, so a hit on another worker would skip a build whose image is not in that
+  worker's daemon. Documented in the README ("Docker builds"): use `cache: "workspace"` or
+  `false` for image builds.
+
+**Verdict: SOLVED on one box, PARTIAL for a fleet.** On a single worker, layers and cache
+mounts persist with no setup: 29.9 s → 5–7 s per rebuild. With several workers each has its
+own Docker cache, and Pit's scheduler does not yet route a group back to the worker that ran
+it last, so a fleet only stays warm per worker. Worker affinity in the scheduler is the
+follow-up.

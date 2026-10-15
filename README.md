@@ -93,6 +93,14 @@ export default {
 | `timeout` | Seconds. The whole process group is killed. |
 | `retries` | Extra attempts after a failure. A pass on a retry is reported as `flaky:` and is not cached. |
 
+### Docker builds
+
+Workers are long-lived, so their Docker daemon keeps its layer cache and BuildKit
+`--mount=type=cache` contents between runs; no `cache-from`/`cache-to` setup is needed. Run
+`docker build` as a host task with `cache: "workspace"` (or `false`), not the default remote
+cache: the image lives in that worker's daemon, not in the task's outputs, so a remote cache
+hit on another worker would skip a build whose image is not there.
+
 ## How it works
 
 ```
