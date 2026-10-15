@@ -91,6 +91,7 @@ export default {
 | `image` | Container image; implies `backend: "docker"`. |
 | `network` | `false` cuts network access in `sandbox` and `docker`. |
 | `timeout` | Seconds. The whole process group is killed. |
+| `retries` | Extra attempts after a failure. A pass on a retry is reported as `flaky:` and is not cached. |
 
 ## How it works
 
@@ -157,6 +158,12 @@ computes its **affected tasks**: tasks whose inputs it touches, plus their depen
   candidate (`tip+A`, `tip+A+B`). If a candidate fails, that change is ejected and the
   changes after it are retested without it.
 - **Overlaps several lanes**: waits until they drain.
+
+**Flakes.** In the queue every failed task is retried once. If it passes on the retry,
+the change keeps its place and the task is reported as `flaky:` (and counted in
+`/api/stats`), so one flaky test cannot eject an unrelated change and restart everything
+behind it. Pull request and local runs stay strict, and a flaky pass is never cached, so
+the flake keeps showing until it is fixed.
 
 Landing is a non-forced push of the exact commit that was tested. Every landed commit also
 gets a full post-merge run as a backstop for undeclared inputs.

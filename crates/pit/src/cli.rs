@@ -244,10 +244,11 @@ pub async fn run(
                     ),
                     _ => secs(ms),
                 };
-                // Why it ran (cache miss reason); failures print their message below.
+                // Why it ran (cache miss reason) or that it was flaky; failures print
+                // their message below.
                 let why = e.data["message"]
                     .as_str()
-                    .filter(|m| m.starts_with("ran because"))
+                    .filter(|m| m.starts_with("ran because") || m.starts_with("flaky:"))
                     .map(|m| format!("  {}", style.dim(m)))
                     .unwrap_or_default();
                 let _ = writeln!(

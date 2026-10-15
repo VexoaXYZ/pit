@@ -592,14 +592,44 @@ impl Worker {
                 env.push((k.clone(), v));
             }
         }
-        let (tx, rx) = mpsc::unbounded_channel::<String>();
-        let forwarder = tokio::spawn(forward_logs(client.clone(), task.id.clone(), rx));
-        let cmd = exec::command(def, backend, ws, &env);
-        let outcome = exec::run(cmd, def.timeout.map(Duration::from_secs), tx).await;
-        let _ = forwarder.await;
-        let outcome = outcome?;
-        let duration_ms = outcome.duration.as_millis() as u64;
-        let log_bytes = outcome.log.into_bytes();
+        // The task's own retries, plus the job's automatic ones (merge queue).
+        let attempts = 1 + def.retries.unwrap_or(0) + job.flake_retries;
+        let mut log = String::new();
+        let mut failures: Vec<String> = Vec::new();
+        let mut duration_ms = 0u64;
+        let mut attempt = 0;
+        let outcome = loop {
+            attempt += 1;
+            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            let forwarder = tokio::spawn(forward_logs(client.clone(), task.id.clone(), rx));
+            let cmd = exec::command(def, backend, ws, &env);
+            let result = exec::run(cmd, def.timeout.map(Duration::from_secs), tx).await;
+            let _ = forwarder.await;
+            let outcome = result?;
+            duration_ms += outcome.duration.as_millis() as u64;
+            log.push_str(&outcome.log);
+            if (outcome.exit_code == Some(0) && !outcome.timed_out) || attempt >= attempts {
+                break outcome;
+            }
+            let why = match (outcome.timed_out, outcome.exit_code) {
+                (true, _) => "timed out".to_string(),
+                (_, Some(code)) => format!("exit {code}"),
+                _ => "killed by a signal".to_string(),
+            };
+            failures.push(format!("attempt {attempt}: {why}"));
+            let note = format!("\n[pit: attempt {attempt} failed ({why}); retrying]\n");
+            log.push_str(&note);
+            let _ = client
+                .post_empty(
+                    &format!("/api/tasks/{}/log", task.id),
+                    &LogChunk { text: note },
+                )
+                .await;
+            if def.cache == CacheMode::Remote && !job.no_cache {
+                files::clear_outputs(ws, &def.outputs)?;
+            }
+        };
+        let log_bytes = log.into_bytes();
         let log_digest = crate::cas::digest(&log_bytes);
         client
             .upload_missing(vec![(log_digest.clone(), log_bytes)])
@@ -607,7 +637,16 @@ impl Worker {
 
         let ok = outcome.exit_code == Some(0) && !outcome.timed_out;
         let mut message = outcome.timed_out.then(|| "timed out".to_string());
-        if ok && !job.no_cache {
+        if ok && !failures.is_empty() {
+            // Passed only on a retry: say so loudly so the flake gets fixed.
+            message = Some(format!(
+                "flaky: {}, passed on attempt {attempt}",
+                failures.join(", ")
+            ));
+        }
+        // A pass that needed a retry is not reused: later runs of the same
+        // inputs must run it again, so the flake keeps showing until fixed.
+        if ok && !job.no_cache && failures.is_empty() {
             match def.cache {
                 CacheMode::Remote => {
                     let outputs = files::collect_outputs(ws, &def.outputs)?;

@@ -9,7 +9,6 @@ against Pit on one machine, and a verdict backed by what was measured. Verdicts:
 | # | Pain point | Sources |
 | --- | --- | --- |
 | B1 | Push-and-pray dev loop: `git commit -m "try fix"`, wait 10 minutes, repeat; no way to run CI config locally | [HN 46908491](https://news.ycombinator.com/item?id=46908491), [Lobsters](https://lobste.rs/s/hkqnro/github_actions_is_slowly_killing_your) |
-| B2 | Flaky tests burn 15–25% of CI compute on reruns | [DEV.to](https://dev.to/byteframe/github-actions-slow-whats-actually-wasting-your-time-4elh) |
 | B3 | Logs of long builds (>10,000 lines) freeze the browser | [HN 46908491](https://news.ycombinator.com/item?id=46908491) |
 | B4 | Docker layer cache does not persist between runs | [Medium](https://medium.com/@akhilesh-mishra/your-github-actions-runners-are-slow-and-you-are-paying-too-much-for-them-5406577314fe) |
 | B5 | `actions/checkout` fails intermittently; release jobs scheduled twice | [HN 46614558](https://news.ycombinator.com/item?id=46614558) |
@@ -63,3 +62,61 @@ The reason is also on the task in the API and dashboard. Covered by the unit tes
 **Verdict: PARTIAL.** Silent misses: **SOLVED**. Random eviction: does not happen, but only
 because Pit never evicts at all, so its disk grows without bound (B8). A size-capped,
 least-recently-used eviction that reports what it evicted is still to do.
+
+## P2. A flaky test ejects innocent changes from the merge queue
+
+**Pain.** Flaky tests are said to burn 15–25% of CI compute on reruns
+([DEV.to](https://dev.to/byteframe/github-actions-slow-whats-actually-wasting-your-time-4elh)).
+In a merge queue it is worse: a flake fails the queued entry, the PR is ejected even
+though it did not touch the failing code, and every PR behind it is rebuilt. "A test that
+fails 5% of the time … has a 5% chance of blowing up the entire queue on every cycle"
+([tenki](https://tenki.cloud/blog/github-merge-queue-setup)). Reports from Sep–Oct 2026:
+5 of 12 failed merge groups in one day were flakes
+([awslabs/aidlc-workflows#1712](https://github.com/awslabs/aidlc-workflows/pull/1712)),
+four groups ejected in an hour at ~20 minutes each for everyone behind them
+([KeepOak/Branch-Agent#1152](https://github.com/KeepOak/Branch-Agent/pull/1152)), and
+silent drops while the PR page reads CLEAN ([cleat#3307](https://github.com/cleat-team/cleat/issues/3307)).
+See also [Mergify#5158](https://github.com/Mergifyio/mergify/discussions/5158),
+[aiur#4193](https://github.com/aiur-team/aiur/issues/4193),
+[intent#5249](https://github.com/intent-hq/intent/issues/5249),
+[learn-ukrainian#9069](https://github.com/learn-ukrainian/learn-ukrainian.github.io/pull/9069),
+[iterion#1410](https://github.com/SocialGouv/iterion/issues/1410).
+The fix teams converge on: retry once inside the queue only, flag the flake loudly, keep
+PR CI strict.
+
+**Reproduction** (`/tmp/painhunt/p2`): a task that fails the first attempt of every run
+("flaked: connection reset") and passes the second; queue a branch with an unrelated change.
+
+**Before** (feat/pit-mvp): the innocent change is ejected and never lands.
+
+```
+q_1c0c0ad3cdff   failed   innocent → main   default.flaky,default.unit   tests failed in run run_00a9587a48ff
+main has b.txt? 0
+```
+
+**Fix** (research/pain-hunt): merge queue runs get one automatic retry per task
+(`Job.flake_retries`); any task can opt into more with `retries: N`. A pass on a retry is
+reported as `flaky: attempt 1: exit 1, passed on attempt 2`, counted in `/api/stats`
+(`tasksFlaky`), shown in `pit run` and the dashboard, and **not cached**.
+
+```
+q_34de37c48c68   landed   innocent → main   tested
+main has b.txt? 1
+  flaky passed flaky: attempt 1: exit 1, passed on attempt 2
+log: flaked: connection reset / [pit: attempt 1 failed (exit 1); retrying] / pass on retry
+```
+
+The first version cached the flaky pass, so a strict `pit run` on the same tree was served
+from the cache and the flake disappeared. Flaky passes are no longer cached; on a second
+innocent change:
+
+```
+q_1f4f7b203856   landed   innocent2 → main   tested
+== strict local run on the landed tree
+    ✗ flaky                    7ms exit 1
+```
+
+Covered by the e2e test `merge_queue_retries_flakes_once_and_flags_them`.
+
+**Verdict: SOLVED** for ejection. Flaky tests still cost a retry each time they flake;
+Pit reports and counts them, but does not quarantine them automatically.

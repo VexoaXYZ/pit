@@ -64,6 +64,10 @@ pub struct TaskDef {
     /// Timeout in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// Extra attempts after a failure. A task that passes on a retry is
+    /// reported as flaky.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
@@ -185,6 +189,10 @@ pub struct Job {
     pub group: String,
     pub os: String,
     pub no_cache: bool,
+    /// Automatic retries for every task. Merge queue runs get one, so a flaky
+    /// test does not eject a change that did not cause it.
+    #[serde(default)]
+    pub flake_retries: u32,
     pub tasks: Vec<JobTask>,
 }
 

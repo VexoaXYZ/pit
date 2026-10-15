@@ -760,3 +760,82 @@ async fn stale_claims_cannot_report() {
         .unwrap();
     assert_eq!(v.status, Status::Passed);
 }
+
+/// A flaky test must not eject an innocent change from the merge queue: the
+/// queue retries once and lands it, flagged as flaky. Outside the queue the
+/// task stays strict, and the flaky pass is not served from the cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_queue_retries_flakes_once_and_flags_them() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let work = tmp.path().join("work");
+    let marks = tmp.path().join("marks");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&marks).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    // Fails the first attempt of every run, passes the second.
+    let flaky = format!(
+        r#"f={}/$PIT_RUN_ID; if [ -f $f ]; then exit 0; else touch $f; exit 1; fi"#,
+        marks.display()
+    );
+    let config =
+        serde_json::json!({ "tasks": { "flaky": { "run": flaky, "inputs": ["app/**"] } } });
+    write(&work, "pit.config.json", &config.to_string());
+    write(&work, "app/a.txt", "a\n");
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    sh(&work, "git checkout -q -b innocent && echo b > app/b.txt && git add -A && git commit -qm b && git push -q origin innocent && git checkout -q main");
+
+    let url = origin.to_string_lossy().to_string();
+    let _: QueueEntryView = pit
+        .client
+        .post(
+            "/api/queue",
+            &QueueAdd {
+                repo: "flaky".into(),
+                url: Some(url),
+                branch: Some("innocent".into()),
+                pr: None,
+                target: None,
+            },
+        )
+        .await
+        .unwrap();
+    let entry = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let entries: Vec<QueueEntryView> = pit.client.get("/api/queue").await.unwrap();
+            let e = entries
+                .into_iter()
+                .find(|e| e.source == "innocent")
+                .unwrap();
+            if matches!(e.status.as_str(), "landed" | "failed") {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("queue did not settle");
+    assert_eq!(
+        entry.status, "landed",
+        "a flake ejected an innocent change: {entry:?}"
+    );
+    let run: RunView = pit
+        .client
+        .get(&format!("/api/runs/{}", entry.run_id.unwrap()))
+        .await
+        .unwrap();
+    let task = &run.groups[0].tasks[0];
+    assert!(
+        task.message
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("flaky: attempt 1: exit 1, passed on attempt 2"),
+        "{task:?}"
+    );
+
+    // The same tree outside the queue: strict, and not served from the cache.
+    sh(&work, "git pull -q origin main");
+    let local = run(&pit, &work).await;
+    assert_eq!(local.status, Status::Failed);
+}

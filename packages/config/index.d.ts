@@ -38,6 +38,12 @@ export interface TaskDef {
   network?: boolean;
   /** Timeout in seconds. */
   timeout?: number;
+  /**
+   * Extra attempts after a failure. A task that only passes on a retry is
+   * reported as flaky. Merge queue runs always get one automatic retry, so a
+   * flake does not eject a change that did not cause it.
+   */
+  retries?: number;
 }
 
 export interface GroupDef {

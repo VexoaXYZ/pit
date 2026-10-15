@@ -599,6 +599,7 @@ impl Db {
             group: group_name,
             os: if os == "any" { worker.os.clone() } else { os },
             no_cache: run.no_cache,
+            flake_retries: u32::from(run.trigger == "queue"),
             tasks,
         }))
     }
@@ -892,6 +893,7 @@ impl Db {
             "tasks": count("SELECT COUNT(*) FROM tasks")?,
             "tasksCached": count("SELECT COUNT(*) FROM tasks WHERE status = 'cached'")?,
             "tasksRun": count("SELECT COUNT(*) FROM tasks WHERE status IN ('passed', 'failed')")?,
+            "tasksFlaky": count("SELECT COUNT(*) FROM tasks WHERE message LIKE 'flaky:%'")?,
             "cacheEntries": count("SELECT COUNT(*) FROM cache")?,
             "cacheHits": count("SELECT COALESCE(SUM(hits), 0) FROM cache")?,
             "timeSavedMs": count("SELECT COALESCE(SUM(json_extract(entry, '$.durationMs') * hits), 0) FROM cache")?,
