@@ -394,7 +394,8 @@ pub async fn queue_add(
 
 pub async fn queue_remove(client: &Client, dir: &Path, entry: &str) -> Result<i32> {
     // Branch names are scoped to this repo; entry ids work from anywhere.
-    let repo = crate::snapshot::identity(dir).await.map(|id| id.name).ok();
+    // The URL identifies the repo even when another checkout shares its name.
+    let repo = crate::snapshot::identity(dir).await.map(|id| id.url).ok();
     let mut path = format!("/api/queue/{}", crate::client::seg(entry)?);
     if let Some(repo) = repo {
         if let Ok(repo) = crate::client::seg(&repo) {

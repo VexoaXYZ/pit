@@ -8,7 +8,6 @@ against Pit on one machine, and a verdict backed by what was measured. Verdicts:
 
 | # | Pain point | Sources |
 | --- | --- | --- |
-| B5 | `actions/checkout` fails intermittently; release jobs scheduled twice | [HN 46614558](https://news.ycombinator.com/item?id=46614558) |
 | B6 | Bills keep climbing; teams move CI to one box for a warm cache | [HN 49612772](https://news.ycombinator.com/item?id=49612772) |
 
 ## P1. Cache misses are silent, and eviction makes them random
@@ -381,3 +380,57 @@ Covered by the e2e test `merge_queue_waits_out_an_origin_outage` and the unit te
 **Verdict: PARTIAL.** Running CI no longer depends on GitHub being up, and queued changes land
 as soon as it is back. But nothing can be merged or reported to GitHub during an outage (it is
 still the source of truth), and webhooks GitHub fails to deliver are not replayed by Pit.
+
+## P8. Checkouts are slow, and flaky
+
+**Pain.** Every GitHub Actions job clones fresh. On T3 Code's CI (Blacksmith runners, sparse
+checkout already on) `actions/checkout` takes 8 to 10 s in each of ~15 jobs (run 38701079905,
+see [bench/](../bench/README.md)). And it is flaky: "actions/checkout failing for no clear reason,
+sometimes only passing on the 3rd built-in retry" ([HN 46614558](https://news.ycombinator.com/item?id=46614558)).
+Anthropic's Scion post describes the same problem at scale: 25 million CI checkouts a day
+([Anthropic](https://www.anthropic.com/engineering/redesigning-source-control)).
+
+**Speed, measured on T3 Code** (28,081 files, 507 MB of history; workspace prepare time
+from Pit's own records):
+
+| Run | Prepare |
+| --- | --- |
+| First run ever on this worker (full clone from GitHub) | 184.8 s |
+| First move to a new commit | 3.2–3.4 s |
+| Every warm run after that | 332–376 ms |
+
+Against 8–10 s per job, every job, on GitHub.
+
+**Flakiness, reproduced** (`/tmp/painhunt/p8`): push a commit, make origin unreachable for
+about 2 s, and start a run on that commit (as a push webhook would).
+
+**Before** (research/pain-hunt at P7): no retry; the run errored at once.
+
+```
+error  git fetch -q --prune --no-tags origin failed …: fatal: '/tmp/painhunt/p8/origin.git' does not appear to be a git repository
+```
+
+**Fix:** fetches retry after 0.5 s, 1 s and 2 s (`git::retry`, used by every fetch on the
+server and workers).
+
+```
+… retrying in 500ms / retrying in 1000ms / retrying in 2000ms
+passed in 3929 ms
+```
+
+**A worse bug the reproduction exposed.** Repos were identified by directory name, so three
+unrelated scratch repos all called `work` (p6, p7, p8) shared one repo row and one mirror, each
+`pit run` overwriting the URL. Folder names like `app`, `api`, `web` collide easily. Now the
+URL decides identity: a different repo with a taken name is registered as `<name>-<hash>`.
+
+```
+   work         /tmp/painhunt/p8/origin.git
+   work-d17519  /tmp/painhunt/p7/origin.git
+```
+
+Covered by the unit tests `retry_survives_a_blip_and_gives_up_eventually` and
+`same_name_different_url_is_a_different_repo`.
+
+**Verdict: SOLVED** for speed after the first clone and for short network blips. Outages
+longer than the ~3.5 s of retries fail the run (the merge queue waits them out, P7). The
+first clone on a new worker is still a full clone; there are no partial or sparse clones yet.

@@ -277,10 +277,24 @@ impl Db {
 
     // ---- repos ----
 
+    /// Finds or registers a repo. With a URL, the URL decides identity: a
+    /// different repo that happens to share a name (two checkouts both called
+    /// `web`) gets its own row, named `<name>-<hash>`, instead of taking over
+    /// the existing one and its mirror.
     pub fn upsert_repo(&self, name: &str, url: Option<&str>, github: Option<&str>) -> Result<Repo> {
         let c = self.conn.lock();
-        let existing = c
-            .query_row(
+        let by_url = match url {
+            Some(u) => c
+                .query_row(
+                    "SELECT id, name, url, github FROM repos WHERE url = ?1 ORDER BY created_at LIMIT 1",
+                    params![u],
+                    |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, url: r.get(2)?, github: r.get(3)? }),
+                )
+                .optional()?,
+            None => None,
+        };
+        let by_name = || {
+            c.query_row(
                 "SELECT id, name, url, github FROM repos WHERE name = ?1",
                 params![name],
                 |r| {
@@ -292,23 +306,30 @@ impl Db {
                     })
                 },
             )
-            .optional()?;
+            .optional()
+        };
+        let existing = match by_url {
+            Some(repo) => Some(repo),
+            None => by_name()?,
+        };
+        let mut name = name.to_string();
         if let Some(mut repo) = existing {
-            if let Some(url) = url.filter(|u| *u != repo.url) {
-                c.execute(
-                    "UPDATE repos SET url = ?1 WHERE id = ?2",
-                    params![url, repo.id],
-                )?;
-                repo.url = url.to_string();
+            match url {
+                // Same name, different repository: register it separately.
+                Some(u) if u != repo.url => {
+                    name = format!("{name}-{}", &crate::cas::digest(u.as_bytes())[..6])
+                }
+                _ => {
+                    if let Some(gh) = github.filter(|g| repo.github.as_deref() != Some(*g)) {
+                        c.execute(
+                            "UPDATE repos SET github = ?1 WHERE id = ?2",
+                            params![gh, repo.id],
+                        )?;
+                        repo.github = Some(gh.to_string());
+                    }
+                    return Ok(repo);
+                }
             }
-            if let Some(gh) = github.filter(|g| repo.github.as_deref() != Some(*g)) {
-                c.execute(
-                    "UPDATE repos SET github = ?1 WHERE id = ?2",
-                    params![gh, repo.id],
-                )?;
-                repo.github = Some(gh.to_string());
-            }
-            return Ok(repo);
         }
         let url =
             url.with_context(|| format!("unknown repo {name:?}; pass its url to register it"))?;
@@ -319,7 +340,7 @@ impl Db {
         )?;
         Ok(Repo {
             id,
-            name: name.into(),
+            name,
             url: url.into(),
             github: github.map(String::from),
         })
@@ -328,7 +349,7 @@ impl Db {
     pub fn repo(&self, id: &str) -> Result<Repo> {
         let c = self.conn.lock();
         c.query_row(
-            "SELECT id, name, url, github FROM repos WHERE id = ?1 OR name = ?1",
+            "SELECT id, name, url, github FROM repos WHERE id = ?1 OR name = ?1 OR url = ?1 ORDER BY created_at LIMIT 1",
             params![id],
             |r| {
                 Ok(Repo {
@@ -1161,5 +1182,37 @@ mod tests {
         assert_eq!(job.group_id, linux);
         assert!(db.heartbeat_group(&job.group_id, Some(&job.lease)).unwrap());
         assert!(!db.heartbeat_group(&job.group_id, Some("stale")).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod repo_identity_tests {
+    use super::*;
+
+    #[test]
+    fn same_name_different_url_is_a_different_repo() {
+        let db = Db::memory().unwrap();
+        let a = db
+            .upsert_repo("work", Some("/tmp/a/origin.git"), None)
+            .unwrap();
+        let b = db
+            .upsert_repo("work", Some("/tmp/b/origin.git"), None)
+            .unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(
+            a.url, "/tmp/a/origin.git",
+            "first repo's URL must not be overwritten"
+        );
+        assert!(b.name.starts_with("work-"));
+        // The same URL finds the same repo again, whatever name it is given.
+        assert_eq!(
+            db.upsert_repo("work", Some("/tmp/b/origin.git"), None)
+                .unwrap()
+                .id,
+            b.id
+        );
+        assert_eq!(db.repo("/tmp/b/origin.git").unwrap().id, b.id);
+        // Without a URL, the name is enough.
+        assert_eq!(db.upsert_repo("work", None, None).unwrap().id, a.id);
     }
 }

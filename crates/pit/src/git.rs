@@ -82,9 +82,33 @@ pub async fn ensure_mirror(dir: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fetches from origin, retrying a failed fetch after 0.5 s, 1 s and 2 s, so
+/// a network blip does not fail a run.
 pub async fn fetch(dir: &Path) -> Result<()> {
-    git(dir, &["fetch", "-q", "--prune", "--no-tags", "origin"]).await?;
-    Ok(())
+    retry(|| async {
+        git(dir, &["fetch", "-q", "--prune", "--no-tags", "origin"])
+            .await
+            .map(|_| ())
+    })
+    .await
+}
+
+pub async fn retry<F, Fut, T>(mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let delays = [500u64, 1000, 2000];
+    for delay in delays {
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                tracing::warn!("{e:#}; retrying in {delay}ms");
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+        }
+    }
+    attempt().await
 }
 
 /// Makes sure the mirror has `sha`, fetching only when it does not.
@@ -249,4 +273,35 @@ pub async fn ls_files(dir: &Path) -> Result<Vec<IndexEntry>> {
 pub async fn toplevel(dir: &Path) -> Result<std::path::PathBuf> {
     let out = git(dir, &["rev-parse", "--show-toplevel"]).await?;
     Ok(std::path::PathBuf::from(out.trim()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_survives_a_blip_and_gives_up_eventually() {
+        let mut calls = 0;
+        let out = retry(|| {
+            calls += 1;
+            let n = calls;
+            async move {
+                if n < 3 {
+                    anyhow::bail!("blip {n}")
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 3);
+        let mut calls = 0;
+        let out: Result<()> = retry(|| {
+            calls += 1;
+            async { anyhow::bail!("down") }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls, 4);
+    }
 }
