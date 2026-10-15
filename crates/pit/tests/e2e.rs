@@ -1741,7 +1741,7 @@ async fn fork_pull_requests_run_on_a_label_without_secrets() {
     .unwrap();
     // Fork code only runs in a container; without Docker it does not run.
     let task = &view.groups[0].tasks[0];
-    if view.status == Status::Error {
+    if task.status == Status::Error {
         let msg = task.message.as_deref().unwrap_or_default();
         assert!(msg.contains("docker"), "{view:?}");
     } else {
