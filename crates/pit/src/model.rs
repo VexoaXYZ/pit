@@ -74,6 +74,14 @@ pub struct TaskDef {
     /// reported as flaky.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
+    /// Split the task into this many shards. Each runs in its own group (so
+    /// shards spread across workers) with `PIT_SHARD` (1-based) and
+    /// `PIT_SHARD_COUNT` set, e.g. `vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shards: Option<u32>,
+    /// Which shard this is; set by Pit when it plans a sharded task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]

@@ -1164,3 +1164,39 @@ async fn secrets_are_masked_in_logs() {
         "{log}"
     );
 }
+
+/// `shards: N` runs a task as N groups, each told its shard by `PIT_SHARD`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sharded_tasks_run_each_shard_once() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        repo.path(),
+        "pit.config.json",
+        r#"{"tasks":{"test":{"run":"echo shard=$PIT_SHARD/$PIT_SHARD_COUNT","shards":3,"cache":false}}}"#,
+    );
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run(&pit, repo.path()).await;
+    assert_eq!(view.status, Status::Passed);
+    let mut seen = vec![];
+    for g in &view.groups {
+        let log = pit
+            .client
+            .get_text(&format!("/api/tasks/{}/log", g.tasks[0].id))
+            .await
+            .unwrap();
+        seen.push((g.name.clone(), log.trim().to_string()));
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("default#1".to_string(), "shard=1/3".to_string()),
+            ("default#2".to_string(), "shard=2/3".to_string()),
+            ("default#3".to_string(), "shard=3/3".to_string())
+        ]
+    );
+}

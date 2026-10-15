@@ -92,6 +92,7 @@ export default {
 | `image` | Container image; implies `backend: "docker"`. |
 | `network` | `false` cuts network access in `sandbox` and `docker`. |
 | `timeout` | Seconds. The whole process group is killed. |
+| `shards` | Split the task into N groups that spread across workers; each gets `PIT_SHARD` and `PIT_SHARD_COUNT` (`vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`). |
 | `retries` | Extra attempts after a failure. A pass on a retry is reported as `flaky:` and is not cached. |
 
 ### Docker builds

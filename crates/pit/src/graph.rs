@@ -21,6 +21,19 @@ pub fn validate(config: &PitConfig) -> Result<()> {
                     );
                 }
             }
+            // A sharded task is spread over several groups, so nothing in
+            // its own group can wait for all of its shards.
+            if task.shards.unwrap_or(1) > 1 {
+                if let Some((other, _)) = group.tasks.iter().find(|(_, t)| t.deps.contains(tname)) {
+                    bail!(
+                        "task {gname}.{other} depends on {tname}, which is sharded; \
+                         tasks cannot depend on a sharded task"
+                    );
+                }
+            }
+            if task.shards == Some(0) {
+                bail!("task {gname}.{tname}: shards must be at least 1");
+            }
             for pattern in task.inputs.iter().flatten().chain(&task.outputs) {
                 Glob::new(pattern.strip_prefix('!').unwrap_or(pattern)).map_err(|e| {
                     anyhow::anyhow!("task {gname}.{tname}: bad glob {pattern:?}: {e}")
@@ -115,17 +128,73 @@ pub fn plan(config: &PitConfig, selected: &[String]) -> Result<Vec<PlannedGroup>
             } else {
                 gname.clone()
             };
-            groups.push(PlannedGroup {
-                name,
-                os: os.clone(),
-                tasks: tasks.clone(),
-            });
+            groups.extend(shard_groups(&name, os, &tasks));
         }
     }
     if let Some(missing) = selected.iter().find(|s| !matched.contains(s.as_str())) {
         bail!("no task named {missing:?} in the pit config");
     }
     Ok(groups)
+}
+
+/// Expands a group with sharded tasks into one group per shard (`ci#1`,
+/// `ci#2`, ...). Each shard group gets the shard of every sharded task plus
+/// their deps (setup is repeated per shard, and shared through the cache);
+/// the group's other tasks go into the first shard.
+fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<PlannedGroup> {
+    let count = tasks
+        .iter()
+        .map(|(_, t)| t.shards.unwrap_or(1))
+        .max()
+        .unwrap_or(1);
+    if count <= 1 {
+        return vec![PlannedGroup {
+            name: name.to_string(),
+            os: os.to_string(),
+            tasks: tasks.to_vec(),
+        }];
+    }
+    let by_name: BTreeMap<String, TaskDef> = tasks.iter().cloned().collect();
+    let sharded: Vec<&(String, TaskDef)> = tasks
+        .iter()
+        .filter(|(_, t)| t.shards.unwrap_or(1) > 1)
+        .collect();
+    let mut setup = BTreeSet::new();
+    for (_, t) in &sharded {
+        for d in &t.deps {
+            add_with_deps(d, &by_name, &mut setup);
+        }
+    }
+    (1..=count)
+        .map(|k| {
+            let tasks = tasks
+                .iter()
+                .filter_map(|(n, t)| {
+                    let shards = t.shards.unwrap_or(1);
+                    if shards > 1 {
+                        (k <= shards).then(|| {
+                            (
+                                n.clone(),
+                                TaskDef {
+                                    shard: Some(k),
+                                    ..t.clone()
+                                },
+                            )
+                        })
+                    } else if setup.contains(n) || k == 1 {
+                        Some((n.clone(), t.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            PlannedGroup {
+                name: format!("{name}#{k}"),
+                os: os.to_string(),
+                tasks,
+            }
+        })
+        .collect()
 }
 
 fn add_with_deps(name: &str, tasks: &BTreeMap<String, TaskDef>, keep: &mut BTreeSet<String>) {
@@ -229,6 +298,7 @@ struct ConfigMaterial<'a> {
     image: Option<&'a str>,
     network: Option<bool>,
     timeout: Option<u64>,
+    shard: Option<(u32, u32)>,
     env: Vec<(&'a str, String)>,
     /// Names only: secret values never enter the key.
     secrets: &'a [String],
@@ -285,6 +355,7 @@ pub fn key_inputs(
         image: task.image.as_deref(),
         network: task.network,
         timeout: task.timeout,
+        shard: task.shard.map(|k| (k, task.shards.unwrap_or(1))),
         env,
         secrets: &task.secrets,
     };
@@ -484,6 +555,60 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn sharded_tasks_split_into_groups_with_their_setup() {
+        let mut tasks = BTreeMap::new();
+        tasks.insert("install".into(), task("i", &[], None));
+        tasks.insert("lint".into(), task("l", &["install"], None));
+        let mut test = task("t", &["install"], None);
+        test.shards = Some(3);
+        tasks.insert("test".into(), test);
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "ci".into(),
+            GroupDef {
+                os: vec!["linux".into()],
+                tasks,
+                ..Default::default()
+            },
+        );
+        let config = PitConfig {
+            groups,
+            ..Default::default()
+        };
+        let planned = plan(&config, &[]).unwrap();
+        let names: Vec<_> = planned.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["ci#1", "ci#2", "ci#3"]);
+        let tasks_of = |i: usize| {
+            planned[i]
+                .tasks
+                .iter()
+                .map(|(n, t)| (n.as_str(), t.shard))
+                .collect::<Vec<_>>()
+        };
+        // Setup in every shard, lint once, each shard its own index.
+        assert_eq!(
+            tasks_of(0),
+            vec![("install", None), ("lint", None), ("test", Some(1))]
+        );
+        assert_eq!(tasks_of(2), vec![("install", None), ("test", Some(3))]);
+        // Shards never share a cache key.
+        let key =
+            |i: usize| action_key(&planned[i].tasks.last().unwrap().1, "linux", &[], &[]).unwrap();
+        assert_ne!(key(0), key(1));
+        // Nothing may depend on a sharded task.
+        let mut bad = config.clone();
+        bad.groups
+            .get_mut("ci")
+            .unwrap()
+            .tasks
+            .get_mut("lint")
+            .unwrap()
+            .deps
+            .push("test".into());
+        assert!(validate(&bad).unwrap_err().to_string().contains("sharded"));
     }
 
     #[test]

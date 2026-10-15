@@ -604,6 +604,11 @@ impl Worker {
             ("PIT_TASK".into(), task.name.clone()),
             ("PIT_RUN_ID".into(), job.run_id.clone()),
             ("PIT_SHA".into(), job.sha.clone()),
+            ("PIT_SHARD".into(), def.shard.unwrap_or(1).to_string()),
+            (
+                "PIT_SHARD_COUNT".into(),
+                def.shards.unwrap_or(1).to_string(),
+            ),
         ];
         // Never hand Pit's own settings (API token) back through `env`. Windows
         // variable names are case-insensitive, so compare uppercased.

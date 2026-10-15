@@ -49,6 +49,14 @@ export interface TaskDef {
    * flake does not eject a change that did not cause it.
    */
   retries?: number;
+  /**
+   * Split the task into this many shards, each in its own group so they spread
+   * across workers. Each gets `PIT_SHARD` (1-based) and `PIT_SHARD_COUNT`:
+   * `vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`. The task's deps run in every
+   * shard (and come from the cache after the first). No task may depend on a
+   * sharded task.
+   */
+  shards?: number;
 }
 
 export interface GroupDef {

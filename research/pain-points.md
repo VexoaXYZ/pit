@@ -676,3 +676,52 @@ other way (hex, split across lines) or send it over the network. The real protec
 running untrusted code with secrets (Pit does not run fork PRs automatically) and short-lived
 credentials. Logs stored before a variable was declared under `secrets` are not rewritten, and
 values declared under plain `env` are not masked.
+
+## P14. Slow test suites need hand-built sharding
+
+**Pain.** Jest, Vitest and Playwright all support `--shard=i/n`, but on GitHub Actions each repo
+wires it up by hand: a `strategy.matrix` of shard indexes, `fail-fast: false`, the build and
+install repeated in every matrix job, reports merged afterwards, and shard counts that need
+maintaining as the suite grows ([Playwright docs](https://playwright.dev/docs/test-sharding),
+[Vitest#4752](https://github.com/vitest-dev/vitest/discussions/4752),
+[WarpBuild](https://www.warpbuild.com/blog/concurrent-tests),
+[oneuptime](https://oneuptime.com/blog/post/2025-12-20-github-actions-parallel-tests/view),
+[bug0](https://bug0.com/blog/playwright-test-sharding-guide),
+[remarkablemark](https://remarkablemark.org/blog/2022/05/13/jest-shard-test-github-actions/),
+[Tim Deschryver](https://timdeschryver.dev/blog/using-playwright-test-shards-in-combination-with-a-job-matrix-to-improve-your-ci-speed),
+[Lewis](https://lewis-38728.medium.com/speeding-up-playwright-tests-with-dynamic-sharding-in-github-actions-91906aa9ed8f),
+[Abigail Armijo](https://abigailarmijo.substack.com/p/github-actions-part-3-shard-your)).
+T3 Code's own CI shards its server tests six ways with a hand-written weighted sequencer
+(`.github/workflows/ci.yml`, `test_server`).
+
+**Reproduction** (`/tmp/painhunt/p14`): a suite of four 3 s test files behind a tiny runner that
+understands `--shard=i/n`; two workers with two slots each.
+
+**Before** (research/pain-hunt at P13): Pit had no way to split a task, so the suite ran as one
+task on one worker while three slots sat idle.
+
+```
+passed in 12.6s · 1 ran, 0 cached
+```
+
+**Fix** (research/pain-hunt): `shards: N` on a task. The planner turns its group into `ci#1` …
+`ci#N`, each with that task's shard plus its deps (setup repeats per shard and comes from the
+cache after the first); the group's other tasks go in the first shard. Each shard gets
+`PIT_SHARD` and `PIT_SHARD_COUNT`, and the shard is part of the cache key. Shard groups are
+ordinary groups, so they spread across workers and each keeps its own warm worker (P11).
+
+```
+  default#1 on local    default#2 on w2    default#3 on w2    default#4 on local
+    ✓ test 3.0s   ✓ test 3.0s   ✓ test 3.1s   ✓ test 3.1s
+passed in 4.0s · 4 ran, 0 cached
+-- each shard's log: "test file 1 ok" … "test file 4 ok"
+```
+
+12.6 s → 4.0 s. Covered by the unit test `sharded_tasks_split_into_groups_with_their_setup` and
+the e2e test `sharded_tasks_run_each_shard_once`.
+
+**Verdict: SOLVED** for splitting and spreading. Not done: choosing the shard count or balancing
+shards by past durations (the runner's own `--shard` decides which tests go where), and merging
+per-shard reports. No task may depend on a sharded task, so a "merge reports" step has to live
+outside the pipeline for now. The CLI prints each shard's task as `test`; the group name
+(`default#2`) is on the line above.
