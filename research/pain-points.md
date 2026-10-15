@@ -6,9 +6,7 @@ against Pit on one machine, and a verdict backed by what was measured. Verdicts:
 
 ## Backlog (not yet tested)
 
-| # | Pain point | Sources |
-| --- | --- | --- |
-| B6 | Bills keep climbing; teams move CI to one box for a warm cache | [HN 49612772](https://news.ycombinator.com/item?id=49612772) |
+All items from the first backlog have been tested (P1–P15).
 
 ## P1. Cache misses are silent, and eviction makes them random
 
@@ -725,3 +723,45 @@ shards by past durations (the runner's own `--shard` decides which tests go wher
 per-shard reports. No task may depend on a sharded task, so a "merge reports" step has to live
 outside the pipeline for now. The CLI prints each shard's task as `test`; the group name
 (`default#2`) is on the line above.
+
+## P15. CI bills keep climbing
+
+**Pain.** Teams move CI onto one box with a fixed monthly cost because the bill keeps growing,
+and get faster builds from a warm cache as a side effect
+([HN 49612772](https://news.ycombinator.com/item?id=49612772)). In December 2025 GitHub announced
+a $0.002/minute platform charge for self-hosted runners from March 2026, then shelved it within
+48 hours after backlash ("an unnecessary cash grab", [community#182089](https://github.com/orgs/community/discussions/182089));
+as of October 2026 self-hosted minutes are still free but GitHub has not withdrawn the idea, and
+hosted Linux 2-core minutes cost $0.006 ([devclass](https://www.devclass.com/development/2025/12/17/github-to-charge-for-self-hosted-runners-from-march-2026/1734518),
+[samexpert](https://samexpert.com/github-actions-pricing-backlash-2026/),
+[bex](https://bex.co/blog/2026/09/19/github-self-hosted-runner-charge-reversal),
+[tenki](https://www.tenki.cloud/blog/github-actions-runner-pricing-2026),
+[craci](https://craci.com/compare/github-actions-runner-providers),
+[OpenMetal](https://openmetal.io/resources/blog/the-real-cost-math-behind-self-hosted-github-actions-runners/),
+[StarSling](https://starsling.dev/github-actions-pricing),
+[Platform Engineering](https://theplatformengineering.substack.com/p/github-actions-2026-pricing-changes)).
+(An earlier search summary in this hunt said the fee was in effect; it is not.)
+
+**Measured.** One T3 Code CI run on GitHub (run 38701079905, Blacksmith runners): 17 jobs,
+1,416 runner-seconds, 34 billed runner-minutes (rounded up per job), 166 vCPU-minutes, of which
+about 434 s (31%) is checkout and dependency install repeated in every job. On Pit, from this
+hunt:
+
+| What changed in the push | Machine time on Pit |
+| --- | --- |
+| Nothing a task reads (rerun, docs, other packages) | about 1 s, or none if the server answers from cache (P1, P10, P12) |
+| Dependencies unchanged, code changed | the tasks' own run time; no checkout or install (P8, P11) |
+| A newer push to the same branch | older runs stopped within a heartbeat (P9) |
+
+**A bug in Pit's own numbers.** `/api/stats` computed "time saved" from the cache entries that
+still exist, so eviction (P4) erased the history: after the 20 MB limit evicted the T3 Code
+entries, the whole session reported 22 s saved. Fixed: hits and time saved are running counters
+updated on every hit. Live check: three cached reruns gave `hits=4 timeSaved=6.1s`; after
+evicting all 24 entries the counters still read `hits=4 timeSaved=6.1s`. Stats also report
+`workerTimeMs` and `supersededRuns`. Covered by the unit test `time_saved_survives_eviction`.
+
+**Verdict: PARTIAL.** Pit is self-hosted and outside Actions, so there is no per-minute charge,
+and it removes the repeated setup (31% of T3 Code's runner time) plus all work whose inputs did
+not change. But code changes still cost their real compute, Pit's machines are a fixed cost you
+run and size yourself, and this hunt did not measure dollars against a real team's month of
+pushes.

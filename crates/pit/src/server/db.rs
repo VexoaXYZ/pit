@@ -110,6 +110,12 @@ CREATE TABLE IF NOT EXISTS kv (
   PRIMARY KEY (ns, key)
 );
 
+-- Running totals for /api/stats that must survive cache eviction.
+CREATE TABLE IF NOT EXISTS counters (
+  name TEXT PRIMARY KEY,
+  value INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS workers (
   name TEXT PRIMARY KEY,
   info TEXT NOT NULL,
@@ -975,13 +981,22 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?;
-        if entry.is_some() {
+        let entry: Option<CacheEntry> = entry.and_then(|e| serde_json::from_str(&e).ok());
+        if let Some(e) = &entry {
             c.execute(
                 "UPDATE cache SET hits = hits + 1, last_hit_at = ?1 WHERE action_key = ?2",
                 params![now_ms(), key],
             )?;
+            // Totals live apart from the entry, so evicting it keeps the history.
+            for (name, by) in [("cacheHits", 1i64), ("timeSavedMs", e.duration_ms as i64)] {
+                c.execute(
+                    "INSERT INTO counters (name, value) VALUES (?1, ?2)
+                     ON CONFLICT(name) DO UPDATE SET value = value + ?2",
+                    params![name, by],
+                )?;
+            }
         }
-        Ok(entry.and_then(|e| serde_json::from_str(&e).ok()))
+        Ok(entry)
     }
 
     /// Reads a cache entry without counting it as a hit.
@@ -1132,8 +1147,10 @@ impl Db {
             "tasksRun": count("SELECT COUNT(*) FROM tasks WHERE status IN ('passed', 'failed')")?,
             "tasksFlaky": count("SELECT COUNT(*) FROM tasks WHERE message LIKE 'flaky:%'")?,
             "cacheEntries": count("SELECT COUNT(*) FROM cache")?,
-            "cacheHits": count("SELECT COALESCE(SUM(hits), 0) FROM cache")?,
-            "timeSavedMs": count("SELECT COALESCE(SUM(json_extract(entry, '$.durationMs') * hits), 0) FROM cache")?,
+            "cacheHits": count("SELECT COALESCE((SELECT value FROM counters WHERE name = 'cacheHits'), 0)")?,
+            "timeSavedMs": count("SELECT COALESCE((SELECT value FROM counters WHERE name = 'timeSavedMs'), 0)")?,
+            "workerTimeMs": count("SELECT COALESCE(SUM(duration_ms), 0) FROM tasks WHERE status IN ('passed', 'failed')")?,
+            "supersededRuns": count("SELECT COUNT(*) FROM runs WHERE message LIKE 'superseded by %'")?,
             "remoteCacheArtifacts": count("SELECT COUNT(*) FROM kv")?,
         }))
     }
@@ -1398,5 +1415,31 @@ mod affinity_tests {
             )
             .unwrap();
         assert_eq!(db.claim_group(&cold).unwrap().0.unwrap().run_id, run3);
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn time_saved_survives_eviction() {
+        let db = Db::memory().unwrap();
+        db.cache_put(
+            "k",
+            &CacheEntry {
+                log_digest: None,
+                outputs: vec![],
+                duration_ms: 90_000,
+                inputs: None,
+            },
+        )
+        .unwrap();
+        db.cache_get("k").unwrap().unwrap();
+        db.cache_get("k").unwrap().unwrap();
+        assert_eq!(db.evict_lru(10).unwrap(), 1);
+        let s = db.stats().unwrap();
+        assert_eq!(s["cacheHits"], 2);
+        assert_eq!(s["timeSavedMs"], 180_000);
     }
 }
