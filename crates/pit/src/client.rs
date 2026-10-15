@@ -13,30 +13,50 @@ use crate::model::*;
 pub struct Client {
     pub base: String,
     token: Option<String>,
+    /// Sent as `x-pit-lease` on job updates (see `Job::lease`).
+    lease: Option<String>,
     http: reqwest::Client,
 }
 
 /// Percent-encodes one URL path segment, so caller-supplied ids cannot
-/// change which endpoint is called.
-pub fn seg(s: &str) -> String {
+/// change which endpoint is called. `.` and `..` are rejected outright: URL
+/// parsers treat even their encoded forms as dot segments.
+pub fn seg(s: &str) -> Result<String> {
+    if s.is_empty()
+        || s == "."
+        || s == ".."
+        || s.eq_ignore_ascii_case("%2e")
+        || s.eq_ignore_ascii_case("%2e%2e")
+    {
+        bail!("invalid identifier {s:?}");
+    }
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        if b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'_' | b'.' | b'~') && s != "." && s != ".."
-        {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
         }
     }
-    out
+    Ok(out)
 }
 
+pub const LEASE_HEADER: &str = "x-pit-lease";
+
 impl Client {
+    /// A client whose requests prove they come from the current claim of a group.
+    pub fn with_lease(&self, lease: &str) -> Client {
+        Client {
+            lease: Some(lease.to_string()),
+            ..self.clone()
+        }
+    }
+
     pub fn new(base: &str, token: Option<String>) -> Result<Client> {
         Ok(Client {
             base: base.trim_end_matches('/').to_string(),
             token,
+            lease: None,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .pool_idle_timeout(Duration::from_secs(90))
@@ -45,7 +65,10 @@ impl Client {
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let r = self.http.request(method, format!("{}{path}", self.base));
+        let mut r = self.http.request(method, format!("{}{path}", self.base));
+        if let Some(lease) = &self.lease {
+            r = r.header(LEASE_HEADER, lease);
+        }
         match &self.token {
             Some(t) => r.bearer_auth(t),
             None => r,
@@ -246,9 +269,19 @@ impl Client {
 mod tests {
     #[test]
     fn path_segments_cannot_escape() {
-        assert_eq!(super::seg("ci.test"), "ci.test");
-        assert_eq!(super::seg("x/../../queue"), "x%2F..%2F..%2Fqueue");
-        assert_eq!(super::seg(".."), "%2E%2E");
-        assert_eq!(super::seg("a?b#c"), "a%3Fb%23c");
+        use super::seg;
+        assert_eq!(seg("ci.test").unwrap(), "ci.test");
+        assert_eq!(seg("a?b#c").unwrap(), "a%3Fb%23c");
+        assert!(seg("..").is_err() && seg(".").is_err() && seg("").is_err());
+        // What matters is the URL that is actually requested.
+        for (input, want) in [
+            ("x/../../queue", "/api/runs/x%2F..%2F..%2Fqueue/log"),
+            ("..a", "/api/runs/..a/log"),
+        ] {
+            let url =
+                reqwest::Url::parse(&format!("http://h/api/runs/{}/log", seg(input).unwrap()))
+                    .unwrap();
+            assert_eq!(url.path(), want);
+        }
     }
 }

@@ -235,8 +235,11 @@ impl Worker {
     }
 
     pub async fn execute(self: Arc<Self>, job: Job) -> Result<Status> {
+        // Every update for this job carries its lease, so a worker that lost
+        // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
+        let client = self.client.with_lease(&job.lease);
         let hb = {
-            let client = self.client.clone();
+            let client = client.clone();
             let gid = job.group_id.clone();
             tokio::spawn(async move {
                 loop {
@@ -270,7 +273,7 @@ impl Worker {
         hb.abort();
         drop(lease);
         let status = result.status;
-        self.client
+        client
             .post_empty(&format!("/api/groups/{}/finish", job.group_id), &result)
             .await?;
         Ok(status)
@@ -360,6 +363,9 @@ impl Worker {
         ws: &Path,
         files: Arc<Vec<(String, String)>>,
     ) -> Status {
+        // Every update for this job carries its lease, so a worker that lost
+        // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
+        let client = self.client.with_lease(&job.lease);
         let warm_path = warm_file(ws);
         let warm: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(
             std::fs::read(&warm_path)
@@ -388,8 +394,7 @@ impl Worker {
                         log_digest: None,
                         message: Some("a dependency failed".into()),
                     };
-                    let _ = self
-                        .client
+                    let _ = client
                         .post_empty(&format!("/api/tasks/{}/finish", t.id), &r)
                         .await;
                     continue;
@@ -423,6 +428,7 @@ impl Worker {
                                     };
                                     let _ = w
                                         .client
+                                        .with_lease(&job.lease)
                                         .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
                                         .await;
                                     (Status::Error, None)
@@ -460,9 +466,12 @@ impl Worker {
         dep_keys: &[String],
         warm: &Mutex<HashMap<String, String>>,
     ) -> Result<(Status, Option<String>)> {
+        // Every update for this job carries its lease, so a worker that lost
+        // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
+        let client = self.client.with_lease(&job.lease);
         let def = &task.def;
         let key = crate::graph::action_key(def, &job.os, files, dep_keys)?;
-        self.client
+        client
             .post_empty(
                 &format!("/api/tasks/{}/start", task.id),
                 &TaskStart {
@@ -486,8 +495,7 @@ impl Worker {
         if !job.no_cache {
             match def.cache {
                 CacheMode::Remote => {
-                    if let Some(entry) = self
-                        .client
+                    if let Some(entry) = client
                         .get_opt::<CacheEntry>(&format!("/api/cache/{key}"))
                         .await?
                     {
@@ -514,7 +522,7 @@ impl Worker {
                             entry.log_digest.clone(),
                             Some(msg),
                         );
-                        self.client
+                        client
                             .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
                             .await?;
                         return Ok((Status::Cached, Some(key)));
@@ -529,7 +537,7 @@ impl Worker {
                             None,
                             Some("unchanged since this warm workspace last ran it".into()),
                         );
-                        self.client
+                        client
                             .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
                             .await?;
                         return Ok((Status::Cached, Some(key)));
@@ -557,14 +565,19 @@ impl Worker {
             ("PIT_RUN_ID".into(), job.run_id.clone()),
             ("PIT_SHA".into(), job.sha.clone()),
         ];
-        // Never hand Pit's own settings (API token) back through `env`.
-        for k in def.env.iter().filter(|k| !k.starts_with("PIT_")) {
+        // Never hand Pit's own settings (API token) back through `env`. Windows
+        // variable names are case-insensitive, so compare uppercased.
+        for k in def
+            .env
+            .iter()
+            .filter(|k| !k.to_ascii_uppercase().starts_with("PIT_"))
+        {
             if let Ok(v) = std::env::var(k) {
                 env.push((k.clone(), v));
             }
         }
         let (tx, rx) = mpsc::unbounded_channel::<String>();
-        let forwarder = tokio::spawn(forward_logs(self.client.clone(), task.id.clone(), rx));
+        let forwarder = tokio::spawn(forward_logs(client.clone(), task.id.clone(), rx));
         let cmd = exec::command(def, backend, ws, &env);
         let outcome = exec::run(cmd, def.timeout.map(Duration::from_secs), tx).await;
         let _ = forwarder.await;
@@ -572,7 +585,7 @@ impl Worker {
         let duration_ms = outcome.duration.as_millis() as u64;
         let log_bytes = outcome.log.into_bytes();
         let log_digest = crate::cas::digest(&log_bytes);
-        self.client
+        client
             .upload_missing(vec![(log_digest.clone(), log_bytes)])
             .await?;
 
@@ -595,13 +608,13 @@ impl Worker {
                         });
                         blobs.push((digest, bytes));
                     }
-                    self.client.upload_missing(blobs).await?;
+                    client.upload_missing(blobs).await?;
                     let entry = CacheEntry {
                         log_digest: Some(log_digest.clone()),
                         outputs: manifest,
                         duration_ms,
                     };
-                    self.client
+                    client
                         .put_json(&format!("/api/cache/{key}"), &entry)
                         .await?;
                 }
@@ -628,7 +641,7 @@ impl Worker {
             Some(log_digest),
             message,
         );
-        self.client
+        client
             .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
             .await?;
         Ok((status, Some(key)))

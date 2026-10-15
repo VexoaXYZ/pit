@@ -279,12 +279,29 @@ fn read_task_log(app: &App, task_id: &str) -> anyhow::Result<String> {
     app.db.live_log(task_id)
 }
 
+/// Job updates must come from the group's current claim.
+fn check_lease(app: &App, group_id: &str, headers: &HeaderMap) -> ApiResult<()> {
+    let lease = headers
+        .get(crate::client::LEASE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    if app.db.lease_ok(group_id, lease)? {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("group {group_id} is no longer claimed by this worker"),
+        ))
+    }
+}
+
 async fn append_log(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(chunk): Json<LogChunk>,
 ) -> ApiResult<StatusCode> {
     let (group_id, run_id, _) = app.db.task_group(&id)?;
+    check_lease(&app, &group_id, &headers)?;
     app.db.append_log(&id, &chunk.text)?;
     app.emit(
         "task.log",
@@ -299,9 +316,11 @@ async fn append_log(
 async fn start_task(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<TaskStart>,
 ) -> ApiResult<StatusCode> {
     let (group_id, run_id, name) = app.db.task_group(&id)?;
+    check_lease(&app, &group_id, &headers)?;
     app.db.start_task(&id, req.action_key.as_deref())?;
     app.emit(
         "task.started",
@@ -316,9 +335,11 @@ async fn start_task(
 async fn finish_task(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(r): Json<TaskResult>,
 ) -> ApiResult<StatusCode> {
     let (group_id, run_id, name) = app.db.task_group(&id)?;
+    check_lease(&app, &group_id, &headers)?;
     app.db.finish_task(&id, &r)?;
     if r.log_digest.is_some() {
         app.db.drop_live_log(&id)?;
@@ -333,7 +354,12 @@ async fn finish_task(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn heartbeat(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+async fn heartbeat(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    check_lease(&app, &id, &headers)?;
     app.db.heartbeat_group(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -341,10 +367,21 @@ async fn heartbeat(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiRe
 async fn finish_group(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(r): Json<GroupResult>,
 ) -> ApiResult<StatusCode> {
     let group = app.db.group(&id)?;
-    app.db.finish_group(&id, &r)?;
+    let lease = headers
+        .get(crate::client::LEASE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    // Checked in the same statement as the update, so a group requeued in
+    // between cannot be finished by its old worker.
+    if !app.db.finish_group(&id, lease, &r)? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("group {id} is no longer claimed by this worker"),
+        ));
+    }
     app.emit(
         "group.finished",
         Some(&group.run_id),

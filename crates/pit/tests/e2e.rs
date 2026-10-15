@@ -667,3 +667,81 @@ async fn removed_queue_entry_never_lands() {
         .await
         .is_err());
 }
+
+/// Only the current claim of a group may report on it: a worker that was
+/// presumed dead and replaced cannot overwrite the result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_claims_cannot_report() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = pit::server::App::with_github(&data.path().join("server"), None, base.clone(), None)
+        .unwrap();
+    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = Client::new(&base, None).unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        repo.path(),
+        "pit.config.json",
+        r#"{"tasks":{"t":{"run":"true"}}}"#,
+    );
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sub = pit::cli::submit(&client, repo.path(), vec![], false)
+        .await
+        .unwrap();
+
+    // Act as a worker by hand.
+    let info = WorkerInfo {
+        name: "fake".into(),
+        os: pit::model::current_os().into(),
+        arch: "x".into(),
+        cpus: 1,
+        backends: vec![Backend::Host],
+        kvm: false,
+    };
+    let job = loop {
+        if let ClaimResponse::Job(job) = client.claim(&info).await.unwrap() {
+            break job;
+        }
+    };
+    assert_eq!(job.run_id, sub.run_id);
+    let result = GroupResult {
+        status: Status::Passed,
+        message: None,
+        prepare_ms: 0,
+    };
+    let path = format!("/api/groups/{}/finish", job.group_id);
+
+    let stale = client.with_lease("lease_stale");
+    let err = stale
+        .post_empty(&path, &result)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("409"), "{err}");
+    let task_path = format!("/api/tasks/{}/start", job.tasks[0].id);
+    assert!(stale
+        .post_empty(&task_path, &TaskStart { action_key: None })
+        .await
+        .is_err());
+    assert!(
+        client.post_empty(&path, &result).await.is_err(),
+        "no lease must be refused"
+    );
+
+    client
+        .with_lease(&job.lease)
+        .post_empty(&path, &result)
+        .await
+        .unwrap();
+    let v: RunView = client
+        .get(&format!("/api/runs/{}", sub.run_id))
+        .await
+        .unwrap();
+    assert_eq!(v.status, Status::Passed);
+}

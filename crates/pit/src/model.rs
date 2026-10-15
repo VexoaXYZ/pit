@@ -173,6 +173,10 @@ pub struct WorkerInfo {
 #[serde(rename_all = "camelCase")]
 pub struct Job {
     pub group_id: String,
+    /// Identifies this claim of the group. Updates without the current lease
+    /// are rejected, so a worker that was presumed dead cannot overwrite the
+    /// result of the worker that took the group over.
+    pub lease: String,
     pub run_id: String,
     pub repo: String,
     pub url: String,

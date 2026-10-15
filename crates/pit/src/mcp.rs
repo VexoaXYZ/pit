@@ -172,8 +172,8 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
                 client
                     .get_text(&format!(
                         "/api/runs/{}/tasks/{}/log",
-                        crate::client::seg(run),
-                        crate::client::seg(task)
+                        crate::client::seg(run)?,
+                        crate::client::seg(task)?
                     ))
                     .await?,
                 false,

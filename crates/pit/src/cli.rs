@@ -335,8 +335,8 @@ pub async fn logs(client: &Client, run: &str, task: &str) -> Result<i32> {
     let text = client
         .get_text(&format!(
             "/api/runs/{}/tasks/{}/log",
-            crate::client::seg(run),
-            crate::client::seg(task)
+            crate::client::seg(run)?,
+            crate::client::seg(task)?
         ))
         .await?;
     print!("{text}");
@@ -381,9 +381,11 @@ pub async fn queue_add(
 pub async fn queue_remove(client: &Client, dir: &Path, entry: &str) -> Result<i32> {
     // Branch names are scoped to this repo; entry ids work from anywhere.
     let repo = crate::snapshot::identity(dir).await.map(|id| id.name).ok();
-    let mut path = format!("/api/queue/{}", crate::client::seg(entry));
+    let mut path = format!("/api/queue/{}", crate::client::seg(entry)?);
     if let Some(repo) = repo {
-        path.push_str(&format!("?repo={}", crate::client::seg(&repo)));
+        if let Ok(repo) = crate::client::seg(&repo) {
+            path.push_str(&format!("?repo={repo}"));
+        }
     }
     let resp: serde_json::Value = client.delete(&path).await?;
     println!(

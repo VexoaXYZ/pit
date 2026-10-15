@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS groups_ (
   prepare_ms INTEGER,
   message TEXT,
   check_run_id INTEGER,
+  lease TEXT,
   heartbeat_at INTEGER,
   created_at INTEGER NOT NULL,
   started_at INTEGER,
@@ -188,6 +189,17 @@ pub struct QueueRow {
     pub updated_at: i64,
 }
 
+/// Columns added after the first release of a table.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_lease: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'lease'")?
+        .exists([])?;
+    if !has_lease {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lease TEXT")?;
+    }
+    Ok(())
+}
+
 fn queue_row(r: &Row) -> rusqlite::Result<QueueRow> {
     let affected: String = r.get("affected")?;
     Ok(QueueRow {
@@ -234,6 +246,7 @@ impl Db {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -242,6 +255,7 @@ impl Db {
     pub fn memory() -> Result<Db> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -525,9 +539,10 @@ impl Db {
             return Ok(None);
         };
         let now = now_ms();
+        let lease = new_id("lease");
         tx.execute(
-            "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2 WHERE id = ?3",
-            params![worker.name, now, gid],
+            "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2, lease = ?4 WHERE id = ?3",
+            params![worker.name, now, gid, lease],
         )?;
         let (run, repo_name, url, group_name): (RunRow, String, String, String) = tx.query_row(
             "SELECT runs.*, repos.name AS repo_name, repos.url AS repo_url, groups_.name AS group_name
@@ -554,6 +569,7 @@ impl Db {
         tx.commit()?;
         Ok(Some(Job {
             group_id: gid,
+            lease,
             run_id,
             repo: repo_name,
             url,
@@ -614,19 +630,46 @@ impl Db {
         Ok(())
     }
 
-    pub fn finish_group(&self, id: &str, result: &GroupResult) -> Result<()> {
+    /// Records a group's result if `lease` is still its current claim.
+    /// Returns false (and changes nothing) for a stale claim.
+    pub fn finish_group(
+        &self,
+        id: &str,
+        lease: Option<&str>,
+        result: &GroupResult,
+    ) -> Result<bool> {
         let c = self.conn.lock();
         let now = now_ms();
-        c.execute(
-            "UPDATE groups_ SET status = ?1, message = ?2, prepare_ms = ?3, finished_at = ?4 WHERE id = ?5",
-            params![result.status.as_str(), result.message, result.prepare_ms as i64, now, id],
+        let changed = c.execute(
+            "UPDATE groups_ SET status = ?1, message = ?2, prepare_ms = ?3, finished_at = ?4
+             WHERE id = ?5 AND status = 'running' AND lease = ?6",
+            params![
+                result.status.as_str(),
+                result.message,
+                result.prepare_ms as i64,
+                now,
+                id,
+                lease
+            ],
         )?;
+        if changed == 0 {
+            return Ok(false);
+        }
         // Anything the worker never reported on is skipped.
         c.execute(
             "UPDATE tasks SET status = 'skipped', finished_at = ?1 WHERE group_id = ?2 AND status IN ('queued', 'running')",
             params![now, id],
         )?;
-        Ok(())
+        Ok(true)
+    }
+    /// Whether `lease` is the current claim of a running group.
+    pub fn lease_ok(&self, group_id: &str, lease: Option<&str>) -> Result<bool> {
+        let Some(lease) = lease else { return Ok(false) };
+        let c = self.conn.lock();
+        let mut st =
+            c.prepare("SELECT 1 FROM groups_ WHERE id = ?1 AND status = 'running' AND lease = ?2")?;
+        let ok = st.exists(params![group_id, lease])?;
+        Ok(ok)
     }
 
     pub fn heartbeat_group(&self, id: &str) -> Result<()> {
@@ -648,7 +691,7 @@ impl Db {
             .collect::<rusqlite::Result<_>>()?;
         for id in &ids {
             c.execute(
-                "UPDATE groups_ SET status = 'queued', worker = NULL, started_at = NULL WHERE id = ?1",
+                "UPDATE groups_ SET status = 'queued', worker = NULL, started_at = NULL, lease = NULL WHERE id = ?1",
                 params![id],
             )?;
             c.execute(

@@ -142,7 +142,11 @@ pub fn command(
     // Pit's own settings (server URL, API token, GitHub credentials) are not
     // the task's business: a task holding PIT_TOKEN could write to the cache.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("PIT_") {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("PIT_")
+        {
             cmd.env_remove(key);
         }
     }
