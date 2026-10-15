@@ -894,3 +894,34 @@ async fn cache_is_kept_under_its_size_limit() {
     let stats: serde_json::Value = pit.client.get("/api/stats").await.unwrap();
     assert!(stats["evictedEntries"].as_u64().unwrap() > 0);
 }
+
+/// Blobs inside the grace period cannot be freed yet; the collector must not
+/// evict the whole cache trying to make room for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_does_not_empty_the_cache_for_blobs_it_cannot_free_yet() {
+    use std::sync::atomic::Ordering;
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    write(
+        dir,
+        "pit.config.json",
+        r#"{"tasks":{"artifact":{"run":"mkdir -p out && head -c 1000000 /dev/urandom > out/blob.bin","inputs":["src/**"],"outputs":["out/**"]}}}"#,
+    );
+    write(dir, ".gitignore", "out\n");
+    write(dir, "src/v", "0\n");
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    for v in 1..=4 {
+        write(dir, "src/v", &format!("{v}\n"));
+        run(&pit, dir).await;
+    }
+    // Every blob is young and the store is far over the limit.
+    pit.app.cache_max_bytes.store(1_000_000, Ordering::Relaxed);
+    let report: serde_json::Value = pit.client.post("/api/gc", &()).await.unwrap();
+    assert_eq!(report["evictedEntries"], 0, "{report}");
+    let newest = run(&pit, dir).await;
+    assert_eq!(newest.groups[0].tasks[0].status, Status::Cached);
+}

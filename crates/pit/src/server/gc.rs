@@ -45,8 +45,11 @@ pub fn collect(app: &App, force: bool) -> Result<GcReport> {
     }
     let target = limit / 10 * 9;
     loop {
-        sweep(app, &mut report)?;
-        if limit == 0 || app.cas.total_bytes() <= target {
+        // Young blobs cannot be deleted yet, so evicting more entries to make
+        // room for them would only empty the cache. Stop once everything that
+        // can be freed now is under the target; the next collection does the rest.
+        let young = sweep(app, &mut report)?;
+        if limit == 0 || app.cas.total_bytes().saturating_sub(young) <= target {
             break;
         }
         // Evict a tenth of what is left at a time, oldest first, then sweep
@@ -84,8 +87,9 @@ pub fn collect(app: &App, force: bool) -> Result<GcReport> {
     Ok(report)
 }
 
-/// Deletes blobs that nothing refers to and that are older than the grace period.
-fn sweep(app: &App, report: &mut GcReport) -> Result<()> {
+/// Deletes blobs that nothing refers to and that are older than the grace
+/// period. Returns the bytes held by blobs still inside the grace period.
+fn sweep(app: &App, report: &mut GcReport) -> Result<u64> {
     let (mut keep, overlays) = app.db.referenced_blobs(now_ms() - RUN_RETENTION_MS)?;
     for d in overlays {
         if let Some(bytes) = app.cas.get(&d)? {
@@ -98,8 +102,13 @@ fn sweep(app: &App, report: &mut GcReport) -> Result<()> {
     let cutoff = SystemTime::now()
         .checked_sub(grace)
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut young = 0;
     for blob in app.cas.blobs() {
-        if keep.contains(&blob.digest) || blob.modified > cutoff {
+        if blob.modified > cutoff {
+            young += blob.size;
+            continue;
+        }
+        if keep.contains(&blob.digest) {
             continue;
         }
         let freed = app.cas.remove(&blob.digest);
@@ -108,5 +117,5 @@ fn sweep(app: &App, report: &mut GcReport) -> Result<()> {
             report.freed_bytes += freed;
         }
     }
-    Ok(())
+    Ok(young)
 }
