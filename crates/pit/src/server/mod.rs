@@ -5,6 +5,7 @@ pub mod api;
 pub mod db;
 pub mod gc;
 pub mod github;
+pub mod notify;
 pub mod queue;
 pub mod remote_cache;
 pub mod resolve;
@@ -47,6 +48,8 @@ pub struct App {
     pub freed_bytes: AtomicU64,
     /// See `ServerOpts::worker_token`.
     pub worker_token: parking_lot::Mutex<Option<String>>,
+    /// See `ServerOpts::notify_url`.
+    pub notify_url: parking_lot::Mutex<Option<String>>,
 }
 
 pub struct ServerOpts {
@@ -57,6 +60,9 @@ pub struct ServerOpts {
     /// trusted run's lease writes the cache main reads, so without it every
     /// API token holder can act as a trusted worker.
     pub worker_token: Option<String>,
+    /// Webhook (Slack-compatible) told when main or a schedule breaks or is
+    /// fixed. See `notify`.
+    pub notify_url: Option<String>,
     pub public_url: Option<String>,
     /// CAS size limit in bytes; 0 means unlimited.
     pub cache_max_bytes: u64,
@@ -91,6 +97,7 @@ impl App {
             queue_kick: Notify::new(),
             cache_max_bytes: AtomicU64::new(0),
             worker_token: Default::default(),
+            notify_url: Default::default(),
             gc_grace_ms: AtomicU64::new(2 * 60 * 1000),
             evicted_entries: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
@@ -439,6 +446,7 @@ impl App {
         if let Some(gh) = &self.github {
             gh.report_run(self, run_id).await;
         }
+        notify::run_finished(self, run_id).await;
         self.queue_kick.notify_one();
     }
 
@@ -506,6 +514,7 @@ pub async fn serve(opts: ServerOpts) -> Result<()> {
         .unwrap_or_else(|| format!("http://{}", opts.addr));
     let app = App::new(&opts.data_dir, opts.token.clone(), public_url)?;
     *app.worker_token.lock() = opts.worker_token.clone();
+    *app.notify_url.lock() = opts.notify_url.clone();
     app.cache_max_bytes
         .store(opts.cache_max_bytes, std::sync::atomic::Ordering::Relaxed);
     serve_app(app, opts.addr).await

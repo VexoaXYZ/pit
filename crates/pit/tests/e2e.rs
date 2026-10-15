@@ -1450,3 +1450,87 @@ async fn schedules_start_one_run_per_slot() {
     assert_eq!(view.status, Status::Error, "{view:?}");
     assert!(view.message.unwrap_or_default().contains("five fields"));
 }
+
+/// Main (here: a schedule) breaking and being fixed posts one message each to
+/// the notify webhook; staying broken posts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notifies_when_a_trusted_line_breaks_and_is_fixed() {
+    let pit = start().await;
+    // A webhook receiver that records what it is sent.
+    let got: std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>> = Default::default();
+    let sink = got.clone();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |axum::Json(v): axum::Json<serde_json::Value>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().push(v);
+                "ok"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook = format!("http://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    *pit.app.notify_url.lock() = Some(hook);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    let config = |run: &str| {
+        serde_json::json!({
+            "tasks": { "check": { "run": run, "cache": false } },
+            "schedules": { "nightly": { "cron": "* * * * *" } },
+        })
+        .to_string()
+    };
+    write(&work, "pit.config.json", &config("exit 1"));
+    sh(&work, "git init -q -b main && git add -A && git commit -qm broken && git remote add origin ../origin.git && git push -q origin main");
+    run(&pit, &work).await; // registers the repo and its mirror; local runs never notify
+
+    let mut minute = 29_000_000_i64;
+    let mut scheduled_run = || {
+        minute += 1;
+        let app = pit.app.clone();
+        let client = pit.client.clone();
+        async move {
+            let before: Vec<RunView> = client.get("/api/runs?limit=100").await.unwrap();
+            let n = before
+                .iter()
+                .filter(|r| r.trigger == "schedule:nightly")
+                .count();
+            pit::server::schedule::tick(&app, minute * 60_000)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let runs: Vec<RunView> = client.get("/api/runs?limit=100").await.unwrap();
+                    let sched: Vec<&RunView> = runs
+                        .iter()
+                        .filter(|r| r.trigger == "schedule:nightly")
+                        .collect();
+                    if sched.len() > n && sched.iter().all(|r| r.status.is_done()) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("scheduled run did not finish");
+            // The webhook is posted after the run is marked finished.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    };
+    scheduled_run().await;
+    scheduled_run().await;
+    write(&work, "pit.config.json", &config("true"));
+    sh(&work, "git commit -qam fixed && git push -q origin main");
+    scheduled_run().await;
+    let got = got.lock().clone();
+    let events: Vec<&str> = got.iter().map(|v| v["event"].as_str().unwrap()).collect();
+    assert_eq!(events, ["broken", "fixed"], "{got:?}");
+    assert_eq!(got[0]["failed"][0], "default.check");
+    assert!(got[0]["text"].as_str().unwrap().contains("is broken"));
+}

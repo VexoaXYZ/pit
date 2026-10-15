@@ -111,6 +111,12 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 
 -- Running totals for /api/stats that must survive cache eviction.
+-- The last result of each notified line (see server::notify).
+CREATE TABLE IF NOT EXISTS notify_state (
+  key TEXT PRIMARY KEY,
+  status TEXT NOT NULL
+);
+
 -- The minute each schedule last fired, so it fires once per slot.
 CREATE TABLE IF NOT EXISTS schedules (
   key TEXT PRIMARY KEY,
@@ -1311,6 +1317,24 @@ impl Db {
             params![message, id],
         )?;
         Ok(())
+    }
+
+    /// Records a line's latest result and returns the one before it.
+    pub fn swap_notify_state(&self, key: &str, status: &str) -> Result<Option<String>> {
+        let c = self.conn.lock();
+        let previous: Option<String> = c
+            .query_row(
+                "SELECT status FROM notify_state WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        c.execute(
+            "INSERT INTO notify_state (key, status) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET status = ?2",
+            params![key, status],
+        )?;
+        Ok(previous)
     }
 
     /// Claims a schedule slot. False if this minute already fired.

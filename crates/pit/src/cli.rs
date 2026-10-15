@@ -24,6 +24,7 @@ pub struct UpOpts {
     pub cache_max_bytes: u64,
     pub workspace_max_bytes: u64,
     pub worker_token: Option<String>,
+    pub notify_url: Option<String>,
 }
 
 /// Server and worker in one process.
@@ -37,6 +38,7 @@ pub async fn up(opts: UpOpts) -> Result<()> {
         cache_max_bytes,
         workspace_max_bytes,
         worker_token,
+        notify_url,
     } = opts;
     // The built-in worker always proves itself; other workers need the same
     // PIT_WORKER_TOKEN to join.
@@ -46,6 +48,7 @@ pub async fn up(opts: UpOpts) -> Result<()> {
     app.cache_max_bytes
         .store(cache_max_bytes, std::sync::atomic::Ordering::Relaxed);
     *app.worker_token.lock() = Some(worker_token.clone());
+    *app.notify_url.lock() = notify_url;
     let server = tokio::spawn(crate::server::serve_app(app, addr));
     // Wait for the listener before the worker starts polling.
     let probe = Client::new(&public, token.clone())?;

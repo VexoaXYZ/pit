@@ -219,6 +219,16 @@ Webhook URL: `<server>/webhooks/github`, events `push`, `pull_request`, `check_r
 Pushes and pull requests start runs; "Re-run" on a check reruns; adding the `pit:merge`
 label to a pull request queues it.
 
+## Notifications
+
+`pit server --notify-url https://hooks.slack.com/services/…` (or `PIT_NOTIFY_URL`) posts
+when a trusted line changes state: main (or the default branch) after a push or a landing, and
+each schedule separately. It posts once when it breaks ("Pit: app main is broken:
+default.test failed. <link>") and once when it is fixed, and nothing while it stays broken or
+green. PR, local and merge queue runs never notify. The body is JSON with `text`, so a Slack
+incoming webhook works as is, plus `event` (`broken`/`fixed`), `repo`, `ref`, `trigger`,
+`run`, `url` and `failed` for anything else.
+
 ## Merge queue
 
 ```sh

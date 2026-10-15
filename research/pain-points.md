@@ -1421,3 +1421,47 @@ no dropped slots while the server is up, and no inactivity shutoff. Not done:
   for non-GitHub repos (`main`, then `master`, then `trunk`).
 - **No failure notification.** A failed scheduled run notifies no one beyond the dashboard and
   GitHub statuses.
+
+## P27. Nobody hears that main is broken
+
+**Pain.** GitHub sends failure notifications to the person who triggered a run, and for
+scheduled workflows to whoever last edited the cron line, not to the team. So every team adds a
+Slack step with `if: failure()` to each workflow, often restricted to `main` and with mention
+groups, or a separate `workflow_run` workflow just to send alerts
+([slack-github-action guide](https://pullnotifier.com/tools/slack-github-actions),
+[ravsam](https://www.ravsam.in/blog/send-slack-notification-when-github-actions-fails/),
+[dev.to](https://dev.to/ravgeetdhillon/send-slack-notification-when-github-actions-fails-1ba6),
+[Gitera](https://gitera.io/blog/github-actions-email-notifications),
+[GitNotifier](https://www.gitnotifier.com/blog/send-slack-notifications-github-actions),
+[OneUptime](https://oneuptime.com/blog/post/2025-12-20-github-actions-notifications/view)).
+Alerting on every failure is noisy, so people tune it by hand.
+
+**Before** (research/pain-hunt at P26): Pit had no notifications. P26's scheduled `pit verify`
+caught P25's bug, but only the dashboard showed it. **NOT SOLVED.**
+
+**Fix** (research/pain-hunt): `--notify-url` / `PIT_NOTIFY_URL` on `pit server` and `pit up`.
+- **Which runs:** only trusted runs (P20) notify. Each line is tracked separately: the branch
+  (pushes and post-merge runs) and each schedule. PR, local and merge queue runs never notify,
+  and cancelled or superseded runs are ignored.
+- **When:** only on a change of state, recorded in a `notify_state` table. That is one message
+  when a line breaks and one when it is fixed.
+- **Payload:** Slack-compatible JSON (`text`) plus structured fields (`event`, `repo`, `ref`,
+  `trigger`, `run`, `url`, `failed`).
+
+**Live check** (`/tmp/painhunt/p27`, a schedule every minute driving trusted runs; a Python
+receiver logging what it gets):
+
+```
+00:13:21 Pit: app-2fdd9f main (schedule:watch) is broken: default.check failed. http://127.0.0.1:7070/runs/run_23340940390d
+         (next scheduled run, still failing: no message)
+00:15:23 Pit: app-2fdd9f main (schedule:watch) is fixed. http://127.0.0.1:7070/runs/run_d1e640ac7ff9
+```
+
+Covered by the unit test `only_state_changes_notify` and the e2e test
+`notifies_when_a_trusted_line_breaks_and_is_fixed`, which uses an in-process webhook receiver
+and expects exactly `["broken", "fixed"]` over break, still broken, fixed.
+
+**Verdict: SOLVED** for team alerts on main and schedules, with no per-workflow wiring. Not done:
+- **No retry.** Delivery is one attempt with a 10s timeout; a failure is logged.
+- **No mentions.** The message does not mention the people who caused the break.
+- **One URL.** There is one notify URL per server, not per repo.

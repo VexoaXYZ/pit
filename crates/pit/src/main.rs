@@ -51,6 +51,10 @@ enum Command {
         /// API token holders cannot act as workers and write trusted results.
         #[arg(long, env = "PIT_WORKER_TOKEN", hide_env_values = true)]
         worker_token: Option<String>,
+        /// Webhook told when main or a schedule breaks or is fixed (a Slack
+        /// incoming webhook works as is).
+        #[arg(long, env = "PIT_NOTIFY_URL")]
+        notify_url: Option<String>,
     },
     /// Run the control plane.
     Server {
@@ -71,6 +75,10 @@ enum Command {
         /// API token holders cannot act as workers and write trusted results.
         #[arg(long, env = "PIT_WORKER_TOKEN", hide_env_values = true)]
         worker_token: Option<String>,
+        /// Webhook told when main or a schedule breaks or is fixed (a Slack
+        /// incoming webhook works as is).
+        #[arg(long, env = "PIT_NOTIFY_URL")]
+        notify_url: Option<String>,
     },
     /// Run a worker that claims groups from a server.
     Worker {
@@ -257,6 +265,7 @@ async fn run(cli: Cli) -> Result<i32> {
             cache_max_gb,
             workspace_max_gb,
             worker_token,
+            notify_url,
         } => {
             let data = data.unwrap_or_else(default_data);
             cli::up(cli::UpOpts {
@@ -268,6 +277,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 cache_max_bytes: gb_to_bytes(cache_max_gb),
                 workspace_max_bytes: gb_to_bytes(workspace_max_gb),
                 worker_token,
+                notify_url,
             })
             .await?;
             Ok(0)
@@ -279,6 +289,7 @@ async fn run(cli: Cli) -> Result<i32> {
             public_url,
             cache_max_gb,
             worker_token,
+            notify_url,
         } => {
             pit::server::serve(pit::server::ServerOpts {
                 data_dir: data.unwrap_or_else(default_data).join("server"),
@@ -287,6 +298,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 public_url,
                 cache_max_bytes: gb_to_bytes(cache_max_gb),
                 worker_token,
+                notify_url,
             })
             .await?;
             Ok(0)
