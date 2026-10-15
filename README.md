@@ -97,6 +97,31 @@ export default {
 | `shards` | Split the task into N groups that spread across workers; each gets `PIT_SHARD` and `PIT_SHARD_COUNT` (`vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`). |
 | `retries` | Extra attempts after a failure. A pass on a retry is reported as `flaky:` and is not cached. |
 
+### Monorepos: one task per package
+
+A config can export a function. Pit calls it with the repo's JavaScript workspace packages
+(from `pnpm-workspace.yaml` or `workspaces` in `package.json`) at the commit being run: each
+package's `name`, `dir`, `scripts`, workspace `deps`, and `inputs`, which are globs for its
+own directory and every workspace package it depends on. A task per package then reruns only
+when something it can see changes, like `nx affected` or `turbo --affected`, and the list
+never drifts from the repo:
+
+```ts
+import type { PitConfig, PitContext } from "@pit-ci/config";
+
+export default ({ packages }: PitContext): PitConfig => ({
+  tasks: Object.fromEntries(
+    packages
+      .filter((p) => p.scripts.includes("typecheck"))
+      .map((p) => [`typecheck:${p.dir}`, { run: `pnpm --filter ${p.name} typecheck`, inputs: [...p.inputs, "tsconfig*.json"] }]),
+  ),
+});
+```
+
+Inputs come from declared dependencies. A package that reads another without listing it
+in `package.json` needs that directory added by hand, or a change there will be a cache hit.
+[`bench/t3code.packages.pit.config.ts`](bench/t3code.packages.pit.config.ts) is a full example.
+
 ### Docker builds
 
 Workers are long-lived, so their Docker daemon keeps its layer cache and BuildKit

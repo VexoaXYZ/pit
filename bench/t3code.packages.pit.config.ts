@@ -58,7 +58,9 @@ export default ({ packages }: PitContext): PitConfig => {
           ...Object.fromEntries(
             packages
               .filter((p) => p.scripts.includes("typecheck"))
-              .filter((p) => !p.dir.startsWith("apps/mobile") && !p.dir.startsWith("apps/marketing"))
+              .filter(
+                (p) => !p.dir.startsWith("apps/mobile") && !p.dir.startsWith("apps/marketing"),
+              )
               .map(typecheck),
           ),
           build: {

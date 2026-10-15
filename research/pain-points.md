@@ -1099,3 +1099,69 @@ New tests: `trust_needs_a_worker_token_and_a_live_lease` (e2e) and
 - **Open: unusual default branches.** For queue runs the default branch is guessed from the
   mirror (`main`, then `master`, then `trunk`), so a repo whose default is `develop` gets
   untrusted queue runs.
+
+## P21. Monorepo CI reruns every package on every change
+
+**Pain.** In a monorepo, a one-line change in one package still runs typecheck, tests and builds
+for all of them. The usual fixes are Nx `affected`, Turborepo `--affected`/`--filter`,
+hand-maintained path filters, or scripts that build a job matrix from changed packages
+([WarpBuild](https://www.warpbuild.com/blog/github-actions-monorepo-guide),
+[LeanIX on nx affected](https://engineering.leanix.net/blog/smarter-nx-affected-checks/),
+[Tenki](https://www.tenki.cloud/blog/monorepo-ci-github-actions-selective-builds),
+[Techplained](https://www.techplained.com/monorepo-ci-pipeline),
+[dynamic-monorepo](https://github.com/Continuous-Actions/dynamic-monorepo)). Path filters do
+not know the dependency graph, and hand-written lists drift from the repo.
+
+The user also asked the direct question: is Pit faster than T3 Code's CI on Blacksmith?
+
+**Reproduction**: T3 Code at `339179f50a` on this 8-core box, now idle (load average 0.35 before
+the runs, against 11 to 15 during the first benchmark). The Blacksmith baseline from
+`bench/README.md` is 190s at p50, on about 15 runners with about 100 vCPUs. The one-file edits
+are uncommitted (`pit run`).
+
+**Before** (research/pain-hunt at P20): Pit evaluates `pit.config.ts` on its own, without the
+repo, so a config cannot list the workspace packages. The bench config has one `typecheck`
+task over all 30 packages, and `test-web` and `build` take every package as input.
+
+| Run (monolithic config) | Wall time | Notes |
+| --- | --- | --- |
+| Cold | 716s | `install` alone 162s. `test-web` failed: a 120s hook timed out under contention (500 of 501 files passed) |
+| One-file edit in `apps/web` | **443s** | Workspace ready in 0.9s. `check` 51s, `typecheck` 137s, `knip` 301s, `build` 312s, `test-web` 441s, all on the same 8 cores |
+
+**Fix** (research/pain-hunt): a config can export a function. Pit calls it with the repo's
+workspace packages, read from `pnpm-workspace.yaml` or `workspaces` at the commit plus overlay.
+Each package comes with `name`, `dir`, `scripts`, workspace `deps`, and `inputs`: globs for its
+own directory and every workspace package it reaches. Results are memoized by config source plus
+package list. [`bench/t3code.packages.pit.config.ts`](../bench/t3code.packages.pit.config.ts)
+generates one typecheck per package (30 tasks, 36 in all) and gives `build` and `test-web` the
+inputs of the packages they actually import.
+
+| Run (per-package config) | Wall time | What reran |
+| --- | --- | --- |
+| One-file edit in `apps/web` | 438s | `typecheck` for `web` (6.4s) and `server` (36.4s) only, against 137s monolithic. `test-web` (433s) still sets the wall time, and it failed again on contention timeouts |
+| One-file edit in `packages/ssh`, which `web` does not import | **209s** | 3 of 30 typechecks (`ssh`, `desktop`, `server`). **`test-web` cached.** `knip` 182s, `build` 204s |
+
+The monolithic config reruns every task for the `ssh` edit as well, because `typecheck`,
+`build` and `test-web` all take `packages/**`. That case was not timed separately; the `apps/web`
+edit (443s) is the measured equivalent.
+
+Two mistakes of mine on the way, kept here so the numbers can be trusted. First, the new config
+failed T3 Code's own `vp check` (formatting) until I formatted it with `vp fmt`. Second, the
+first `ssh` run went through a server still capped at the 0.02 GB cache from the P4 test, so
+everything had been evicted and reran ("its earlier result was evicted…"). It was redone at
+20 GB.
+
+**Against Blacksmith (190s at p50):**
+- **Pit wins:** anything cached (1.0s), setup (under 1s against about 30s per job), and edits
+  that touch only part of the monorepo. On the `ssh` edit Pit was within 10% of Blacksmith on
+  one box.
+- **Pit loses:** an edit that reaches `test-web`, `build` and `knip`. There one 8-core VPS
+  (443s) loses to 15 machines. The remaining time is compute, not orchestration.
+
+**Verdict: PARTIAL.** Per-package affected runs now work and come from the repo itself; the
+measured case dropped from 443s to 209s. Still to do:
+- **Undeclared dependencies.** Inputs come from declared workspace dependencies, so a package
+  that reads another without declaring it can get a wrong cache hit. Nx and Turborepo have the
+  same limit.
+- **Package managers.** Only JavaScript workspaces are read; Cargo and Go workspaces are not.
+- **More cores.** Parity with Blacksmith on a full rerun needs more workers.
