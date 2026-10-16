@@ -2595,3 +2595,66 @@ async fn a_pass_much_slower_than_usual_is_noted() {
     );
     assert!(!message(&view, "steady").contains("slow:"), "{view:?}");
 }
+
+/// A task killed by a signal says which one, and a container killed for
+/// using more than its `memory` says it ran out of memory instead of
+/// "exited with 137".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killed_tasks_say_why() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let docker = cfg!(target_os = "linux")
+        && pit::worker::exec::detect_backends()
+            .await
+            .contains(&Backend::Docker);
+    let mut tasks = serde_json::json!({
+        "killed": { "run": "kill -9 $$", "cache": false },
+    });
+    if docker {
+        tasks["hungry"] = serde_json::json!({
+            "image": "node:22-alpine",
+            "memory": "64m",
+            "run": "node -e 'const a = []; setInterval(() => a.push(Buffer.alloc(8e6, 1)), 20)'",
+            "cache": false,
+        });
+    }
+    write(
+        dir,
+        "pit.config.json",
+        &serde_json::json!({ "tasks": tasks }).to_string(),
+    );
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run_with_timeout(&pit, dir, Duration::from_secs(240)).await;
+    let message = |name: &str| {
+        view.groups[0]
+            .tasks
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.message.clone())
+            .unwrap_or_default()
+    };
+    assert!(
+        message("killed").starts_with("killed by SIGKILL"),
+        "{view:?}"
+    );
+    if docker {
+        assert!(
+            message("hungry").starts_with("out of memory: exit 137"),
+            "{view:?}"
+        );
+    }
+}
+
+async fn run_with_timeout(pit: &Pit, dir: &Path, limit: Duration) -> RunView {
+    let sub = pit::cli::submit(&pit.client, dir, vec![], Default::default())
+        .await
+        .unwrap();
+    tokio::time::timeout(limit, pit::cli::wait(&pit.client, &sub.run_id, |_| {}))
+        .await
+        .expect("run timed out")
+        .unwrap()
+}

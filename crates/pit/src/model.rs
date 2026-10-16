@@ -108,6 +108,10 @@ pub struct TaskDef {
     /// Allow network access in isolated backends. Defaults to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<bool>,
+    /// Memory limit for a `docker` task (`"2g"`, `"512m"`), without swap, so
+    /// a local run hits the same ceiling as a small CI runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
     /// Timeout in seconds. Defaults to an hour; 0 means no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,

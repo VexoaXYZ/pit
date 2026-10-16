@@ -2585,3 +2585,80 @@ Both checks need a margin in ratio and in absolute time, so short tasks' jitter 
   slowdowns.
 - Queue time (P23, P41's `/metrics`) is measured separately from task time, but `pit slow` does
   not chart it.
+
+## P45. "Process completed with exit code 137": out of memory, but nothing says so
+
+**The pain.** Exit code 137 is 128 + SIGKILL. In CI it nearly always means the kernel's OOM killer
+stopped the job, but the log shows at most `Killed`, then the exit code:
+- [Hyperenv](https://hyperenv.com/blog/github-actions-running-out-of-memory/) and a
+  [self-hosted runner guide](https://jakeinsight.com/productivity/2026-03-24-github-actions-selfhosted-runner-docker-container-/)
+  explain it, and the second notes that host cgroup limits cap containers "without any warning in
+  workflow logs".
+- People still have to guess:
+  - [community #169191](https://github.com/orgs/community/discussions/169191) has random 137s on
+    `ubuntu-24.04`;
+  - [actions/runner#3521](https://github.com/actions/runner/issues/3521) has 137s after a runner
+    update;
+  - [softprops/action-gh-release#243](https://github.com/softprops/action-gh-release/issues/243)
+    has large uploads failing with 137;
+  - [moonfire-nvr#85](https://github.com/scottlamb/moonfire-nvr/issues/85) is the classic
+    `webpack … Killed … 137`.
+- PyTorch's answer was a bigger runner
+  ([executorch#15400](https://github.com/pytorch/executorch/pull/15400)).
+
+**Reproduction.** A host task grows memory under a 200 MB cap (`systemd-run --scope -p
+MemoryMax=200M`, standing in for a small runner), and another task is killed with `kill -9 $$`.
+Before, Pit reported:
+
+```
+✗ default.bundle: exited with 137
+  │ building
+  │ Killed
+✗ default.killed: exited with a signal
+```
+
+Nothing said it was memory, how much the task used, or which signal killed the other one. Docker
+tasks could not be given a memory limit either, so a laptop with 32 GB never reproduced a 7 GB
+runner's failure.
+
+**Fix.**
+- **The signal is named.** That covers a direct one (`killed by SIGKILL`) and one reported as
+  128 + n by a shell or the docker client (`exit 137: killed by SIGKILL`, `exit 139: killed by
+  SIGSEGV`).
+- **Out-of-memory kills are detected.** On Linux the worker reads the kernel's `oom_kill`
+  counter in `/proc/vmstat` before and after the task. The counter includes kills from cgroup
+  limits (Docker `--memory`, systemd `MemoryMax`). A SIGKILL while it went up reads "out of
+  memory: … the kernel's OOM killer ran while it did. Give it more memory or less parallelism".
+  Without that, the result says something else sent the signal.
+- **Memory is sampled.** The task's process group is sampled every 250 ms (`/proc/<pid>/statm`),
+  so the result says how much it was seen using.
+- **New `memory` option for docker tasks** (`"2g"`, `"512m"`): `--memory` and `--memory-swap`
+  with the same value, so a local run hits a small runner's ceiling. The config is rejected when
+  the value is malformed or the task isn't a docker task.
+
+**Measured.**
+
+| Task | Pit's result |
+| --- | --- |
+| Host task growing under the 200 MB cap | `out of memory: exit 137: killed by SIGKILL, and the kernel's OOM killer ran while it did; its processes were seen using up to 159 MB` |
+| Docker task, `memory: "64m"`, allocating 8 MB every 20 ms | `out of memory: exit 137: killed by SIGKILL, and the kernel's OOM killer ran while it did` |
+| The same image and limit, allocating 8 MB once | Passed |
+| `kill -9 $$` | `killed by SIGKILL; the kernel recorded no OOM kill, so something else sent it` |
+
+Tests:
+- e2e `killed_tasks_say_why`: the SIGKILL message, plus the docker OOM where Linux Docker is
+  available;
+- unit tests: message wording, a 64 MB allocation seen by the sampler, the OOM counter readable,
+  and the config checks.
+
+**Verdict: PARTIAL.** A 137 now says whether it was memory and roughly how much was used, and
+`memory` reproduces a small runner's limit locally. Limits:
+- The OOM check uses a machine-wide counter: another task OOM-killed at the same moment would be
+  blamed too. A docker task's own `OOMKilled` flag would be exact, but Pit runs containers with
+  `--rm` and doesn't inspect them.
+- Sampling every 250 ms misses a spike that grows and dies faster. In the first repro, an
+  instant 300 MB allocation was seen as 3 MB; the result says "seen using up to", not "peaked
+  at".
+- No peak figure for docker tasks (their processes are not in the task's process group).
+- Linux only; macOS gets the signal names but no OOM or memory figures.
+- Host and sandbox tasks cannot be given a limit.

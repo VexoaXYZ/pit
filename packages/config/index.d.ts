@@ -46,6 +46,11 @@ export interface TaskDef {
   image?: string;
   /** Network access for `sandbox` and `docker`. Defaults to true. */
   network?: boolean;
+  /**
+   * Memory limit for a `docker` task, without swap: `"2g"`, `"512m"`. A task
+   * killed for memory says so ("out of memory: … seen using up to 1.9 GB").
+   */
+  memory?: string;
   /** Timeout in seconds. Defaults to 3600 (an hour); 0 disables it. */
   timeout?: number;
   /**

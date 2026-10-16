@@ -93,6 +93,7 @@ export default {
 | `backend` | `"host"` (default), `"sandbox"` (Linux PID, IPC, UTS and optional network namespaces), `"docker"`. |
 | `image` | Container image; implies `backend: "docker"`. |
 | `network` | `false` cuts network access in `sandbox` and `docker`. |
+| `memory` | Memory limit for `docker` tasks, without swap (`"2g"`, `"512m"`): a local run hits the ceiling a small CI runner has. Any task killed by a signal says which, whether the kernel's OOM killer ran meanwhile, and the most memory its processes were seen using (Linux, sampled; not inside containers), instead of "exit 137". |
 | `timeout` | Seconds; default 3600, `0` for no limit. The whole process group is killed. |
 | `idleTimeout` | Seconds without any output before the task is stopped as hung; default 900, `0` for no limit. |
 | `shards` | Split the task into N groups that spread across workers; each gets `PIT_SHARD` and `PIT_SHARD_COUNT` (`vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`). |

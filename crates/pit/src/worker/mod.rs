@@ -11,6 +11,7 @@ pub mod exec;
 pub mod files;
 pub mod junit;
 pub mod mask;
+pub mod memory;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1208,13 +1209,29 @@ impl Worker {
             }
         }
         if !ok && message.is_none() {
-            message = Some(format!(
-                "exited with {}",
-                outcome
-                    .exit_code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "a signal".into())
-            ));
+            message = Some(
+                memory::explain(
+                    outcome.exit_code,
+                    outcome.signal,
+                    outcome.oom,
+                    // A container's processes are not in the task's process
+                    // group; only the docker client is.
+                    if backend == Backend::Docker {
+                        0
+                    } else {
+                        outcome.peak_memory
+                    },
+                )
+                .unwrap_or_else(|| {
+                    format!(
+                        "exited with {}",
+                        outcome
+                            .exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "a signal".into())
+                    )
+                }),
+            );
         }
         // Name the failed tests, from the task's JUnit reports.
         let reports = files::collect_outputs(ws, &def.reports)?;

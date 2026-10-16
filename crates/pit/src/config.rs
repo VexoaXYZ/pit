@@ -262,11 +262,24 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
                     task.image
                 );
             }
+            if let Some(m) = &task.memory {
+                let digits = m.trim_end_matches(['b', 'k', 'm', 'g']);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    bail!("task {gname}.{tname}: memory {m:?} should look like \"512m\" or \"2g\"");
+                }
+            }
             if !task.shard_files.is_empty() && task.shards.unwrap_or(1) < 2 {
                 bail!("task {gname}.{tname}: shardFiles needs shards of 2 or more");
             }
             if task.image.is_some() && task.backend.is_none() {
                 task.backend = Some(crate::model::Backend::Docker);
+            }
+        }
+    }
+    for (gname, group) in &config.groups {
+        for (tname, task) in &group.tasks {
+            if task.memory.is_some() && task.backend != Some(crate::model::Backend::Docker) {
+                bail!("task {gname}.{tname}: `memory` needs the docker backend (set `image` or `backend: \"docker\"`)");
             }
         }
     }
@@ -303,6 +316,8 @@ mod tests {
             &br#"{"tasks":{"t":{"run":"true","shardFiles":["src/**"]}}}"#[..],
             br#"{"tasks":{"t":{"run":"true","shards":1,"shardFiles":["src/**"]}}}"#,
             br#"{"tasks":{"t":{"run":"true","image":"--privileged"}}}"#,
+            br#"{"tasks":{"t":{"run":"true","memory":"2g"}}}"#,
+            br#"{"tasks":{"t":{"run":"true","image":"node:22","memory":"lots"}}}"#,
         ] {
             assert!(
                 parse(CONFIG_JSON, bad, dir.path(), &Default::default(), false)

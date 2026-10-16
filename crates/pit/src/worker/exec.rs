@@ -23,6 +23,13 @@ pub struct Outcome {
     pub idle: bool,
     /// Stopped because the run was cancelled or superseded.
     pub cancelled: bool,
+    /// The signal that ended it, if one did (Unix).
+    pub signal: Option<i32>,
+    /// The kernel's OOM killer ran while it did.
+    pub oom: bool,
+    /// The most memory its process group was seen to use, in bytes, sampled
+    /// (Linux; a docker task's container is not in the group).
+    pub peak_memory: u64,
 }
 
 /// Which isolation backends work on this host.
@@ -185,6 +192,14 @@ pub fn command_with(
             if !network {
                 a.extend(["--network".into(), "none".into()]);
             }
+            if let Some(m) = &task.memory {
+                a.extend([
+                    "--memory".into(),
+                    m.clone(),
+                    "--memory-swap".into(),
+                    m.clone(),
+                ]);
+            }
             // Files written to the warm workspace must stay owned by the worker,
             // or the next checkout in it fails.
             #[cfg(unix)]
@@ -256,8 +271,10 @@ pub async fn run(
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
+    let oom_before = super::memory::oom_kills();
     let mut child = cmd.spawn().context("spawning task")?;
     let pid = child.id();
+    let (peak, sampler) = super::memory::sample(pid);
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let out = child
         .stdout
@@ -337,6 +354,11 @@ pub async fn run(
         _ = idle => Ended::Idle,
         _ = cancelled => Ended::Cancelled,
     };
+    sampler.abort();
+    let oom = matches!(
+        (oom_before, super::memory::oom_kills()),
+        (Some(a), Some(b)) if b > a
+    );
     let went_idle = matches!(ended, Ended::Idle);
     let (status, timed_out, was_cancelled) = match ended {
         Ended::Exited(s) => (Some(s), false, false),
@@ -385,7 +407,14 @@ pub async fn run(
     if was_cancelled {
         log.push_str("\n[pit: run cancelled; task stopped]\n");
     }
+    #[cfg(unix)]
+    let signal = status.and_then(|s| std::os::unix::process::ExitStatusExt::signal(&s));
+    #[cfg(not(unix))]
+    let signal = None;
     Ok(Outcome {
+        signal,
+        oom,
+        peak_memory: peak.load(std::sync::atomic::Ordering::Relaxed),
         exit_code: status.and_then(|s| s.code()),
         log,
         duration: started.elapsed(),
