@@ -372,6 +372,28 @@ impl Queue<'_> {
                 }
             }
         }
+        // A lane's newest testing entry needs a run of its own. It can lack
+        // one when the change it was batched into left the lane (removed,
+        // updated, requeued); that run covers every batched entry before it.
+        let lanes: BTreeSet<String> = self.entries.iter().filter_map(|e| e.lane.clone()).collect();
+        for lane in lanes {
+            let newest = (0..self.entries.len())
+                .filter(|&j| {
+                    self.entries[j].lane.as_deref() == Some(lane.as_str())
+                        && self.entries[j].status == "testing"
+                })
+                .max_by_key(|&j| self.entries[j].position);
+            if let Some(j) = newest.filter(|&j| self.entries[j].run_id.is_none()) {
+                let o = self.entries[j].clone();
+                let run = self.queue_run(&o, self.lane_tasks(&o)).await?;
+                let o = &mut self.entries[j];
+                o.run_id = Some(run);
+                o.reason =
+                    Some("testing again: the change it was batched with left the queue".into());
+                let o = o.clone();
+                self.save(&o)?;
+            }
+        }
         let mut order: Vec<usize> = (0..self.entries.len()).collect();
         order.sort_by_key(|&i| (self.entries[i].lane.clone(), self.entries[i].position));
         for i in order {
@@ -398,7 +420,24 @@ impl Queue<'_> {
                     if o.lane != lane || o.position >= pos || o.status != "testing" {
                         continue;
                     }
-                    if let Some(r) = o.run_id.clone() {
+                    // A change whose own run already failed is not rescued
+                    // by a later one: it fails, and the later ones are
+                    // retested without it.
+                    let own = match &o.run_id {
+                        Some(r) => Some((r.clone(), self.app.db.run(r)?.status)),
+                        None => None,
+                    };
+                    if own.as_ref().is_some_and(|(_, s)| s.is_done() && !s.is_ok()) {
+                        continue;
+                    }
+                    // Saved first: a crash before the skip must not leave a
+                    // skipped run on an entry that still counts it.
+                    let o = &mut self.entries[j];
+                    o.status = "passed".into();
+                    o.reason = Some(format!("passed together with later changes in {run_id}"));
+                    let o = o.clone();
+                    self.save(&o)?;
+                    if let Some((r, _)) = own {
                         if self
                             .app
                             .db
@@ -407,11 +446,6 @@ impl Queue<'_> {
                             self.app.run_finished(&r).await;
                         }
                     }
-                    let o = &mut self.entries[j];
-                    o.status = "passed".into();
-                    o.reason = Some(format!("passed together with later changes in {run_id}"));
-                    let o = o.clone();
-                    self.save(&o)?;
                 }
             } else {
                 // A candidate contains every earlier change in its lane. Until
@@ -462,25 +496,22 @@ impl Queue<'_> {
     async fn land(&mut self) -> Result<()> {
         let lanes: BTreeSet<String> = self.entries.iter().filter_map(|e| e.lane.clone()).collect();
         for lane in lanes {
-            loop {
-                // The first entry of the lane that has not landed yet.
-                let next = self
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| {
-                        e.lane.as_deref() == Some(lane.as_str())
-                            && matches!(e.status.as_str(), "testing" | "passed")
-                    })
-                    .min_by_key(|(_, e)| e.position)
-                    .map(|(i, _)| i);
-                let Some(i) = next else { break };
-                if self.entries[i].status != "passed" {
-                    break;
-                }
-                if !self.land_one(i, "tested").await? {
-                    break;
-                }
+            // The leading run of passed entries lands as one push of the
+            // newest, which contains the others: the target never sits on a
+            // commit that was not itself tested.
+            let mut pending: Vec<usize> = (0..self.entries.len())
+                .filter(|&i| {
+                    self.entries[i].lane.as_deref() == Some(lane.as_str())
+                        && matches!(self.entries[i].status.as_str(), "testing" | "passed")
+                })
+                .collect();
+            pending.sort_by_key(|&i| self.entries[i].position);
+            let batch: Vec<usize> = pending
+                .into_iter()
+                .take_while(|&i| self.entries[i].status == "passed")
+                .collect();
+            if !batch.is_empty() {
+                self.land_batch(&batch, "tested").await?;
             }
         }
         Ok(())
@@ -488,7 +519,17 @@ impl Queue<'_> {
 
     /// Pushes an entry to the target. Returns false if it could not land now.
     async fn land_one(&mut self, i: usize, how: &str) -> Result<bool> {
-        let e = self.entries[i].clone();
+        self.land_batch(&[i], how).await
+    }
+
+    /// Pushes consecutive passed entries of one lane as a single commit: the
+    /// newest one's candidate, which contains the others.
+    async fn land_batch(&mut self, batch: &[usize], how: &str) -> Result<bool> {
+        let (&first, &last) = (
+            batch.first().context("empty batch")?,
+            batch.last().context("empty batch")?,
+        );
+        let e = self.entries[last].clone();
         let candidate = e
             .candidate_sha
             .clone()
@@ -498,20 +539,28 @@ impl Queue<'_> {
         } else {
             // Another lane landed first. Its tasks are disjoint from this one,
             // so re-merging onto the new tip keeps this lane's result valid.
-            let msg = merge_message(&e);
-            match git::merge_commit(&self.mirror, &self.tip, &e.head_sha, &msg).await? {
-                Some(c) => c,
-                None => {
-                    let lane = e.lane.clone().unwrap_or_default();
-                    self.requeue(i, "conflicts with a change that landed first; retesting")?;
-                    self.requeue_after(
-                        &lane,
-                        e.position.unwrap_or(0),
-                        "an earlier change in this lane is being retested",
-                    )?;
-                    return Ok(false);
+            let mut c = self.tip.clone();
+            for &i in batch {
+                let o = &self.entries[i];
+                match git::merge_commit(&self.mirror, &c, &o.head_sha, &merge_message(o)).await? {
+                    Some(m) => c = m,
+                    None => {
+                        let lane = self.entries[first].lane.clone().unwrap_or_default();
+                        let pos = self.entries[first].position.unwrap_or(0);
+                        self.requeue(
+                            first,
+                            "conflicts with a change that landed first; retesting",
+                        )?;
+                        self.requeue_after(
+                            &lane,
+                            pos,
+                            "an earlier change in this lane is being retested",
+                        )?;
+                        return Ok(false);
+                    }
                 }
             }
+            c
         };
         if !git::push(
             &self.mirror,
@@ -524,19 +573,21 @@ impl Queue<'_> {
             return Ok(false);
         }
         self.tip = commit.clone();
-        let e = &mut self.entries[i];
-        e.status = "landed".into();
-        e.landed_sha = Some(commit.clone());
-        e.reason = Some(how.to_string());
-        let e = e.clone();
-        self.save(&e)?;
-        self.app.emit(
-            "queue.landed",
-            None,
-            None,
-            None,
-            serde_json::json!({ "id": e.id, "sha": commit }),
-        );
+        for &i in batch {
+            let e = &mut self.entries[i];
+            e.status = "landed".into();
+            e.landed_sha = Some(commit.clone());
+            e.reason = Some(how.to_string());
+            let e = e.clone();
+            self.save(&e)?;
+            self.app.emit(
+                "queue.landed",
+                None,
+                None,
+                None,
+                serde_json::json!({ "id": e.id, "sha": commit }),
+            );
+        }
         // Backstop: the landed commit gets a full run on the target branch.
         self.app
             .create_run(
@@ -689,13 +740,9 @@ impl Queue<'_> {
                 });
                 if let Some(p) = prev {
                     if let Some(r) = self.entries[p].run_id.clone() {
-                        if self.app.db.run_untouched(&r)?
-                            && self
-                                .app
-                                .db
-                                .skip_run_because(&r, &format!("batched into {run_id}"))?
-                        {
-                            self.app.run_finished(&r).await;
+                        if self.app.db.run_untouched(&r)? {
+                            // Saved first: a crash before the skip must not
+                            // leave a skipped run on an entry that counts it.
                             let o = &mut self.entries[p];
                             o.run_id = None;
                             o.reason = Some(format!(
@@ -703,6 +750,13 @@ impl Queue<'_> {
                             ));
                             let o = o.clone();
                             self.save(&o)?;
+                            if self
+                                .app
+                                .db
+                                .skip_run_because(&r, &format!("batched into {run_id}"))?
+                            {
+                                self.app.run_finished(&r).await;
+                            }
                         }
                     }
                 }

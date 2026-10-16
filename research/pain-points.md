@@ -1959,6 +1959,26 @@ all four worker slots so queued candidates must wait, then queues `a`, `b` (bad)
 expects `a` and `c` landed, `b` ejected, at least one "batched into" run, and `b`'s file absent
 from `main`. It passed on three repeated runs, and all earlier merge queue tests still pass.
 
+**Hardened after an independent review** of the batching commit, which found:
+1. **(High) A batched change could be stranded forever.** If the change it was batched into
+   left the queue (removed, unlabelled, branch updated or deleted, requeued), nothing ever gave
+   the batched change a run back, and a lane could deadlock. Now each lane's newest testing entry
+   always gets a run if it has none. That one run covers every earlier batched entry. A new e2e
+   test (`a_change_batched_into_a_removed_one_still_lands`) failed with this fix disabled and
+   passes with it.
+2. **(Medium) Promotion and landing.** A later candidate passing promoted earlier entries even
+   if one had a run that already failed. Each entry's own commit was also pushed in turn, so the
+   target passed through commits nobody had tested on their own. Now an entry whose own run
+   failed is never promoted. A batch lands atomically: one push of the newest passed candidate,
+   all its entries marked landed at that commit, and one post-merge run. Live: 10 overlapping
+   PRs landed in 18.6s with 3 queue runs and **2 post-merge runs** (it was 10).
+3. **(Low) A crash at the wrong moment could eject a change.** Entry state is now saved before
+   its run is skipped.
+
+An existing test assumed `a2` always joins `a1`'s lane. With faster landing, `a1` can land first
+and `a2` then starts on top of it, so the test now checks that `a2` was tested on top of `a1`
+either way.
+
 **Verdict: SOLVED** for CI cost per landed change in a busy queue. Not done:
 - **Linear split.** A failed batch is split by testing each folded change, not by binary
   bisection, so a batch of N costs up to N runs on failure.
