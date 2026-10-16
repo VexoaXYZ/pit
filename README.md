@@ -278,6 +278,13 @@ the change keeps its place and the task is reported as `flaky:` (and counted in
 behind it. Pull request and local runs stay strict, and a flaky pass is never cached, so
 the flake keeps showing until it is fixed.
 
+**Batching.** A candidate contains every earlier change in its lane, so when it passes, the
+changes before it pass with it: their own runs are cancelled and they land together. A change
+that joins a lane while the previous candidate is still waiting for a worker replaces that run,
+and only the newest candidate is tested. If a batched candidate fails, the changes folded into
+it get their own runs again to find the one that broke it. Ten overlapping changes on two slots
+landed in 12.9s with 3 runs, against 29.9s and 10 runs before.
+
 **Priority.** Workers take merge queue groups first, since every change waiting to land
 waits on them, then other trusted runs (main pushes, post-merge), then PRs and local runs,
 oldest first within each.

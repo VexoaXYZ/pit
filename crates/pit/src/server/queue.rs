@@ -390,10 +390,52 @@ impl Queue<'_> {
                 self.entries[i].reason = None;
                 let e = self.entries[i].clone();
                 self.save(&e)?;
+                // This candidate contains every earlier change in its lane, so
+                // their own runs are no longer needed.
+                let (lane, pos) = (e.lane.clone(), e.position);
+                for j in 0..self.entries.len() {
+                    let o = &self.entries[j];
+                    if o.lane != lane || o.position >= pos || o.status != "testing" {
+                        continue;
+                    }
+                    if let Some(r) = o.run_id.clone() {
+                        if self
+                            .app
+                            .db
+                            .skip_run_because(&r, &format!("covered by {run_id}"))?
+                        {
+                            self.app.run_finished(&r).await;
+                        }
+                    }
+                    let o = &mut self.entries[j];
+                    o.status = "passed".into();
+                    o.reason = Some(format!("passed together with later changes in {run_id}"));
+                    let o = o.clone();
+                    self.save(&o)?;
+                }
             } else {
                 // A candidate contains every earlier change in its lane. Until
                 // those have passed, the failure may not be this change's fault.
                 let (lane, pos) = (self.entries[i].lane.clone(), self.entries[i].position);
+                // Changes batched into this candidate get their own runs now,
+                // to find which one broke it.
+                for j in 0..self.entries.len() {
+                    let o = &self.entries[j];
+                    if o.lane == lane
+                        && o.position < pos
+                        && o.status == "testing"
+                        && o.run_id.is_none()
+                    {
+                        let o = o.clone();
+                        let run = self.queue_run(&o, self.lane_tasks(&o)).await?;
+                        let o = &mut self.entries[j];
+                        o.run_id = Some(run);
+                        o.reason =
+                            Some("testing on its own: a batch with later changes failed".into());
+                        let o = o.clone();
+                        self.save(&o)?;
+                    }
+                }
                 let earlier_untested = self
                     .entries
                     .iter()
@@ -632,29 +674,39 @@ impl Queue<'_> {
                 );
             }
             tasks.retain(|t| !t.is_empty());
-            let run_id = self
-                .app
-                .create_run(
-                    CreateRun {
-                        repo: self.repo.name.clone(),
-                        url: None,
-                        sha: candidate.clone(),
-                        overlay: None,
-                        tasks: tasks.into_iter().collect(),
-                        trigger: Some("queue".into()),
-                        git_ref: Some(format!("queue/{}", e.source)),
-                        no_cache: false,
-                        fresh: false,
-                        no_secrets: false,
-                        // Queueing is the decision to land it on the target.
-                        trusted: super::trusted_branch(
-                            self.target,
-                            default_branch(&self.mirror).await.ok().as_deref(),
-                        ),
-                    },
-                    e.pr,
-                )
-                .await?;
+            let mut probe = e.clone();
+            probe.candidate_sha = Some(candidate.clone());
+            let run_id = self.queue_run(&probe, tasks).await?;
+            // Batching: the change before this one in the lane, if no worker
+            // has started on it, is tested by this candidate (which contains
+            // it) instead of on its own. If this candidate fails, it gets its
+            // own run again (see `collect_results`).
+            if position > 0 {
+                let prev = self.entries.iter().position(|o| {
+                    o.lane.as_deref() == Some(lane.as_str())
+                        && o.position == Some(position - 1)
+                        && o.status == "testing"
+                });
+                if let Some(p) = prev {
+                    if let Some(r) = self.entries[p].run_id.clone() {
+                        if self.app.db.run_untouched(&r)?
+                            && self
+                                .app
+                                .db
+                                .skip_run_because(&r, &format!("batched into {run_id}"))?
+                        {
+                            self.app.run_finished(&r).await;
+                            let o = &mut self.entries[p];
+                            o.run_id = None;
+                            o.reason = Some(format!(
+                                "batched: tested together with later changes in {run_id}"
+                            ));
+                            let o = o.clone();
+                            self.save(&o)?;
+                        }
+                    }
+                }
+            }
             let entry = &mut self.entries[i];
             entry.status = "testing".into();
             entry.lane = Some(lane);
@@ -667,6 +719,47 @@ impl Queue<'_> {
             self.save(&entry)?;
         }
         Ok(())
+    }
+}
+
+impl Queue<'_> {
+    /// Starts a merge queue run of an entry's candidate.
+    async fn queue_run(&self, e: &QueueRow, tasks: BTreeSet<String>) -> Result<String> {
+        self.app
+            .create_run(
+                CreateRun {
+                    repo: self.repo.name.clone(),
+                    url: None,
+                    sha: e
+                        .candidate_sha
+                        .clone()
+                        .context("entry without a candidate")?,
+                    overlay: None,
+                    tasks: tasks.into_iter().collect(),
+                    trigger: Some("queue".into()),
+                    git_ref: Some(format!("queue/{}", e.source)),
+                    no_cache: false,
+                    fresh: false,
+                    no_secrets: false,
+                    // Queueing is the decision to land it on the target.
+                    trusted: super::trusted_branch(
+                        self.target,
+                        default_branch(&self.mirror).await.ok().as_deref(),
+                    ),
+                },
+                e.pr,
+            )
+            .await
+    }
+
+    /// The tasks a lane has affected up to and including this entry.
+    fn lane_tasks(&self, e: &QueueRow) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .filter(|o| o.lane == e.lane && o.position <= e.position)
+            .flat_map(|o| o.affected.iter().cloned())
+            .filter(|t| !t.is_empty())
+            .collect()
     }
 }
 

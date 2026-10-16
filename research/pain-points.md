@@ -1919,3 +1919,49 @@ on, as is the default, most of that is cache hits.
 - **CI cost per landed change: NOT SOLVED.** There is no batching, which would mean testing only
   a lane's newest candidate and bisecting on failure. That is a larger change to the queue,
   left for later.
+
+## P36. Batching for the merge queue (P35's open gap)
+
+**Pain.** As P35: with CI on every candidate, a deep queue costs one full run per change.
+GitHub's merge queue batches up to 5 changes into one merge-commit test by default; Mergify's
+batches and Bors's "rollups" do the same, and all of them bisect a failed batch
+([Mergify batches](https://docs.mergify.com/merge-queue/batches/),
+[tenki](https://tenki.cloud/blog/github-merge-queue-setup),
+[humanwhocodes](https://humanwhocodes.com/blog/2026/04/improving-developer-velocity-github-merge-queue/)).
+
+**Before** (research/pain-hunt at P35): 10 overlapping changes on the 2-slot worker, 5-second
+checks, landed in 29.9s using 10 runs.
+
+**Fix** (research/pain-hunt), built on lanes:
+1. **A passing candidate settles the ones before it.** Every candidate contains all earlier
+   changes in its lane, so they are marked passed together, their runs are skipped ("covered
+   by run_…"), and they land.
+2. **A waiting candidate gets folded in.** A change that joins a lane while the previous
+   candidate's run has not been picked up by any worker replaces that run ("batched into
+   run_…"). Only the newest candidate is tested.
+3. **A failed batch is split.** If a candidate fails while earlier entries in its lane were
+   batched into it, those entries get their own runs, and the existing ejection logic finds the
+   change that broke it.
+
+Runs dropped this way end as **skipped** ("cancelled" on GitHub), not failed. The new
+`Db::skip_run_because` exists so a batched run never shows up as a red run.
+
+```
+10 overlapping PRs, 5s checks, 2 slots:
+  before (P35):  10 landed in 29.9s, 10 runs
+  after:         10 landed in 12.9s,  3 runs passed, 7 skipped (batched or covered)
+6 PRs with a bad one in the middle (bis3 adds a file the check rejects):
+  bis0–2, bis4–5 landed; bis3 failed; its file never reached main.  43.0s (the failure costs the split)
+```
+
+Covered by the e2e test `merge_queue_batches_waiting_changes_and_bisects_failures`. It occupies
+all four worker slots so queued candidates must wait, then queues `a`, `b` (bad) and `c`. It
+expects `a` and `c` landed, `b` ejected, at least one "batched into" run, and `b`'s file absent
+from `main`. It passed on three repeated runs, and all earlier merge queue tests still pass.
+
+**Verdict: SOLVED** for CI cost per landed change in a busy queue. Not done:
+- **Linear split.** A failed batch is split by testing each folded change, not by binary
+  bisection, so a batch of N costs up to N runs on failure.
+- **Only waiting runs are batched.** A run a worker has already started is never cancelled to
+  batch, so on an idle fleet each change still gets its own run. There it costs nothing extra,
+  since the slots were free.

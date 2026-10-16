@@ -1849,3 +1849,108 @@ async fn junit_reports_name_failed_tests() {
     let msg = view.groups[0].tasks[0].message.clone().unwrap_or_default();
     assert!(!msg.contains("cart.pays"), "stale report read: {msg}");
 }
+
+/// While workers are busy, queued changes in one lane are batched: only the
+/// newest candidate runs. A bad change inside the batch is still found (the
+/// batched changes get their own runs) and ejected; the rest land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merge_queue_batches_waiting_changes_and_bisects_failures() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let origin = root.join("origin.git");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    let mut groups = serde_json::Map::new();
+    for i in 0..4 {
+        groups.insert(
+            format!("busy{i}"),
+            serde_json::json!({ "tasks": { "wait": { "run": "sleep 3", "inputs": ["busy/**"], "cache": false } } }),
+        );
+    }
+    groups.insert(
+        "ci".into(),
+        serde_json::json!({ "tasks": { "integration": { "run": "! grep -rq BAD shared/", "inputs": ["shared/**"], "cache": false } } }),
+    );
+    write(
+        &work,
+        "pit.config.json",
+        &serde_json::json!({ "groups": groups }).to_string(),
+    );
+    write(&work, "shared/base", "0\n");
+    write(&work, "busy/x", "0\n");
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    for (b, body) in [("a", "1"), ("b", "BAD"), ("c", "3")] {
+        sh(&work, &format!("git checkout -q -b {b} main && echo {body} > shared/{b} && git add -A && git commit -qm {b} && git push -q origin {b} && git checkout -q main"));
+    }
+    // Occupy all four worker slots so queued candidates cannot start yet.
+    let busy = pit::cli::submit(&pit.client, &work, vec![], Default::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let url = origin.to_string_lossy().to_string();
+    for b in ["a", "b", "c"] {
+        let _: QueueEntryView = pit
+            .client
+            .post(
+                "/api/queue",
+                &QueueAdd {
+                    repo: "batch".into(),
+                    url: Some(url.clone()),
+                    branch: Some(b.into()),
+                    pr: None,
+                    target: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let entries = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let entries: Vec<QueueEntryView> = pit.client.get("/api/queue").await.unwrap();
+            let ours: Vec<_> = entries
+                .into_iter()
+                .filter(|e| ["a", "b", "c"].contains(&e.source.as_str()))
+                .collect();
+            if ours.len() == 3
+                && ours
+                    .iter()
+                    .all(|e| matches!(e.status.as_str(), "landed" | "failed"))
+            {
+                return ours;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("queue did not settle");
+    let status = |s: &str| {
+        entries
+            .iter()
+            .find(|e| e.source == s)
+            .unwrap()
+            .status
+            .clone()
+    };
+    assert_eq!(
+        (
+            status("a").as_str(),
+            status("b").as_str(),
+            status("c").as_str()
+        ),
+        ("landed", "failed", "landed"),
+        "{entries:?}"
+    );
+    let runs: Vec<RunView> = pit.client.get("/api/runs?limit=50").await.unwrap();
+    assert!(
+        runs.iter().any(|r| r.status == Status::Skipped
+            && r.message
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("batched into")),
+        "nothing was batched"
+    );
+    assert!(sh(&origin, "git show main:shared/b 2>/dev/null || echo absent").contains("absent"));
+    let _ = busy;
+}

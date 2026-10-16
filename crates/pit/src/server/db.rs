@@ -941,6 +941,15 @@ impl Db {
     /// its unclaimed groups are skipped. Groups already running finish on
     /// their workers, but their results no longer change the run. Returns
     /// whether the run was still active.
+    /// Whether no worker has picked up any part of the run yet.
+    pub fn run_untouched(&self, run_id: &str) -> Result<bool> {
+        Ok(!self
+            .conn
+            .lock()
+            .prepare_cached("SELECT 1 FROM groups_ WHERE run_id = ?1 AND status != 'queued'")?
+            .exists(params![run_id])?)
+    }
+
     pub fn cancel_run(&self, run_id: &str) -> Result<bool> {
         self.cancel_run_because(run_id, "cancelled")
     }
@@ -949,12 +958,22 @@ impl Db {
     /// Running groups lose their lease, so their worker's next heartbeat is
     /// refused and it stops the tasks.
     pub fn cancel_run_because(&self, run_id: &str, message: &str) -> Result<bool> {
+        self.cancel_run_as(run_id, message, Status::Failed)
+    }
+
+    /// Cancels a run whose work is done elsewhere (a merge queue batch):
+    /// it ends as skipped, not failed.
+    pub fn skip_run_because(&self, run_id: &str, message: &str) -> Result<bool> {
+        self.cancel_run_as(run_id, message, Status::Skipped)
+    }
+
+    fn cancel_run_as(&self, run_id: &str, message: &str, status: Status) -> Result<bool> {
         let c = self.conn.lock();
         let now = now_ms();
         let changed = c.execute(
-            "UPDATE runs SET status = 'failed', message = ?3, finished_at = ?1
+            "UPDATE runs SET status = ?4, message = ?3, finished_at = ?1
              WHERE id = ?2 AND status IN ('queued', 'running')",
-            params![now, run_id, message],
+            params![now, run_id, message, status.as_str()],
         )?;
         if changed == 0 {
             return Ok(false);
