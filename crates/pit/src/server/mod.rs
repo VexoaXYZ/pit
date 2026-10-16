@@ -1,0 +1,372 @@
+//! The control plane: run planning, dispatch, results, events, merge queue,
+//! GitHub integration, remote caches and the dashboard.
+
+pub mod api;
+pub mod db;
+pub mod github;
+pub mod queue;
+pub mod remote_cache;
+pub mod web;
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+use tokio::sync::{broadcast, Notify};
+
+use crate::cas::Cas;
+use crate::model::*;
+use db::Db;
+
+pub struct App {
+    pub db: Db,
+    pub cas: Cas,
+    pub data_dir: PathBuf,
+    pub events: broadcast::Sender<Event>,
+    /// Woken whenever a group becomes claimable.
+    pub work: Notify,
+    pub token: Option<String>,
+    pub github: Option<github::GitHub>,
+    pub public_url: String,
+    mirror_locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub queue_lock: tokio::sync::Mutex<()>,
+    /// Wakes the merge queue loop (see `serve_app`).
+    pub queue_kick: Notify,
+}
+
+pub struct ServerOpts {
+    pub data_dir: PathBuf,
+    pub addr: SocketAddr,
+    pub token: Option<String>,
+    pub public_url: Option<String>,
+}
+
+impl App {
+    pub fn new(data_dir: &Path, token: Option<String>, public_url: String) -> Result<Arc<App>> {
+        Self::with_github(data_dir, token, public_url, github::GitHub::from_env()?)
+    }
+
+    pub fn with_github(
+        data_dir: &Path,
+        token: Option<String>,
+        public_url: String,
+        github: Option<github::GitHub>,
+    ) -> Result<Arc<App>> {
+        std::fs::create_dir_all(data_dir)?;
+        let db = Db::open(&data_dir.join("pit.db"))?;
+        let cas = Cas::open(data_dir.join("cas"))?;
+        let (events, _) = broadcast::channel(4096);
+        Ok(Arc::new(App {
+            db,
+            cas,
+            data_dir: data_dir.to_path_buf(),
+            events,
+            work: Notify::new(),
+            token,
+            github,
+            public_url,
+            mirror_locks: Default::default(),
+            queue_lock: Default::default(),
+            queue_kick: Notify::new(),
+        }))
+    }
+
+    pub fn emit(
+        &self,
+        kind: &str,
+        run_id: Option<&str>,
+        group_id: Option<&str>,
+        task_id: Option<&str>,
+        data: serde_json::Value,
+    ) {
+        let _ = self.events.send(Event {
+            kind: kind.to_string(),
+            run_id: run_id.map(String::from),
+            group_id: group_id.map(String::from),
+            task_id: task_id.map(String::from),
+            data,
+        });
+    }
+
+    pub fn mirror_dir(&self, repo_id: &str) -> PathBuf {
+        self.data_dir.join("mirrors").join(format!("{repo_id}.git"))
+    }
+
+    /// Ensures the server's mirror of a repo has `sha`. Serialized per repo.
+    pub async fn ensure_commit(&self, repo: &db::Repo, sha: &str) -> Result<PathBuf> {
+        let dir = self.mirror_dir(&repo.id);
+        let lock = self.mirror_lock(&repo.id);
+        let _g = lock.lock().await;
+        crate::git::ensure_commit(&dir, &repo.url, sha).await?;
+        Ok(dir)
+    }
+
+    pub async fn fetch_mirror(&self, repo: &db::Repo) -> Result<PathBuf> {
+        let dir = self.mirror_dir(&repo.id);
+        let lock = self.mirror_lock(&repo.id);
+        let _g = lock.lock().await;
+        crate::git::ensure_mirror(&dir, &repo.url).await?;
+        crate::git::fetch(&dir).await?;
+        Ok(dir)
+    }
+
+    pub fn mirror_lock(&self, repo_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.mirror_locks
+            .lock()
+            .entry(repo_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Loads the config for a commit, preferring a version from the overlay.
+    pub async fn load_config(
+        &self,
+        mirror: &Path,
+        sha: &str,
+        overlay: Option<&Overlay>,
+    ) -> Result<PitConfig> {
+        let scratch = self.data_dir.join("tmp");
+        for name in crate::config::CONFIG_FILES {
+            if let Some(entry) = overlay.and_then(|o| o.entries.iter().find(|e| e.path == *name)) {
+                let Some(d) = &entry.digest else { continue };
+                let src = self
+                    .cas
+                    .get(d)?
+                    .context("overlay config blob missing from CAS")?;
+                return crate::config::parse(name, &src, &scratch).await;
+            }
+            if let Some(src) = crate::git::show_file(mirror, sha, name).await? {
+                return crate::config::parse(name, &src, &scratch).await;
+            }
+        }
+        bail!("no {} at {sha}", crate::config::CONFIG_TS)
+    }
+
+    pub fn load_overlay(&self, digest: &str) -> Result<Overlay> {
+        let bytes = self
+            .cas
+            .get(digest)?
+            .context("overlay manifest missing from CAS")?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub async fn create_run(
+        self: &Arc<Self>,
+        req: CreateRun,
+        github_pr: Option<u64>,
+    ) -> Result<String> {
+        let repo = self.db.upsert_repo(&req.repo, req.url.as_deref(), None)?;
+        let overlay_files = match &req.overlay {
+            Some(d) => self.load_overlay(d)?.entries.len(),
+            None => 0,
+        };
+        let trigger = req.trigger.clone().unwrap_or_else(|| "api".into());
+        let run_id = self.db.insert_run(
+            &repo.id,
+            &req.sha,
+            req.git_ref.as_deref(),
+            req.overlay.as_deref(),
+            overlay_files,
+            &trigger,
+            req.no_cache,
+            github_pr,
+        )?;
+        self.emit(
+            "run.created",
+            Some(&run_id),
+            None,
+            None,
+            serde_json::json!({ "repo": repo.name, "sha": req.sha, "trigger": trigger }),
+        );
+        let app = self.clone();
+        let id = run_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = app.plan_run(&id, &repo, &req).await {
+                tracing::warn!("planning {id} failed: {e:#}");
+                let _ = app
+                    .db
+                    .set_run_status(&id, Status::Error, Some(&format!("{e:#}")));
+                app.run_finished(&id).await;
+            }
+        });
+        Ok(run_id)
+    }
+
+    async fn plan_run(
+        self: &Arc<Self>,
+        run_id: &str,
+        repo: &db::Repo,
+        req: &CreateRun,
+    ) -> Result<()> {
+        let mirror = self.ensure_commit(repo, &req.sha).await?;
+        let overlay = req
+            .overlay
+            .as_deref()
+            .map(|d| self.load_overlay(d))
+            .transpose()?;
+        let config = self
+            .load_config(&mirror, &req.sha, overlay.as_ref())
+            .await?;
+        let groups = crate::graph::plan(&config, &req.tasks)?;
+        if self.db.run(run_id)?.status.is_done() {
+            return Ok(()); // Cancelled while planning.
+        }
+        if groups.is_empty() {
+            self.db
+                .set_run_status(run_id, Status::Passed, Some("no tasks to run"))?;
+            self.run_finished(run_id).await;
+            return Ok(());
+        }
+        for g in &groups {
+            let mut backends: Vec<Backend> = g
+                .tasks
+                .iter()
+                .filter_map(|(_, t)| t.backend)
+                .filter(|b| *b != Backend::Host)
+                .collect();
+            backends.sort_by_key(|b| b.as_str());
+            backends.dedup();
+            self.db
+                .insert_group(run_id, &g.name, &g.os, &backends, &g.tasks)?;
+        }
+        self.emit(
+            "run.planned",
+            Some(run_id),
+            None,
+            None,
+            serde_json::json!({ "groups": groups.len() }),
+        );
+        if let Some(gh) = &self.github {
+            gh.report_run(self, run_id).await;
+        }
+        self.work.notify_waiters();
+        Ok(())
+    }
+
+    /// Called whenever a group finishes; closes the run when all are done.
+    pub async fn group_finished(self: &Arc<Self>, run_id: &str) -> Result<()> {
+        if self.db.run(run_id)?.status.is_done() {
+            return Ok(());
+        }
+        let groups = self.db.groups_for_run(run_id)?;
+        if groups.is_empty() {
+            return Ok(()); // Still planning.
+        }
+        if groups.iter().all(|g| g.status.is_done()) {
+            // Workers never report a skipped group; only a cancel does, and a
+            // cancelled run must never count as green.
+            let cancelled = groups.iter().any(|g| g.status == Status::Skipped);
+            let failed = groups.iter().any(|g| !g.status.is_ok());
+            let status = if failed {
+                Status::Failed
+            } else {
+                Status::Passed
+            };
+            self.db
+                .set_run_status(run_id, status, cancelled.then_some("cancelled"))?;
+            self.run_finished(run_id).await;
+        } else if let Some(gh) = &self.github {
+            gh.report_run(self, run_id).await;
+        }
+        Ok(())
+    }
+
+    pub async fn run_finished(self: &Arc<Self>, run_id: &str) {
+        let status = self
+            .db
+            .run(run_id)
+            .map(|r| r.status.as_str())
+            .unwrap_or("error");
+        self.emit(
+            "run.finished",
+            Some(run_id),
+            None,
+            None,
+            serde_json::json!({ "status": status }),
+        );
+        if let Some(gh) = &self.github {
+            gh.report_run(self, run_id).await;
+        }
+        self.queue_kick.notify_one();
+    }
+
+    pub fn authorized(&self, header: Option<&str>, query_token: Option<&str>) -> bool {
+        let Some(token) = &self.token else {
+            return true;
+        };
+        let bearer = header
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::trim);
+        let basic_ok = header
+            .and_then(|h| h.strip_prefix("Basic "))
+            .and_then(|b| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(b.trim())
+                    .ok()
+            })
+            .map(|raw| {
+                String::from_utf8_lossy(&raw)
+                    .split_once(':')
+                    .map(|(_, p)| p == token)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        bearer == Some(token.as_str()) || query_token == Some(token.as_str()) || basic_ok
+    }
+}
+
+pub async fn serve(opts: ServerOpts) -> Result<()> {
+    let public_url = opts
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}", opts.addr));
+    let app = App::new(&opts.data_dir, opts.token.clone(), public_url)?;
+    serve_app(app, opts.addr).await
+}
+
+pub async fn serve_app(app: Arc<App>, addr: SocketAddr) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    serve_listener(app, listener).await
+}
+
+pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) -> Result<()> {
+    // Requeue work from workers that went away.
+    let reaper = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            match reaper.db.requeue_stale_groups(60_000) {
+                Ok(ids) if !ids.is_empty() => {
+                    tracing::warn!("requeued {} group(s) from silent workers", ids.len());
+                    reaper.work.notify_waiters();
+                }
+                Err(e) => tracing::warn!("reaper: {e:#}"),
+                _ => {}
+            }
+        }
+    });
+    // The merge queue advances when a run finishes, and every few seconds to
+    // notice branches that moved.
+    let queue_app = app.clone();
+    tokio::spawn(async move {
+        loop {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                queue_app.queue_kick.notified(),
+            )
+            .await;
+            if let Err(e) = queue::tick(&queue_app).await {
+                tracing::warn!("merge queue tick failed: {e:#}");
+            }
+        }
+    });
+    let router = api::router(app.clone());
+    tracing::info!("pit server listening on {}", app.public_url);
+    axum::serve(listener, router).await?;
+    Ok(())
+}
