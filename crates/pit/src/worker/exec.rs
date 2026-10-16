@@ -97,6 +97,8 @@ pub struct EnvPolicy {
     pub hide: Vec<String>,
     /// Inherit only `MINIMAL_ENV`, for code nobody trusts (fork PRs).
     pub minimal: bool,
+    /// The network a `docker` task joins: its group's services'.
+    pub docker_network: Option<String>,
 }
 
 /// What a task gets under `EnvPolicy::minimal`: enough to find tools and a
@@ -192,6 +194,8 @@ pub fn command_with(
             ];
             if !network {
                 a.extend(["--network".into(), "none".into()]);
+            } else if let Some(n) = &policy.docker_network {
+                a.extend(["--network".into(), n.clone()]);
             }
             if let Some(m) = &task.memory {
                 a.extend([
@@ -489,12 +493,12 @@ mod tests {
         assert!(out(EnvPolicy::default()).await.contains("[s2][g][path]"));
         let hidden = EnvPolicy {
             hide: vec!["some_token_for_test_x".into()],
-            minimal: false,
+            ..Default::default()
         };
         assert!(out(hidden).await.contains("[][g][path]"));
         let minimal = EnvPolicy {
-            hide: vec![],
             minimal: true,
+            ..Default::default()
         };
         assert!(out(minimal).await.contains("[][g][path]"));
     }

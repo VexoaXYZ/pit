@@ -275,12 +275,27 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
             if !task.shard_files.is_empty() && task.shards.unwrap_or(1) < 2 {
                 bail!("task {gname}.{tname}: shardFiles needs shards of 2 or more");
             }
+            // Services are a group's: every task gets the group's, and only
+            // those.
+            task.services = group.services.clone();
             if task.image.is_some() && task.backend.is_none() {
                 task.backend = Some(crate::model::Backend::Docker);
             }
         }
     }
     for (gname, group) in &config.groups {
+        for (sname, svc) in &group.services {
+            let ok_name = !sname.is_empty()
+                && sname.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'
+                });
+            if !ok_name {
+                bail!("group {gname}: service name {sname:?} should be lowercase letters, digits, - or _");
+            }
+            if svc.image.is_empty() || svc.image.starts_with('-') {
+                bail!("group {gname}: service {sname} needs an image");
+            }
+        }
         for (tname, task) in &group.tasks {
             if task.memory.is_some() && task.backend != Some(crate::model::Backend::Docker) {
                 bail!("task {gname}.{tname}: `memory` needs the docker backend (set `image` or `backend: \"docker\"`)");

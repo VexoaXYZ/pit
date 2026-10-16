@@ -2406,7 +2406,10 @@ async fn metrics_show_queue_depth_for_autoscaling() {
     let metrics = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let m = pit.client.get_text("/metrics").await.unwrap();
-            if m.contains(&format!("pit_queued_groups{{os=\"{other}\"}} 1")) {
+            // The worker counts once it has polled for work.
+            if m.contains(&format!("pit_queued_groups{{os=\"{other}\"}} 1"))
+                && m.contains("pit_workers_online 1")
+            {
                 return m;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2895,4 +2898,52 @@ async fn the_merge_queue_fails_fast() {
         run.message.as_deref(),
         Some("stopped early: default.lint failed")
     );
+}
+
+/// A group's `services` start before its tasks, are reachable from docker
+/// tasks by name and from host tasks on a published port (so two groups on
+/// one worker never fight over a port), and are removed afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn groups_get_their_own_service_containers() {
+    if !(cfg!(target_os = "linux")
+        && pit::worker::exec::detect_backends()
+            .await
+            .contains(&Backend::Docker))
+    {
+        eprintln!("skipped: no Linux docker");
+        return;
+    }
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let service = serde_json::json!({
+        "image": "node:22-alpine",
+        "command": ["node", "-e", "require('http').createServer((q, r) => r.end(process.env.WHO)).listen(8080)"],
+        "ports": [8080],
+    });
+    let mut a = service.clone();
+    a["env"] = serde_json::json!({ "WHO": "a" });
+    let mut b = service.clone();
+    b["env"] = serde_json::json!({ "WHO": "b" });
+    let fetch = "node -e \"fetch('http://' + process.env.PIT_SERVICE_WEB_HOST + ':' + process.env.PIT_SERVICE_WEB_PORT).then(r => r.text()).then(t => { console.log('got ' + t); process.exit(t === process.env.WANT ? 0 : 1) })\"";
+    let config = serde_json::json!({ "groups": {
+        "a": { "services": { "web": a }, "tasks": {
+            "in-docker": { "image": "node:22-alpine", "run": format!("WANT=a {fetch}"), "cache": false },
+        } },
+        "b": { "services": { "web": b }, "tasks": {
+            "on-host": { "run": format!("WANT=b {fetch}"), "cache": false },
+        } },
+    } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run_with_timeout(&pit, dir, Duration::from_secs(240)).await;
+    assert_eq!(view.status, Status::Passed, "{view:?}");
+    let left = sh(
+        dir,
+        "docker ps -aq --filter name=pit-grp_; docker network ls -q --filter name=pit-grp_",
+    );
+    assert!(left.trim().is_empty(), "left behind: {left}");
 }

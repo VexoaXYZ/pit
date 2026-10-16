@@ -411,8 +411,9 @@ impl App {
                 .filter_map(|(_, t)| t.backend)
                 .filter(|b| *b != Backend::Host)
                 .collect();
-            // A fork's tasks run in containers only.
-            if req.no_secrets {
+            // A fork's tasks run in containers only, and services are
+            // containers.
+            if req.no_secrets || g.tasks.iter().any(|(_, t)| !t.services.is_empty()) {
                 backends.push(Backend::Docker);
             }
             backends.sort_by_key(|b| b.as_str());

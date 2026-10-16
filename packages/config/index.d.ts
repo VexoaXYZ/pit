@@ -114,7 +114,28 @@ export interface GroupDef {
    * none are cancelled.
    */
   lock?: string;
+  /**
+   * Containers the group's tasks talk to, started before its first task and
+   * removed after its last. Tasks get `PIT_SERVICE_<NAME>_HOST` and
+   * `PIT_SERVICE_<NAME>_PORT`. Needs Docker on the worker.
+   */
+  services?: Record<string, ServiceDef>;
   tasks: Record<string, TaskDef>;
+}
+
+export interface ServiceDef {
+  image: string;
+  /** Container variables, e.g. `{ POSTGRES_PASSWORD: "pit" }`. */
+  env?: Record<string, string>;
+  /** Arguments after the image, replacing its default command. */
+  command?: string[];
+  /** Container ports tasks connect to; published on random host ports. */
+  ports?: number[];
+  /**
+   * Run in the container until it succeeds before any task starts, e.g.
+   * `"pg_isready -U postgres"`. Without it Pit waits for the first port.
+   */
+  ready?: string;
 }
 
 export interface PitConfig {

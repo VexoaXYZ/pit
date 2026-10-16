@@ -58,8 +58,33 @@ pub struct GroupDef {
     /// database. Others wait in line; none are cancelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock: Option<String>,
+    /// Containers the group's tasks talk to (a database, a cache), started
+    /// before its first task and removed after its last. Needs Docker.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, ServiceDef>,
     #[serde(default)]
     pub tasks: BTreeMap<String, TaskDef>,
+}
+
+/// A service container, like Actions' `services` or a compose service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServiceDef {
+    pub image: String,
+    /// Variables for the container (`POSTGRES_PASSWORD`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Arguments after the image, replacing its default command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Container ports the tasks connect to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
+    /// A command run in the container until it succeeds, before any task
+    /// starts (`pg_isready -U postgres`). Without one, Pit waits for the
+    /// first port to accept connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -144,6 +169,9 @@ pub struct TaskDef {
     /// This shard's files; set by Pit when it plans the run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shard_assigned: Vec<String>,
+    /// The group's services; copied onto every task when the config loads.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, ServiceDef>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]

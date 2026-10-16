@@ -134,6 +134,34 @@ environment. Waiting groups stay queued, with no limit and no cancellations, and
 are waiting for ("waiting: lock `staging-db` is held by run_…"). The lock covers the whole
 group, so keep it small.
 
+### Services
+
+A database or cache for a group's tests, without one shared instance or a `docker run` in a task:
+
+```ts
+api: {
+  services: {
+    db: { image: "postgres:16-alpine", env: { POSTGRES_PASSWORD: "pit" }, ports: [5432], ready: "pg_isready -U postgres" },
+  },
+  tasks: { test: { run: "npm test" } },
+}
+```
+
+Each service starts before the group's first task, on a network of the group's own, and is
+removed after its last task, however the group ended (a worker that died mid-job cleans up when it
+starts again). Pit waits for `ready` to succeed in the container, or for the first port to accept
+connections, and if the service exits or isn't ready after 90 seconds, the group fails with its
+last log lines.
+
+Tasks find a service through `PIT_SERVICE_DB_HOST` and `PIT_SERVICE_DB_PORT`:
+- a `docker` task gets the service's name and container port (`db:5432`);
+- a host or sandbox task gets `127.0.0.1` and a random published port, so two groups on one
+  worker never fight over 5432.
+
+`command` replaces the image's arguments. Each service's image (by ID), command and variables are
+part of its group's cache keys. Services need Docker on the worker, and their `env` values are
+visible to the worker's `ps`, so keep them to test credentials.
+
 ### Schedules
 
 ```ts

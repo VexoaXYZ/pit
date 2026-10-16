@@ -2862,3 +2862,77 @@ queueing, holding its lane, and every change behind it, for the slowest task.
 **Verdict: SOLVED.** Pull requests show every failure, and the merge gate fails fast, with no
 per-workflow setting. Limit: the queue notices a failure on its next tick (about a second), and
 the cancelled run's worker stops at its next heartbeat.
+
+## P48. Tests need a database: service containers, port clashes and leftovers
+
+**The pain.**
+- GitHub Actions' `services` run on Linux runners only.
+- For years they had no way to pass arguments to the image:
+  [actions/runner#1152](https://github.com/actions/runner/pull/1152),
+  [#2139](https://github.com/actions/runner/issues/2139),
+  [community #52675](https://github.com/orgs/community/discussions/52675),
+  [#26688](https://github.com/orgs/community/discussions/26688),
+  [#160506](https://github.com/orgs/community/discussions/160506). A 2026 article reports that
+  `entrypoint` and `command` keys were added
+  ([itacademy](https://itacademy.com.ua/en/articles/2026-04-04/github-actions-service-containers-entrypoint-command-2026-04-04/));
+  I couldn't confirm that in GitHub's own docs.
+- Readiness is hand-written with `--health-cmd` options
+  ([Medium](https://medium.com/@sreeprad99/from-ci-chaos-to-orchestration-deep-dive-into-github-actions-service-containers-and-docker-compose-7cb2ff335864),
+  [jen20](https://jen20.dev/post/services-in-github-actions/)).
+- On a persistent runner, people `docker run -d -p 5432:5432 postgres` in a step. That clashes with
+  concurrent jobs on the same port and leaks the container when the step fails.
+
+**Reproduction.** Pit had no services, so a task had to start Postgres itself. Two groups did
+that (`docker run -d -p 55432:5432 postgres:16-alpine`):
+- the second failed with exit 125, because the port was taken;
+- the first's test failed after the database came up;
+- both containers were left behind (one `Up`, one `Created`).
+
+Verdict before: **NOT SOLVED**.
+
+**Fix: `services` on a group.** It takes `image`, `env`, `command`, `ports` and `ready`. For each
+group, the worker:
+- creates a network of its own (`pit-<group>`);
+- starts each service on it with a network alias, its ports published on random `127.0.0.1`
+  ports;
+- waits for readiness: `ready` run with `docker exec` until it succeeds, or else the first port
+  accepting connections on the container's own address. A published port accepts before the
+  service listens, so it is only the fallback where the container's address isn't reachable
+  (Docker Desktop);
+- fails the group with the service's last 20 log lines if it exits or isn't ready within 90s;
+- removes the services and network when the group ends, however it ended (after a `--debug`
+  hold, so the debug shell can still reach them).
+
+Tasks get `PIT_SERVICE_<NAME>_HOST` and `_PORT` (and `_PORT_<n>` per port):
+- `docker` tasks join the group's network and get `db` and `5432`;
+- host and sandbox tasks get `127.0.0.1` and the published port.
+
+Other details:
+- Each service's image ID, command, variables and ports are in its group's cache keys.
+- Planning requires Docker for groups with services.
+- Containers and networks are labelled with the worker's instance id, kept in its data dir. A
+  worker that died mid-job removes its own leftovers when it starts. It's not labelled with the
+  worker's name: workers on one machine share the hostname, and the first version, labelled by
+  name, made each new e2e worker remove another test's live services.
+
+**Measured.**
+- The same two-group setup with `services.db` passed without clashes:
+  - `migrate` in a `postgres:16-alpine` task connected to `db:5432` and created a table;
+  - `test` read the row back (`found 42`) and then failed on purpose;
+  - the host-side group reached its own Postgres at `127.0.0.1:32768`;
+  - afterwards, no containers or networks with the label remained.
+- The whole run took 17.7s, including two Postgres starts.
+- e2e `groups_get_their_own_service_containers` (Linux with Docker): two groups each run an HTTP
+  service on 8080 with different answers. A docker task and a host task each get their own group's
+  answer, and nothing is left behind.
+- The e2e suite passed 9 times in a row after the readiness change. One run before it failed
+  without a captured reason; a not-yet-listening service behind docker's proxy is the likely
+  cause, not proven.
+
+**Verdict: PARTIAL.**
+- Pit now runs per-group service containers with no port clashes and no leftovers.
+- Limits:
+  - Services need Docker, so they're Linux-container only like Actions'.
+  - No `depends_on` between services: they start in name order, each waiting until ready.
+  - Service `env` values appear in `docker run`'s arguments, visible to `ps` on the worker.
+  - No health status beyond `ready`.

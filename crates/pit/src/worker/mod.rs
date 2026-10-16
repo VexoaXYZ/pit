@@ -12,6 +12,7 @@ pub mod files;
 pub mod junit;
 pub mod mask;
 pub mod memory;
+pub mod services;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -64,6 +65,12 @@ pub struct Worker {
     /// Groups running now, by id: their lease, to hand back on a hard stop,
     /// and the switch that stops their tasks.
     running: Mutex<HashMap<String, Running>>,
+    /// Service containers of the groups running now, by group id.
+    services: Mutex<HashMap<String, Arc<services::Running>>>,
+    /// Identifies this worker's data dir across restarts, unlike its name
+    /// (the hostname by default, shared by workers on one machine). Its
+    /// service containers are labelled with it.
+    instance: String,
     /// `runtime` command outputs, per job (`group id \0 command`).
     runtime_memo: Mutex<HashMap<String, String>>,
 }
@@ -130,6 +137,9 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
         tracing::info!("{} secret(s) from {}", worker.secrets.len(), path.display());
     }
     worker.client = worker.client.with_worker_token(opts.worker_token.clone());
+    if worker.info.backends.contains(&Backend::Docker) {
+        services::clean_up_after(&worker.instance).await;
+    }
     let worker = Arc::new(worker);
     tracing::info!(
         "pit worker {} ({} {}, {} cpus, backends: {}) serving {} with {} slot(s)",
@@ -286,6 +296,8 @@ impl Worker {
             secrets: Default::default(),
             draining: Default::default(),
             running: Default::default(),
+            services: Default::default(),
+            instance: instance_id(data_dir),
             runtime_memo: Default::default(),
         })
     }
@@ -556,17 +568,44 @@ impl Worker {
                 prepare_ms,
             },
             Ok((files, note)) => {
-                let status = self
-                    .clone()
-                    .run_tasks(&job, &ws, Arc::new(files), cancel_rx)
-                    .await;
-                GroupResult {
-                    status,
-                    message: note,
-                    prepare_ms,
+                let wanted = job
+                    .tasks
+                    .first()
+                    .map(|t| t.def.services.clone())
+                    .unwrap_or_default();
+                let started = if wanted.is_empty() {
+                    Ok(None)
+                } else {
+                    services::start(&self.instance, &job.group_id, &wanted)
+                        .await
+                        .map(Some)
+                };
+                match started {
+                    Err(e) => GroupResult {
+                        status: Status::Error,
+                        message: Some(format!("{e:#}")),
+                        prepare_ms,
+                    },
+                    Ok(svc) => {
+                        if let Some(s) = svc {
+                            self.services
+                                .lock()
+                                .insert(job.group_id.clone(), Arc::new(s));
+                        }
+                        let status = self
+                            .clone()
+                            .run_tasks(&job, &ws, Arc::new(files), cancel_rx)
+                            .await;
+                        GroupResult {
+                            status,
+                            message: note,
+                            prepare_ms,
+                        }
+                    }
                 }
             }
         };
+        let services = self.services.lock().remove(&job.group_id);
         hb.abort();
         let debug_dir = debug::dir(&self.data_dir, &job.group_id);
         if job.debug && debug::has_scripts(&debug_dir) {
@@ -577,6 +616,10 @@ impl Worker {
             let (w, ws) = (self.clone(), ws.clone());
             tokio::spawn(async move {
                 debug::hold(&debug_dir, debug::HOLD).await;
+                // The debug shell can still reach the services until then.
+                if let Some(s) = services {
+                    s.stop().await;
+                }
                 w.release_workspace(&pool, &ws, fresh);
                 if fresh {
                     disk::remove_meta(&ws);
@@ -584,6 +627,9 @@ impl Worker {
                 }
             });
         } else {
+            if let Some(s) = services {
+                s.stop().await;
+            }
             drop(lease);
             if job.fresh {
                 let ws = ws.clone();
@@ -1108,9 +1154,15 @@ impl Worker {
             secret_values.push(token.clone());
             env.push(("PIT_OIDC_TOKEN".into(), token));
         }
+        // Where the group's services are, from this task's backend.
+        let services = self.services.lock().get(&job.group_id).cloned();
+        if let Some(s) = &services {
+            env.extend(s.env(backend));
+        }
         let policy = exec::EnvPolicy {
             hide: self.secrets.keys().cloned().collect(),
             minimal: job.no_secrets,
+            docker_network: services.as_ref().map(|s| s.network.clone()),
         };
         // Secrets never reach the server's logs, live or stored.
         let masker = Arc::new(mask::Masker::new(secret_values));
@@ -1389,6 +1441,20 @@ impl Worker {
     }
 }
 
+/// A random id kept in the data dir, made on first start.
+fn instance_id(data_dir: &Path) -> String {
+    let path = data_dir.join("instance-id");
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        if !id.trim().is_empty() {
+            return id.trim().to_string();
+        }
+    }
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let _ = std::fs::create_dir_all(data_dir);
+    let _ = std::fs::write(&path, &id);
+    id
+}
+
 fn warm_file(ws: &Path) -> PathBuf {
     disk::meta_file(ws, "warm.json")
 }
@@ -1430,6 +1496,27 @@ impl Worker {
             };
             out.insert(format!("{}{image}", crate::graph::IMAGE_INPUT), id);
         }
+        // A test's result depends on the database it ran against: each
+        // service's image (by ID), command and variables are inputs too.
+        for (name, svc) in &def.services {
+            let memo_key = format!("{}\0service {name}", job.group_id);
+            let cached = self.runtime_memo.lock().get(&memo_key).cloned();
+            let id = match cached {
+                Some(id) => id,
+                None => {
+                    let id = image_id(&svc.image).await;
+                    self.runtime_memo.lock().insert(memo_key, id.clone());
+                    id
+                }
+            };
+            out.insert(
+                format!("service {name}"),
+                format!(
+                    "{} {id} command={:?} env={:?} ports={:?}",
+                    svc.image, svc.command, svc.env, svc.ports
+                ),
+            );
+        }
         for cmd in &def.runtime {
             let memo_key = format!("{}\0{cmd}", job.group_id);
             if let Some(v) = self.runtime_memo.lock().get(&memo_key).cloned() {
@@ -1450,6 +1537,7 @@ impl Worker {
             let policy = exec::EnvPolicy {
                 hide: self.secrets.keys().cloned().collect(),
                 minimal: job.no_secrets,
+                docker_network: None,
             };
             let exec::TaskCommand {
                 cmd: mut command,
