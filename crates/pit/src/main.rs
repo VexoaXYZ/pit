@@ -84,6 +84,11 @@ enum Command {
         /// incoming webhook works as is).
         #[arg(long, env = "PIT_NOTIFY_URL")]
         notify_url: Option<String>,
+        /// Issue OIDC tokens to tasks (`oidc` in the config), so they can get
+        /// cloud credentials without stored keys. Needs PIT_TOKEN and
+        /// PIT_WORKER_TOKEN, and a server host no task can read.
+        #[arg(long, env = "PIT_OIDC")]
+        oidc: bool,
     },
     /// Run a worker that claims groups from a server.
     Worker {
@@ -316,6 +321,7 @@ async fn run(cli: Cli) -> Result<i32> {
             cache_max_gb,
             worker_token,
             notify_url,
+            oidc,
         } => {
             pit::server::serve(pit::server::ServerOpts {
                 data_dir: data.unwrap_or_else(default_data).join("server"),
@@ -325,6 +331,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 cache_max_bytes: gb_to_bytes(cache_max_gb),
                 worker_token,
                 notify_url,
+                oidc,
             })
             .await?;
             Ok(0)

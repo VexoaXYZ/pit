@@ -98,18 +98,27 @@ impl Issuer {
     }
 }
 
-/// The subject a cloud policy matches on, in the shape GitHub uses:
-/// `repo:<repo>:ref:refs/heads/main` for trusted branch runs, and a
-/// distinct form for everything else, so a policy for main never matches a
-/// pull request or a laptop.
-pub fn subject(repo: &str, trigger: &str, git_ref: Option<&str>, trusted: bool) -> String {
-    let r = git_ref.unwrap_or_default();
+/// The subject a cloud policy matches on, in GitHub's shape, for a trusted
+/// run: `repo:<owner/name>:ref:refs/heads/<branch>` for runs of the default
+/// branch (pushes, post-merge, schedules) and `repo:<owner/name>:merge_queue`
+/// for merge queue candidates into it. `None` for anything else, and for
+/// names that could smuggle in another claim.
+pub fn subject(repo: &str, trigger: &str, git_ref: Option<&str>) -> Option<String> {
+    let safe = |s: &str| !s.is_empty() && !s.contains([':', '*', ' ']);
+    if !safe(repo) {
+        return None;
+    }
     match trigger {
-        "queue" => format!("repo:{repo}:merge_queue:{}", r.trim_start_matches("queue/")),
-        "pr" => format!("repo:{repo}:pull_request"),
-        "local" => format!("repo:{repo}:local:{r}"),
-        _ if trusted => format!("repo:{repo}:ref:refs/heads/{r}"),
-        t => format!("repo:{repo}:{t}:{r}"),
+        "queue" => Some(format!("repo:{repo}:merge_queue")),
+        "push" | "post-merge" => {
+            let branch = git_ref.filter(|b| safe(b))?;
+            Some(format!("repo:{repo}:ref:refs/heads/{branch}"))
+        }
+        t if t.starts_with("schedule:") => {
+            let branch = git_ref.filter(|b| safe(b))?;
+            Some(format!("repo:{repo}:ref:refs/heads/{branch}"))
+        }
+        _ => None,
     }
 }
 
@@ -145,30 +154,32 @@ mod tests {
     }
 
     #[test]
-    fn subjects_keep_main_apart_from_everything_else() {
+    fn subjects_only_for_trusted_shapes_and_never_injectable() {
         assert_eq!(
-            subject("acme/app", "push", Some("main"), true),
-            "repo:acme/app:ref:refs/heads/main"
+            subject("acme/app", "push", Some("main")).as_deref(),
+            Some("repo:acme/app:ref:refs/heads/main")
         );
         assert_eq!(
-            subject("acme/app", "push", Some("feature"), false),
-            "repo:acme/app:push:feature"
+            subject("acme/app", "post-merge", Some("main")).as_deref(),
+            Some("repo:acme/app:ref:refs/heads/main")
         );
         assert_eq!(
-            subject("acme/app", "pr", Some("pull/7"), false),
-            "repo:acme/app:pull_request"
+            subject("acme/app", "schedule:nightly", Some("main")).as_deref(),
+            Some("repo:acme/app:ref:refs/heads/main")
         );
         assert_eq!(
-            subject("acme/app", "local", Some("wip"), false),
-            "repo:acme/app:local:wip"
+            subject("acme/app", "queue", Some("queue/fix")).as_deref(),
+            Some("repo:acme/app:merge_queue")
         );
+        // Untrusted shapes, and the review's forgery (`trigger: "ref"`), get nothing.
+        for t in ["pr", "local", "api", "rerun", "ref"] {
+            assert_eq!(subject("acme/app", t, Some("refs/heads/main")), None, "{t}");
+        }
+        // Separators cannot smuggle in another claim.
         assert_eq!(
-            subject("acme/app", "queue", Some("queue/fix"), true),
-            "repo:acme/app:merge_queue:fix"
+            subject("acme/app", "push", Some("x:ref:refs/heads/main")),
+            None
         );
-        assert_eq!(
-            subject("acme/app", "schedule:nightly", Some("main"), true),
-            "repo:acme/app:ref:refs/heads/main"
-        );
+        assert_eq!(subject("acme:x", "push", Some("main")), None);
     }
 }

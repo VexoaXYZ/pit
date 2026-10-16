@@ -56,8 +56,8 @@ pub struct App {
     pub inflight: parking_lot::Mutex<HashMap<String, String>>,
     /// The last minute `schedule::tick` evaluated.
     pub schedule_minute: parking_lot::Mutex<Option<i64>>,
-    /// Signs OIDC tokens for tasks.
-    pub oidc: oidc::Issuer,
+    /// Signs OIDC tokens for tasks; set only by `pit server --oidc`.
+    pub oidc: std::sync::OnceLock<oidc::Issuer>,
 }
 
 pub struct ServerOpts {
@@ -71,6 +71,8 @@ pub struct ServerOpts {
     /// Webhook (Slack-compatible) told when main or a schedule breaks or is
     /// fixed. See `notify`.
     pub notify_url: Option<String>,
+    /// Issue OIDC tokens to tasks (see `oidc`).
+    pub oidc: bool,
     pub public_url: Option<String>,
     /// CAS size limit in bytes; 0 means unlimited.
     pub cache_max_bytes: u64,
@@ -108,7 +110,7 @@ impl App {
             notify_url: Default::default(),
             inflight: Default::default(),
             schedule_minute: Default::default(),
-            oidc: oidc::Issuer::load_or_create(data_dir)?,
+            oidc: Default::default(),
             gc_grace_ms: AtomicU64::new(2 * 60 * 1000),
             evicted_entries: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),
@@ -244,6 +246,19 @@ impl App {
         }
         out.extend(crate::git::read_blobs(mirror, sha, &from_git).await?);
         Ok(out)
+    }
+
+    /// Turns on the OIDC issuer. Only for a server whose data dir no task can
+    /// read: never under `pit up`, where the worker shares its user.
+    pub fn enable_oidc(&self) -> Result<()> {
+        if self.token.is_none() || self.worker_token.lock().is_none() {
+            bail!(
+                "--oidc needs PIT_TOKEN and PIT_WORKER_TOKEN: without them anyone who can reach \
+                 the server could claim a job and get a token for it"
+            );
+        }
+        let _ = self.oidc.set(oidc::Issuer::load_or_create(&self.data_dir)?);
+        Ok(())
     }
 
     pub fn load_overlay(&self, digest: &str) -> Result<Overlay> {
@@ -565,6 +580,9 @@ pub async fn serve(opts: ServerOpts) -> Result<()> {
     *app.notify_url.lock() = opts.notify_url.clone();
     app.cache_max_bytes
         .store(opts.cache_max_bytes, std::sync::atomic::Ordering::Relaxed);
+    if opts.oidc {
+        app.enable_oidc()?;
+    }
     serve_app(app, opts.addr).await
 }
 

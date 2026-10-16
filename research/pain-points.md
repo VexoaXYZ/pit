@@ -2084,8 +2084,47 @@ and the e2e test `tasks_get_verifiable_oidc_tokens`. That test verifies the toke
 does: discovery, then JWKS, then an ES256 signature check with audience and issuer, then the
 claims. It also checks the token is masked in the log and that there is a 403 without a lease.
 
+**An independent security review of that first version found it unsafe.** Three findings were
+reproduced against the built binary:
+1. **(Critical) Forged subjects.** Any API token holder could create a run with
+   `trigger: "ref", ref: "refs/heads/main"` and get `sub: repo:X:ref:refs/heads/main`, because
+   untrusted subjects were built as `repo:{repo}:{trigger}:{ref}`.
+2. **(Critical) Squatted repo names.** Registering an unclaimed repo name through the API gave a
+   trusted schedule or merge queue run of the caller's own code, with a main-branch `sub`.
+3. **(Critical) A readable key.** Under `pit up` the worker shares the server's user, so any
+   task, including a fork run, could read `oidc-es256.p8` and sign tokens offline.
+
+Three more came from reading the code:
+
+4. **(High) Claiming a main job without code.** Without `PIT_WORKER_TOKEN`, any API token
+   holder could claim a main job and mint a token from its lease.
+5. **(Medium) Queue subjects** ignored trust and the target branch.
+6. **(Low) Key file race.** The key file was briefly world-readable, and any read error
+   regenerated it.
+
+**Fixed:**
+- **Opt-in.** OIDC is off unless `pit server --oidc`, which refuses to start without both
+  `PIT_TOKEN` and `PIT_WORKER_TOKEN`. `pit up` cannot enable it, and no key is created otherwise.
+- **Trusted, GitHub-verified runs only.** Tokens go only to trusted runs of repos registered by
+  a signed GitHub webhook, and the subject uses GitHub's `owner/name`.
+- **Two subject shapes.** `subject()` produces only `…:ref:refs/heads/<branch>` (push,
+  post-merge, schedules) and `…:merge_queue`, and rejects names containing `:`, `*` or spaces.
+- **Safe key file.** It is created `create_new` with mode 0600, and only a missing file is
+  regenerated.
+
+The e2e test (`oidc_tokens_only_for_trusted_github_runs`) now covers the review's cases:
+- **Refused setups:** OIDC is off by default, and `enable_oidc` fails without a worker token.
+- **The good path:** a signed push to main gets a verifiable token with
+  `sub: repo:acme/widgets:ref:refs/heads/main` and `trusted: true`, masked in the log.
+- **Refused runs:** a `pit run` of the same repo is refused, and so is the review's forged API
+  run (`trigger: "ref"`).
+
+Live, `pit up` now serves no JWKS (404), and a task asking for a token is refused with a clear
+message.
+
 **Verdict: PARTIAL.** Issuance is complete and standards-shaped, but it was **not tested against
-a real cloud provider** from this machine. A cloud also needs the issuer at a public HTTPS URL
+a real cloud provider** from this machine. It is also only safe with the `--oidc` server on a
+host where no task runs: a same-user task can read the key file or the worker's environment. A cloud also needs the issuer at a public HTTPS URL
 (`PIT_PUBLIC_URL` behind TLS). Not done:
 - **No token refresh.** Tasks longer than 10 minutes that need fresh credentials get no new
   token.

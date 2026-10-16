@@ -2047,15 +2047,48 @@ async fn a_change_batched_into_a_removed_one_still_lands() {
     assert_eq!(entries[0].status, "landed", "{entries:?}");
 }
 
-/// A task asks for an OIDC token and gets one a cloud would accept: signed
-/// with the key at the server's public JWKS, for its audience, with claims
-/// from the run. Without a live job lease there is no token.
+/// OIDC tokens go only to trusted runs of repos GitHub vouched for, on a
+/// server started with `--oidc`: a push to main gets one a cloud would accept
+/// (verified against the public JWKS), while a `pit run` and a run forged
+/// through the API to look like main get none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tasks_get_verifiable_oidc_tokens() {
-    let pit = start().await;
+async fn oidc_tokens_only_for_trusted_github_runs() {
+    use hmac::Mac;
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github =
+        pit::server::github::GitHub::with_token("http://127.0.0.1:9", "t", Some("s3cret".into()))
+            .unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        Some("api-tok".into()),
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    // Off until enabled, and refused without a worker token.
+    assert!(app.oidc.get().is_none());
+    assert!(app.enable_oidc().is_err());
+    *app.worker_token.lock() = Some("w-tok".into());
+    app.enable_oidc().unwrap();
+    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: Some("api-tok".into()),
+        name: Some("oidc".into()),
+        data_dir: data.path().join("worker"),
+        slots: 2,
+        parallelism: 2,
+        workspace_max_bytes: 0,
+        worker_token: Some("w-tok".into()),
+        secrets_file: None,
+    }));
+    let client = Client::new(&base, Some("api-tok".into())).unwrap();
+
     let repo = tempfile::tempdir().unwrap();
-    let dir = repo.path();
-    let out = dir
+    let out = repo
+        .path()
         .join("..")
         .join(format!("oidc-{}.jwt", std::process::id()));
     let config = serde_json::json!({ "tasks": { "deploy": {
@@ -2063,19 +2096,47 @@ async fn tasks_get_verifiable_oidc_tokens() {
         "oidc": "sts.amazonaws.com",
         "cache": false,
     } } });
-    write(dir, "pit.config.json", &config.to_string());
+    write(repo.path(), "pit.config.json", &config.to_string());
     sh(
-        dir,
+        repo.path(),
         "git init -q -b main && git add -A && git commit -qm init",
     );
-    let view = run(&pit, dir).await;
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+
+    // A push to main, signed by GitHub: trusted, verified repo.
+    let payload = serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": sha,
+        "repository": { "full_name": "acme/widgets", "clone_url": repo.path().to_string_lossy(), "default_branch": "main" }
+    })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(payload.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let http = reqwest::Client::new();
+    let resp: serde_json::Value = http
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "push")
+        .header("x-hub-signature-256", sig)
+        .body(payload)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let run_id = resp["run"].as_str().unwrap().to_string();
+    let view = tokio::time::timeout(
+        Duration::from_secs(30),
+        pit::cli::wait(&client, &run_id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(view.status, Status::Passed, "{view:?}");
     let token = std::fs::read_to_string(&out).unwrap();
-    assert!(token.split('.').count() == 3, "{token}");
 
     // Verify the way a cloud does: discovery, then the JWKS, then the token.
-    let base = pit.client.base.clone();
-    let http = reqwest::Client::new();
     let discovery: serde_json::Value = http
         .get(format!("{base}/.well-known/openid-configuration"))
         .send()
@@ -2100,24 +2161,36 @@ async fn tasks_get_verifiable_oidc_tokens() {
     let claims = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &v)
         .unwrap()
         .claims;
-    assert_eq!(claims["sub"], format!("repo:{}:local:main", view.repo));
-    assert_eq!(claims["trusted"], false);
-    assert_eq!(claims["sha"], view.sha);
-
-    // The token never shows in the log.
-    let log: String = pit
-        .client
-        .get_text(&format!("/api/runs/{}/tasks/deploy/log", view.id))
+    assert_eq!(claims["sub"], "repo:acme/widgets:ref:refs/heads/main");
+    assert_eq!(claims["trusted"], true);
+    let log = client
+        .get_text(&format!("/api/runs/{run_id}/tasks/deploy/log"))
         .await
         .unwrap();
     assert!(log.contains("token: ***") && !log.contains(&token), "{log}");
 
-    // No lease, no token.
-    let denied = http
-        .post(format!("{base}/api/oidc/token"))
-        .json(&serde_json::json!({ "audience": "sts.amazonaws.com" }))
-        .send()
+    // `pit run` of the same repo: untrusted, no token, so the task errors.
+    let sub = pit::cli::submit(&client, repo.path(), vec![], Default::default())
         .await
         .unwrap();
-    assert_eq!(denied.status(), 403);
+    let local = pit::cli::wait(&client, &sub.run_id, |_| {}).await.unwrap();
+    let msg = local.groups[0].tasks[0].message.clone().unwrap_or_default();
+    assert!(msg.contains("only issued to trusted runs"), "{msg}");
+
+    // The review's forgery: an API run dressed up as main.
+    let forged: serde_json::Value = client
+        .post(
+            "/api/runs",
+            &serde_json::json!({ "repo": "acme/widgets", "sha": sha, "trigger": "ref", "ref": "refs/heads/main" }),
+        )
+        .await
+        .unwrap();
+    let forged = pit::cli::wait(&client, forged["id"].as_str().unwrap(), |_| {})
+        .await
+        .unwrap();
+    assert_ne!(
+        forged.status,
+        Status::Passed,
+        "a forged run got a token: {forged:?}"
+    );
 }

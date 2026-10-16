@@ -252,19 +252,28 @@ worker's user and could read the file itself, so run untrusted code in `docker`.
 
 ## Cloud credentials (OIDC)
 
-A task with `oidc: "sts.amazonaws.com"` gets a 10-minute token in `PIT_OIDC_TOKEN`, signed by the
-server, to trade for cloud credentials instead of storing access keys. The server is the OIDC
-issuer. Its keys are at `<PIT_PUBLIC_URL>/.well-known/openid-configuration` and
-`/.well-known/jwks.json`, which a cloud must be able to reach over HTTPS. Tokens are issued only
-to a running job, with claims taken from the run, and never to pull requests from forks.
+`pit server --oidc` makes the server an OIDC issuer, so a task with
+`oidc: "sts.amazonaws.com"` gets a 10-minute token in `PIT_OIDC_TOKEN` to trade for cloud
+credentials instead of storing keys. Its keys are at `<PIT_PUBLIC_URL>/.well-known/openid-configuration`
+and `/.well-known/jwks.json`, which a cloud must reach over HTTPS. Tokens are refused unless all
+of these hold:
+
+- The server was started with `--oidc`, with both `PIT_TOKEN` and `PIT_WORKER_TOKEN` set.
+  Without them, anyone who can reach the server could claim a job and get its token. `pit up`
+  never issues tokens.
+- The repo was registered by a signed GitHub webhook. The subject uses GitHub's `owner/name`, so
+  a repo created through the API cannot take a name a policy trusts.
+- The run is trusted (P20): a push to the default branch, a post-merge run, a schedule or a
+  merge queue candidate into it. Pull requests, other branches, `pit run`, API-created runs and
+  forks get nothing.
 
 | Claim | Value |
 | --- | --- |
-| `sub` | `repo:<repo>:ref:refs/heads/<branch>` for trusted branch runs (pushes to the default branch, post-merge, schedules); `repo:<repo>:merge_queue:<branch>`, `repo:<repo>:pull_request`, `repo:<repo>:local:<branch>` otherwise |
-| `trusted`, `trigger`, `repo`, `ref`, `sha`, `run_id` | From the run |
+| `sub` | `repo:<owner/name>:ref:refs/heads/<branch>`, or `repo:<owner/name>:merge_queue` |
+| `trusted`, `trigger`, `repo`, `ref`, `sha`, `run_id` | From the run as the server recorded it |
 
-Match on `sub` exactly, and on `aud`, as you would for GitHub: a policy for
-`repo:acme/app:ref:refs/heads/main` never matches a pull request or a `pit run`.
+Run the `--oidc` server where no task runs. A task on the same host as the same user could read
+the signing key in the data dir (`oidc-es256.p8`, mode 0600) or the worker's environment.
 
 ```sh
 # AWS: the SDKs read the token from a file

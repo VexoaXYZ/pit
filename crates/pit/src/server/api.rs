@@ -585,12 +585,14 @@ async fn cache_last(
     })
 }
 
-async fn oidc_discovery(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
-    Json(app.oidc.discovery(&app.public_url))
+async fn oidc_discovery(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>> {
+    let issuer = app.oidc.get().ok_or_else(|| not_found("OIDC issuer"))?;
+    Ok(Json(issuer.discovery(&app.public_url)))
 }
 
-async fn oidc_jwks(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
-    Json(app.oidc.jwks())
+async fn oidc_jwks(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>> {
+    let issuer = app.oidc.get().ok_or_else(|| not_found("OIDC issuer"))?;
+    Ok(Json(issuer.jwks()))
 }
 
 #[derive(Deserialize)]
@@ -598,47 +600,61 @@ struct OidcRequest {
     audience: String,
 }
 
-/// `POST /api/oidc/token`: a token for the job holding this lease. The
-/// claims come from the run as the server recorded it, never from the
-/// request; fork pull requests get none.
+/// `POST /api/oidc/token`: a token for the job holding this lease, for
+/// trusted runs of repos GitHub has vouched for (registered by a signed
+/// webhook) only. The claims come from the run as the server recorded it,
+/// never from the request.
 async fn oidc_token(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
     Json(req): Json<OidcRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let forbidden = |m: &str| ApiError(StatusCode::FORBIDDEN, anyhow::anyhow!("{m}"));
+    let issuer = app
+        .oidc
+        .get()
+        .ok_or_else(|| forbidden("this server does not issue OIDC tokens (pit server --oidc)"))?;
     let run_id = match lease(&headers) {
         Some(l) => app.db.lease_run(l)?,
         None => None,
     }
     .ok_or_else(|| forbidden("OIDC tokens are only issued to a running job"))?;
     let run = app.db.run(&run_id)?;
-    if run.no_secrets {
-        return Err(forbidden("pull requests from forks get no OIDC token"));
+    // Pull requests, other branches, `pit run`, API-created runs and forks:
+    // code nobody has merged gets no cloud identity.
+    if !run.trusted || run.no_secrets {
+        return Err(forbidden(
+            "OIDC tokens are only issued to trusted runs (the default branch, its merge queue and schedules)",
+        ));
     }
+    let repo = app.db.repo(&run.repo_id)?;
+    let Some(full_name) = repo.github else {
+        return Err(forbidden(
+            "OIDC tokens are only issued for repos registered by a GitHub webhook",
+        ));
+    };
     if req.audience.is_empty() {
         return Err(anyhow::anyhow!("audience is required").into());
     }
-    let repo = app.db.repo(&run.repo_id)?.name;
+    let sub = super::oidc::subject(&full_name, &run.trigger, run.git_ref.as_deref())
+        .ok_or_else(|| forbidden("this run has no OIDC subject"))?;
     let now = crate::model::now_ms() / 1000;
     let claims = serde_json::json!({
         "iss": app.public_url,
         "aud": req.audience,
-        "sub": super::oidc::subject(&repo, &run.trigger, run.git_ref.as_deref(), run.trusted),
+        "sub": sub,
         "iat": now,
         "nbf": now - 5,
         "exp": now + super::oidc::TOKEN_SECS,
         "jti": crate::model::new_id("jwt"),
-        "repo": repo,
+        "repo": full_name,
         "ref": run.git_ref,
         "sha": run.sha,
         "run_id": run_id,
         "trigger": run.trigger,
         "trusted": run.trusted,
     });
-    Ok(Json(
-        serde_json::json!({ "token": app.oidc.sign(&claims)? }),
-    ))
+    Ok(Json(serde_json::json!({ "token": issuer.sign(&claims)? })))
 }
 
 #[derive(Deserialize)]
