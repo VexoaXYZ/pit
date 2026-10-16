@@ -2453,7 +2453,7 @@ deleted first:
 **Verdict: SOLVED** for one worker: each LFS object is downloaded once per worker, not once per
 checkout. Limits:
 - Each worker still downloads once; the server does not share LFS objects through its CAS.
-- A fork's new LFS objects are fetched from the base repo's LFS endpoint, so they work only where
-  the host serves the fork network from there (GitHub does).
+- A fork's new LFS objects are fetched from the base repo's LFS endpoint. Whether that endpoint
+  has them depends on the host; not tested.
 - The pointer-file note for workers without git-lfs was not exercised here, because this machine
   has git-lfs.
