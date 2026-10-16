@@ -2387,8 +2387,13 @@ async fn metrics_show_queue_depth_for_autoscaling() {
     let pit = start().await;
     let repo = tempfile::tempdir().unwrap();
     let dir = repo.path();
-    // No macOS worker exists, so this group waits.
-    let config = serde_json::json!({ "groups": { "mac": { "os": ["macos"], "tasks": { "t": { "run": "true" } } } } });
+    // No worker runs another OS than this one, so this group waits.
+    let other = if cfg!(target_os = "windows") {
+        "macos"
+    } else {
+        "windows"
+    };
+    let config = serde_json::json!({ "groups": { "away": { "os": [other], "tasks": { "t": { "run": "true" } } } } });
     write(dir, "pit.config.json", &config.to_string());
     sh(
         dir,
@@ -2400,7 +2405,7 @@ async fn metrics_show_queue_depth_for_autoscaling() {
     let metrics = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let m = pit.client.get_text("/metrics").await.unwrap();
-            if m.contains("pit_queued_groups{os=\"macos\"} 1") {
+            if m.contains(&format!("pit_queued_groups{{os=\"{other}\"}} 1")) {
                 return m;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2409,6 +2414,6 @@ async fn metrics_show_queue_depth_for_autoscaling() {
     .await
     .expect("queued group never showed up in /metrics");
     assert!(metrics.contains("# TYPE pit_oldest_queued_seconds gauge"));
-    assert!(metrics.contains("pit_oldest_queued_seconds{os=\"macos\"}"));
+    assert!(metrics.contains(&format!("pit_oldest_queued_seconds{{os=\"{other}\"}}")));
     assert!(metrics.contains("pit_workers_online 1"), "{metrics}");
 }
