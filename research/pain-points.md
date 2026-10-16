@@ -2521,3 +2521,67 @@ environment. Limits:
 - The shell inherits your environment where the task got the worker's: only the task's own
   variables are reproduced, plus, for fork-style runs, a note that the task saw a minimal
   environment.
+
+## P44. CI gets slower and nobody notices
+
+**The pain.** CI services report failures, not slowdowns. "GitHub never pings you when CI
+quietly takes twice as long"
+([DEV](https://dev.to/ace2932/why-your-github-actions-ci-is-slow-and-how-to-speed-it-up-19la)).
+Creep is gradual, and Actions shows one run at a time, so "no one is asking whether things are
+getting better or worse"
+([DEV, citrend](https://dev.to/_06a3df6b50aec966668fb/github-actions-wont-tell-you-your-ci-is-getting-worse-i-built-a-zero-dep-cli-that-does-260o)).
+The answers people build:
+- third-party CLIs and dashboards
+  ([avrea](https://avrea.com/blog/github-actions-observability),
+  [kleore](https://www.kleore.com/blog/github-actions-ci-optimization));
+- a cron workflow that pulls run data from the API
+  ([OneUptime](https://oneuptime.com/blog/post/2026-02-02-github-actions-performance-optimization/view));
+- percentile charts of queue time against run time
+  ([WarpBuild](https://www.warpbuild.com/answers/why-are-github-actions-slow));
+- hand-written JUnit duration budgets
+  ([monorepo case study](https://dev.to/jimmyyeung/journey-of-systematically-cut-our-monorepo-ci-time-in-half-ec8)).
+
+One [community thread](https://github.com/orgs/community/discussions/162536) traced a sudden slowdown
+to the runner's drive layout.
+
+**Reproduction.**
+- `p44`: `test` gets half a second slower every run (1.0s, 1.5s, … 4.5s) while `build` stays at 1s.
+  After 8 runs, `test` took 4.5x its first duration. Nothing said so: every run printed `passed`,
+  and `pit stats` only had global totals.
+- `p44b`: six runs at 1s, then `test` jumps to 4s (as if a commit added a slow fixture). That also
+  passed silently.
+
+Verdict before: **NOT SOLVED**.
+
+**Fix.** Each task is compared with its own history: same repo, group, OS and name, counting
+passing runs only, and leaving out cache hits and passes that needed a retry.
+
+| Check | Fires when | Shows up in |
+| --- | --- | --- |
+| One run against its usual time (median of the last 10 passing runs, with at least 5 needed) | 1.5x and at least 2s slower | The task's result, as `slow: took 4.0s, usually 1.0s (3.9x, median of its last 6 passing runs)`, and so in the CLI (on the task line and again by the verdict), the MCP run summary, and a new Note column in the GitHub check table. |
+| `pit slow` (`GET /api/slow?days=14`): the median of the last 5 passing runs against the median of the runs before them | 1.3x and at least 1s slower | A list of the tasks that got slower, so a gradual creep, which never jumps 1.5x in one run, still shows. |
+
+Both checks need a margin in ratio and in absolute time, so short tasks' jitter is not reported.
+
+**Measured.**
+- `p44b`: the 4s run printed `! default.test: slow: took 4.2s, usually 1.0s (4.0x …)` next to the
+  green verdict.
+- `p44` (the creep): runs 9 and 10 were flagged at 1.9x and 1.8x.
+- `pit slow` listed exactly the two slowed tasks, and not the steady `build`:
+  - `p44b default.test`: 1.0s → 4.0s, 3.9x, 11 samples;
+  - `p44 default.test`: 2.0s → 4.5s, 2.2x, 10 samples.
+- Tests:
+  - e2e `a_pass_much_slower_than_usual_is_noted`: 5 quick runs, then a 2.5s one that is flagged,
+    while the steady task is not;
+  - unit tests for the thresholds (jitter, too little history, 10% on a long task) and for creep
+    detection;
+  - a unit test for the check table's Note column (slow pass, escaped failure message, plain pass).
+
+**Verdict: PARTIAL.**
+- Pit now says so when a task gets slower, in the run itself and as a trend.
+- Once a slowdown persists for about half of the last 10 runs, the median catches up and per-run
+  notes stop. `pit slow` keeps listing it while the window still shows the change.
+- Nothing pushes an alert: the notify webhook (P27) fires on broken and fixed main, not on
+  slowdowns.
+- Queue time (P23, P41's `/metrics`) is measured separately from task time, but `pit slow` does
+  not chart it.

@@ -17,6 +17,7 @@ pub mod init;
 pub mod mcp;
 pub mod model;
 pub mod server;
+pub mod slow;
 pub mod snapshot;
 pub mod worker;
 pub mod workspace;

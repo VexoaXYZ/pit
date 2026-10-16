@@ -2555,3 +2555,43 @@ async fn debug_runs_keep_the_failed_workspace_and_a_way_in() {
     .await
     .expect("the workspace was not released");
 }
+
+/// A passing task that takes far longer than it usually does says so in its
+/// result, and a steady one does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_much_slower_than_usual_is_noted() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let delay = dir.join("..").join(format!("slow-{}", std::process::id()));
+    std::fs::write(&delay, "0").unwrap();
+    let config = serde_json::json!({ "tasks": {
+        "steady": { "run": "true", "cache": false },
+        "test": { "run": format!("sleep $(cat {})", delay.display()), "cache": false },
+    } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let message = |view: &RunView, name: &str| {
+        view.groups[0]
+            .tasks
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.message.clone())
+            .unwrap_or_default()
+    };
+    for _ in 0..pit::slow::MIN_HISTORY {
+        let view = run(&pit, dir).await;
+        assert!(!message(&view, "test").contains("slow:"), "{view:?}");
+    }
+    std::fs::write(&delay, "2.5").unwrap();
+    let view = run(&pit, dir).await;
+    assert_eq!(view.status, Status::Passed);
+    assert!(
+        message(&view, "test").starts_with("slow: took 2."),
+        "{view:?}"
+    );
+    assert!(!message(&view, "steady").contains("slow:"), "{view:?}");
+}

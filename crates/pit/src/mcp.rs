@@ -277,7 +277,13 @@ async fn summarize(client: &Client, view: &RunView, elapsed_ms: u64, url: &str) 
                 .duration_ms
                 .map(|d| format!(" {:.1}s", d as f64 / 1000.0))
                 .unwrap_or_default();
-            s.push_str(&format!("  {} {}{time}\n", t.status.as_str(), t.name));
+            let slow = t
+                .message
+                .as_deref()
+                .and_then(|m| m.split(" · ").find(|p| p.starts_with("slow:")))
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default();
+            s.push_str(&format!("  {} {}{time}{slow}\n", t.status.as_str(), t.name));
             if matches!(t.status, Status::Failed | Status::Error) {
                 failed.push((
                     format!("{}.{}", g.name, t.name),

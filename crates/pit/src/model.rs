@@ -432,6 +432,23 @@ pub struct Event {
     pub data: serde_json::Value,
 }
 
+/// A task that has become slower over a period (`pit slow`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlowTask {
+    pub repo: String,
+    pub group: String,
+    pub os: String,
+    pub task: String,
+    /// Median duration of its last few passing executions.
+    pub recent_ms: u64,
+    /// Median duration of the passing executions before those.
+    pub before_ms: u64,
+    /// Passing executions in the window.
+    pub samples: u64,
+    pub last_run: String,
+}
+
 /// A task with signs of flakiness over a period (`pit flaky`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

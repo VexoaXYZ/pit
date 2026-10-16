@@ -363,20 +363,40 @@ fn summarize(g: &GroupView) -> String {
     if let Some(ms) = g.prepare_ms {
         s.push_str(&format!(", workspace ready in {ms}ms"));
     }
-    s.push_str("\n\n| Task | Status | Time |\n| --- | --- | --- |\n");
+    s.push_str("\n\n| Task | Status | Time | Note |\n| --- | --- | --- | --- |\n");
     for t in &g.tasks {
         let time = t
             .duration_ms
             .map(|d| format!("{:.1}s", d as f64 / 1000.0))
             .unwrap_or_default();
         s.push_str(&format!(
-            "| {} | {} | {} |\n",
+            "| {} | {} | {} | {} |\n",
             t.name,
             t.status.as_str(),
-            time
+            time,
+            note(t)
         ));
     }
     s
+}
+
+/// What a check's table says about a task: why it failed, or that a pass was
+/// flaky or much slower than usual.
+fn note(t: &crate::model::TaskView) -> String {
+    let m = t.message.as_deref().unwrap_or_default();
+    let text = if matches!(t.status, Status::Failed | Status::Error) {
+        m.to_string()
+    } else {
+        m.split(" · ")
+            .filter(|p| p.starts_with("slow:") || p.starts_with("flaky:"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let line = text.lines().next().unwrap_or_default();
+    line.chars()
+        .take(200)
+        .collect::<String>()
+        .replace('|', "\\|")
 }
 
 #[derive(Deserialize)]
@@ -618,6 +638,50 @@ fn register(app: &App, r: &RepoPayload) -> Result<super::db::Repo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_tables_name_slow_passes_and_failures() {
+        let task = |name: &str, status: Status, message: Option<&str>| TaskView {
+            id: name.into(),
+            name: name.into(),
+            deps: vec![],
+            status,
+            action_key: None,
+            exit_code: None,
+            duration_ms: Some(4_000),
+            log_digest: None,
+            message: message.map(String::from),
+            started_at: None,
+            finished_at: None,
+        };
+        let g: GroupView = serde_json::from_value(serde_json::json!({
+            "id": "g", "name": "ci", "os": "linux", "status": "failed", "worker": null,
+            "prepareMs": null, "message": null, "startedAt": null, "finishedAt": null, "tasks": [],
+        }))
+        .unwrap();
+        let g = GroupView {
+            tasks: vec![
+                task(
+                    "lint",
+                    Status::Passed,
+                    Some("ran because x · slow: took 4.0s, usually 1.0s"),
+                ),
+                task("test", Status::Failed, Some("1 of 2 tests failed: a|b")),
+                task("build", Status::Passed, Some("ran because inputs changed")),
+            ],
+            ..g
+        };
+        let table = summarize(&g);
+        assert!(
+            table.contains("| lint | passed | 4.0s | slow: took 4.0s, usually 1.0s |"),
+            "{table}"
+        );
+        assert!(
+            table.contains("| test | failed | 4.0s | 1 of 2 tests failed: a\\|b |"),
+            "{table}"
+        );
+        assert!(table.contains("| build | passed | 4.0s |  |"), "{table}");
+    }
 
     #[test]
     fn verifies_github_signatures() {

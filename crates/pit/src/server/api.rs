@@ -69,6 +69,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/cache/failed/{key}", get(cache_failed))
         .route("/api/cache/{key}/claim", post(cache_claim))
         .route("/api/flaky", get(flaky))
+        .route("/api/slow", get(slow))
         .route("/metrics", get(metrics))
         .route("/api/timings", post(record_timings))
         .route("/api/oidc/token", post(oidc_token))
@@ -449,9 +450,20 @@ async fn finish_task(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(r): Json<TaskResult>,
+    Json(mut r): Json<TaskResult>,
 ) -> ApiResult<StatusCode> {
     let (group_id, run_id, name) = app.db.task_group(&id)?;
+    // A pass that took far longer than this task usually does says so: CI
+    // that gets slower otherwise goes unnoticed until everything is slow.
+    if r.status == Status::Passed {
+        let history = app.db.recent_durations(&id, crate::slow::HISTORY)?;
+        if let Some(note) = crate::slow::note(r.duration_ms as i64, &history) {
+            r.message = Some(match r.message.take() {
+                Some(m) => format!("{m} · {note}"),
+                None => note,
+            });
+        }
+    }
     if !app.db.finish_task(&id, lease(&headers), &r)? {
         return Err(stale(&group_id));
     }
@@ -817,6 +829,19 @@ async fn record_timings(
 #[derive(Deserialize)]
 struct FlakyQuery {
     days: Option<i64>,
+}
+
+/// `GET /api/slow?days=14`: see `Db::slow_tasks`.
+async fn slow(
+    State(app): State<Arc<App>>,
+    Query(q): Query<FlakyQuery>,
+) -> ApiResult<Json<Vec<SlowTask>>> {
+    let days = q.days.unwrap_or(14).clamp(1, 90);
+    let since = crate::model::now_ms() - days * 86_400_000;
+    let rows = tokio::task::spawn_blocking(move || app.db.slow_tasks(since))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(rows))
 }
 
 /// `GET /api/flaky?days=14`: see `Db::flaky_tasks`.

@@ -170,6 +170,13 @@ enum Command {
         #[arg(long, default_value_t = 14)]
         days: u32,
     },
+    /// Tasks whose recent passing runs take much longer than earlier ones.
+    Slow {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, default_value_t = 14)]
+        days: u32,
+    },
     /// Print a task's log.
     Logs {
         run: String,
@@ -412,6 +419,9 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Flaky { conn, days } => {
             cli::flaky(&cli::client(&conn.server, conn.token)?, days).await
+        }
+        Command::Slow { conn, days } => {
+            cli::slow(&cli::client(&conn.server, conn.token)?, days).await
         }
         Command::Logs { run, task, conn } => {
             cli::logs(&cli::client(&conn.server, conn.token)?, &run, &task).await

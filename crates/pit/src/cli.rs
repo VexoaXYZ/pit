@@ -211,10 +211,12 @@ fn task_line(
         ),
         _ => secs(ms),
     };
-    // Why it ran (cache miss reason) or that it was flaky; failures print
-    // their message below.
+    // Why it ran (cache miss reason), that it was flaky or much slower than
+    // usual; failures print their message below.
     let why = message
-        .filter(|m| m.starts_with("ran because") || m.starts_with("flaky:"))
+        .filter(|m| {
+            m.starts_with("ran because") || m.starts_with("flaky:") || m.starts_with("slow:")
+        })
         .map(|m| format!("  {}", style.dim(m)))
         .unwrap_or_default();
     format!("    {} {name:<24} {detail}{why}", style.status(status))
@@ -381,6 +383,25 @@ pub async fn run(
                 }
             }
         }
+        // A pass that took far longer than usual is easy to miss in a green
+        // run; name it once more next to the verdict.
+        for g in &view.groups {
+            for t in &g.tasks {
+                if let Some(slow) = t
+                    .message
+                    .as_deref()
+                    .and_then(|m| m.split(" · ").find(|p| p.starts_with("slow:")))
+                {
+                    eprintln!(
+                        "  {} {}.{}: {}",
+                        style.paint("33", "!"),
+                        g.name,
+                        t.name,
+                        slow
+                    );
+                }
+            }
+        }
         let all: Vec<&TaskView> = view.groups.iter().flat_map(|g| &g.tasks).collect();
         let ran = all
             .iter()
@@ -426,6 +447,32 @@ pub async fn runs(client: &Client, limit: usize) -> Result<i32> {
             dur
         );
     }
+    Ok(0)
+}
+
+/// Tasks that got slower over the last `days`, worst first.
+pub async fn slow(client: &Client, days: u32) -> Result<i32> {
+    let tasks: Vec<SlowTask> = client.get(&format!("/api/slow?days={days}")).await?;
+    if tasks.is_empty() {
+        println!("no task got slower in the last {days} day(s)");
+        return Ok(0);
+    }
+    println!(
+        "{:<40} {:>9} {:>9} {:>7} {:>8}  last run",
+        "task", "before", "recent", "change", "samples"
+    );
+    for t in tasks {
+        println!(
+            "{:<40} {:>8.1}s {:>8.1}s {:>6.1}x {:>8}  {}",
+            format!("{} {}.{} ({})", t.repo, t.group, t.task, t.os),
+            t.before_ms as f64 / 1000.0,
+            t.recent_ms as f64 / 1000.0,
+            t.recent_ms as f64 / t.before_ms.max(1) as f64,
+            t.samples,
+            t.last_run
+        );
+    }
+    println!("\n\"recent\": median of the last 5 passing runs; \"before\": median of the ones before them.");
     Ok(0)
 }
 

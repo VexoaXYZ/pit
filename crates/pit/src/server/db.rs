@@ -87,6 +87,7 @@ CREATE INDEX IF NOT EXISTS tasks_group ON tasks(group_id, position);
 CREATE INDEX IF NOT EXISTS tasks_run ON tasks(run_id);
 CREATE INDEX IF NOT EXISTS tasks_key ON tasks(action_key);
 CREATE INDEX IF NOT EXISTS tasks_finished ON tasks(finished_at);
+CREATE INDEX IF NOT EXISTS tasks_name ON tasks(name, finished_at);
 
 CREATE TABLE IF NOT EXISTS task_logs (
   task_id TEXT NOT NULL,
@@ -1571,6 +1572,86 @@ impl Db {
 
     /// Tasks that passed only on a retry, or both passed and failed with the
     /// same inputs, since `since` (ms).
+    /// Durations of the task's last passing executions (same repo, group,
+    /// OS and name; not cached, not passed on a retry), newest first.
+    pub fn recent_durations(&self, task_id: &str, limit: usize) -> Result<Vec<i64>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT t2.duration_ms FROM tasks t
+             JOIN groups_ g ON g.id = t.group_id JOIN runs r ON r.id = t.run_id
+             JOIN tasks t2 ON t2.name = t.name
+             JOIN groups_ g2 ON g2.id = t2.group_id AND g2.name = g.name AND g2.os = g.os
+             JOIN runs r2 ON r2.id = t2.run_id AND r2.repo_id = r.repo_id
+             WHERE t.id = ?1 AND t2.id != t.id AND t2.status = 'passed'
+               AND t2.duration_ms IS NOT NULL AND COALESCE(t2.message, '') NOT LIKE 'flaky:%'
+             ORDER BY t2.finished_at DESC LIMIT ?2",
+        )?;
+        let rows = st
+            .query_map(params![task_id, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Tasks whose recent passing runs take much longer than the ones
+    /// before them, over the window since `since`.
+    pub fn slow_tasks(&self, since: i64) -> Result<Vec<SlowTask>> {
+        let rows: Vec<(String, String, String, String, i64, String)> = {
+            let c = self.conn.lock();
+            let mut st = c.prepare(
+                "SELECT repos.name, g.name, g.os, t.name, t.duration_ms, t.run_id FROM tasks t
+                 JOIN groups_ g ON g.id = t.group_id JOIN runs r ON r.id = t.run_id
+                 JOIN repos ON repos.id = r.repo_id
+                 WHERE t.finished_at > ?1 AND t.status = 'passed' AND t.duration_ms IS NOT NULL
+                   AND COALESCE(t.message, '') NOT LIKE 'flaky:%'
+                 ORDER BY t.finished_at",
+            )?;
+            let rows = st
+                .query_map(params![since], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        // (repo, group, os, task) -> (duration, run), oldest first.
+        type Series =
+            std::collections::BTreeMap<(String, String, String, String), Vec<(i64, String)>>;
+        let mut series: Series = Default::default();
+        for (repo, group, os, task, ms, run) in rows {
+            series
+                .entry((repo, group, os, task))
+                .or_default()
+                .push((ms, run));
+        }
+        let mut out = Vec::new();
+        for ((repo, group, os, task), runs) in series {
+            let durations: Vec<i64> = runs.iter().map(|(d, _)| *d).collect();
+            if let Some((recent, before)) = crate::slow::trend(&durations) {
+                out.push(SlowTask {
+                    repo,
+                    group,
+                    os,
+                    task,
+                    recent_ms: recent as u64,
+                    before_ms: before as u64,
+                    samples: durations.len() as u64,
+                    last_run: runs.last().map(|(_, r)| r.clone()).unwrap_or_default(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            (b.recent_ms as f64 / b.before_ms.max(1) as f64)
+                .total_cmp(&(a.recent_ms as f64 / a.before_ms.max(1) as f64))
+        });
+        Ok(out)
+    }
+
     pub fn flaky_tasks(&self, since: i64) -> Result<Vec<FlakyTask>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
