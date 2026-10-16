@@ -1039,6 +1039,26 @@ impl Db {
     /// its unclaimed groups are skipped. Groups already running finish on
     /// their workers, but their results no longer change the run. Returns
     /// whether the run was still active.
+    /// A task of the run that failed for good (after its retries; a
+    /// quarantined task's failure does not count), as `group.task`.
+    pub fn run_failed_task(&self, run_id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock();
+        let rows: Vec<(String, String, String)> = {
+            let mut st = c.prepare_cached(
+                "SELECT g.name, t.name, t.def FROM tasks t JOIN groups_ g ON g.id = t.group_id
+                 WHERE t.run_id = ?1 AND t.status IN ('failed', 'error')",
+            )?;
+            let rows = st
+                .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        Ok(rows.into_iter().find_map(|(g, t, def)| {
+            let def: TaskDef = serde_json::from_str(&def).ok()?;
+            (!def.quarantine).then(|| format!("{g}.{t}"))
+        }))
+    }
+
     pub fn cancel_run(&self, run_id: &str) -> Result<bool> {
         self.cancel_run_because(run_id, "cancelled")
     }

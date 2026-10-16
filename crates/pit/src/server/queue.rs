@@ -427,7 +427,21 @@ impl Queue<'_> {
             let Some(run_id) = self.entries[i].run_id.clone() else {
                 continue;
             };
-            let run = self.app.db.run(&run_id)?;
+            let mut run = self.app.db.run(&run_id)?;
+            // A candidate is decided by its first real failure: nothing later
+            // in its run can make it pass, so the run stops there and the
+            // queue moves on, instead of holding the lane until its slowest
+            // task ends (GitHub's fail-fast, for the merge gate only; other
+            // runs report every failure).
+            if !run.status.is_done() {
+                if let Some(task) = self.app.db.run_failed_task(&run_id)? {
+                    let why = format!("stopped early: {task} failed");
+                    if self.app.db.cancel_run_because(&run_id, &why)? {
+                        self.cancelled.push(run_id.clone());
+                    }
+                    run = self.app.db.run(&run_id)?;
+                }
+            }
             if !run.status.is_done() {
                 continue;
             }

@@ -40,7 +40,7 @@ Pit removes each of those costs:
 | Every task reruns on every push | **Action keys.** A task's cache key hashes its command, its input files and its deps. Unchanged tasks are restored from the cache, including their output files. |
 | One machine per job, setup repeated per job | **Groups.** A group's tasks share one workspace and run as a DAG, in parallel. Setup happens once. |
 | Push and wait to see if it works | **`pit run`** ships your uncommitted changes as an overlay and runs them on a warm worker. Agents get the same through MCP. |
-| Merge queues that serialize everything | **Grouped speculative queue.** Changes that touch disjoint tasks land in parallel lanes; overlapping changes are tested speculatively; docs-only changes land without tests. |
+| Merge queues that serialize everything | **Grouped speculative queue.** Changes that touch disjoint tasks land in parallel lanes; overlapping changes are tested speculatively; docs-only changes land without tests. A candidate fails at its first real failure (the rest of its run is stopped), while every other run reports all of its failures. |
 
 ## Quick start
 

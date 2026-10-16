@@ -2833,3 +2833,66 @@ async fn the_worker_never_writes_through_a_task_planted_symlink() {
     assert_eq!(view.status, Status::Passed, "{view:?}");
     assert_eq!(std::fs::read_to_string(&precious).unwrap(), "precious");
 }
+
+/// A merge queue candidate is failed at its first real failure: the rest of
+/// its run is stopped instead of holding the lane until its slowest task
+/// ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_merge_queue_fails_fast() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    write(
+        &work,
+        "pit.config.json",
+        r#"{"tasks":{
+            "lint":{"run":"! grep -rq BAD src","cache":false},
+            "slow":{"run":"sleep 60","cache":false}
+        }}"#,
+    );
+    write(&work, "src/a.txt", "ok\n");
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    sh(&work, "git checkout -q -b broken && echo BAD > src/b.txt && git add -A && git commit -qm broken && git push -q origin broken");
+    let started = std::time::Instant::now();
+    let entry: QueueEntryView = pit
+        .client
+        .post(
+            "/api/queue",
+            &QueueAdd {
+                repo: "ff".into(),
+                url: Some(tmp.path().join("origin.git").to_string_lossy().to_string()),
+                branch: Some("broken".into()),
+                pr: None,
+                target: None,
+                sha: None,
+            },
+        )
+        .await
+        .unwrap();
+    let failed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let entries: Vec<QueueEntryView> = pit.client.get("/api/queue").await.unwrap();
+            if let Some(e) = entries
+                .into_iter()
+                .find(|e| e.id == entry.id && e.status == "failed")
+            {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the broken change held the queue");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let run: RunView = pit
+        .client
+        .get(&format!("/api/runs/{}", failed.run_id.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        run.message.as_deref(),
+        Some("stopped early: default.lint failed")
+    );
+}

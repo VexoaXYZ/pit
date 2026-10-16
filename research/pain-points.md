@@ -2815,3 +2815,50 @@ Not fixed (limits):
 
 Claims corrected: P31's fork isolation (above), P41's gauges and drain, P43's secrets wording,
 P44's flaky and cold-run handling, P45's message on machines without `/proc`.
+
+## P47. Fail-fast: the default hides failures, but turning it off wastes the merge gate's time
+
+**The pain.** In a GitHub Actions matrix, `fail-fast` defaults to true: one failing leg cancels
+the others, so you see one failure and grey "cancelled" badges. You then rerun the grid to learn
+what else broke ([FixDevs](https://fixdevs.com/blog/github-actions-matrix-strategy/),
+[OneUptime](https://oneuptime.com/blog/post/2026-02-02-github-actions-matrix-builds/view),
+[Tenki](https://tenki.cloud/blog/github-actions-matrix-strategy-tenki-runners)). Because
+scheduling isn't deterministic, which leg gets reported is luck
+([Edward Thomson](https://www.edwardthomson.com/blog/github_actions_6_fail_fast_matrix_workflows)).
+
+The advice splits by purpose. [WarpBuild](https://www.warpbuild.com/guides/github-actions-matrix-builds)
+says to fail fast when the matrix is a merge gate and to turn it off when it is a compatibility
+report. [RunsOn](https://runs-on.com/github-actions/the-matrix-strategy/) and
+[eastondev](https://eastondev.com/blog/en/posts/dev/20260408-github-actions-matrix/) say much the
+same. So people end up with different settings per workflow.
+
+**Reproduction 1: hidden failures.**
+- Group `matrix`: a 3-shard task where shard 1 fails at once and shard 3 fails after 3s.
+- Group `checks`: `lint` fails at once; `typecheck` fails after 3s.
+
+Pit ran all five to completion and reported all four failures (`matrix#1`, `matrix#3`, `lint`,
+`typecheck`), with the passing shard green. Nothing was cancelled, because groups, shards and
+independent tasks never cancel each other. **SOLVED** as it was.
+
+**Reproduction 2: the merge gate.** A queued change makes `lint` fail at once while `test` sleeps
+20s. Before, the queue waited for the whole candidate run: the entry was decided **21.9s** after
+queueing, holding its lane, and every change behind it, for the slowest task.
+
+**Fix.** For merge queue candidates only:
+- When any task fails for good (after its retries, not counting quarantined tasks), the queue
+  cancels the rest of the run ("stopped early: default.lint failed") and handles the candidate as
+  failed right away.
+- Batches are still split to find the culprit as before.
+- Pull request, push and local runs still report every failure.
+
+**Measured.**
+- The same change was decided in **2.9s**.
+- Its run reads `failed · stopped early: default.lint failed`, with `test` skipped and no
+  leftover `sleep` process.
+- e2e `the_merge_queue_fails_fast`: a 60s task next to a failing lint, and the entry fails well
+  within 30s with that message.
+- The existing queue tests (lanes, batching, splitting, flake retries) still pass, run twice.
+
+**Verdict: SOLVED.** Pull requests show every failure, and the merge gate fails fast, with no
+per-workflow setting. Limit: the queue notices a failure on its next tick (about a second), and
+the cancelled run's worker stops at its next heartbeat.
