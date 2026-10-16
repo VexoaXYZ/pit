@@ -95,6 +95,8 @@ pub struct RunOpts {
     pub no_cache: bool,
     /// Use a new, empty workspace instead of a warm one.
     pub fresh: bool,
+    /// Keep a failed task's workspace and write a shell script into it.
+    pub debug: bool,
 }
 
 pub async fn submit(
@@ -117,6 +119,7 @@ pub async fn submit(
                 git_ref: snapshot.branch.clone(),
                 no_cache: opts.no_cache,
                 fresh: opts.fresh,
+                debug: opts.debug,
                 no_secrets: false,
                 trusted: false,
             },

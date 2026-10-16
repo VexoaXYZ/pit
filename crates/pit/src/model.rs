@@ -235,6 +235,10 @@ pub struct CreateRun {
     /// left by earlier runs (ignored files, tool caches) can affect it.
     #[serde(default)]
     pub fresh: bool,
+    /// When a task fails, keep its workspace and write a script that opens a
+    /// shell in the task's environment there (`pit run --debug`).
+    #[serde(default)]
+    pub debug: bool,
     /// Code from outside the repo (a fork PR): no secrets, no `env` values
     /// from the worker, and only a minimal inherited environment. Only the
     /// server sets it.
@@ -290,6 +294,9 @@ pub struct Job {
     /// See `CreateRun::no_secrets`.
     #[serde(default)]
     pub no_secrets: bool,
+    /// See `CreateRun::debug`.
+    #[serde(default)]
+    pub debug: bool,
     pub tasks: Vec<JobTask>,
 }
 

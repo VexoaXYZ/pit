@@ -192,6 +192,7 @@ pub struct RunRow {
     pub trusted: bool,
     pub fresh: bool,
     pub no_secrets: bool,
+    pub debug: bool,
 }
 
 pub struct WaitingGroup {
@@ -286,6 +287,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_fresh {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0")?;
     }
+    let has_debug: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'debug'")?
+        .exists([])?;
+    if !has_debug {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN debug INTEGER NOT NULL DEFAULT 0")?;
+    }
     let has_no_secrets: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'no_secrets'")?
         .exists([])?;
@@ -361,6 +368,7 @@ fn run_row(r: &Row) -> rusqlite::Result<RunRow> {
         github_pr: r.get::<_, Option<i64>>("github_pr")?.map(|v| v as u64),
         trusted: r.get::<_, i64>("trusted")? != 0,
         fresh: r.get::<_, i64>("fresh")? != 0,
+        debug: r.get::<_, i64>("debug")? != 0,
         no_secrets: r.get::<_, i64>("no_secrets")? != 0,
     })
 }
@@ -857,6 +865,7 @@ impl Db {
             trusted: run.trusted,
             fresh: run.fresh,
             no_secrets: run.no_secrets,
+            debug: run.debug,
             tasks,
         };
         Ok((Some(job), held))
@@ -1220,6 +1229,13 @@ impl Db {
         self.conn
             .lock()
             .execute("UPDATE runs SET no_secrets = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn set_run_debug(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("UPDATE runs SET debug = 1 WHERE id = ?1", params![id])?;
         Ok(())
     }
 

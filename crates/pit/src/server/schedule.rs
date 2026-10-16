@@ -135,6 +135,7 @@ async fn start(
                 git_ref: Some(branch.to_string()),
                 no_cache: s.no_cache,
                 fresh: s.fresh,
+                debug: false,
                 no_secrets: false,
                 trusted: true,
             },

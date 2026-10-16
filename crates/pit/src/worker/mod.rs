@@ -5,6 +5,7 @@
 //! A job is a whole group of tasks. They run in one workspace, in dependency
 //! order, with independent tasks in parallel.
 
+pub mod debug;
 pub mod disk;
 pub mod exec;
 pub mod files;
@@ -87,17 +88,24 @@ struct WorkspaceLease<'a> {
 
 impl Drop for WorkspaceLease<'_> {
     fn drop(&mut self) {
-        if let Some(slots) = self.worker.workspaces.lock().get_mut(&self.pool) {
-            if self.fresh {
-                slots.retain(|s| s.path != self.path);
+        self.worker
+            .release_workspace(&self.pool, &self.path, self.fresh);
+    }
+}
+
+impl Worker {
+    fn release_workspace(&self, pool: &str, path: &Path, fresh: bool) {
+        if let Some(slots) = self.workspaces.lock().get_mut(pool) {
+            if fresh {
+                slots.retain(|s| s.path != path);
                 return;
             }
-            if let Some(s) = slots.iter_mut().find(|s| s.path == self.path) {
+            if let Some(s) = slots.iter_mut().find(|s| s.path == path) {
                 s.busy = false;
                 s.last_used = Instant::now();
             }
         }
-        disk::touch_used(&self.path);
+        disk::touch_used(path);
     }
 }
 
@@ -542,10 +550,26 @@ impl Worker {
             }
         };
         hb.abort();
-        drop(lease);
-        if job.fresh {
-            let ws = ws.clone();
-            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws));
+        let debug_dir = debug::dir(&self.data_dir, &job.group_id);
+        if job.debug && debug::has_scripts(&debug_dir) {
+            // Keep the failed workspace as it is for the debug scripts: still
+            // busy, so no other job checks out over it.
+            let (pool, fresh) = (lease.pool.clone(), lease.fresh);
+            std::mem::forget(lease);
+            let (w, ws) = (self.clone(), ws.clone());
+            tokio::spawn(async move {
+                debug::hold(&debug_dir, debug::HOLD).await;
+                w.release_workspace(&pool, &ws, fresh);
+                if fresh {
+                    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws)).await;
+                }
+            });
+        } else {
+            drop(lease);
+            if job.fresh {
+                let ws = ws.clone();
+                tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws));
+            }
         }
         let prefix = format!("{}\0", job.group_id);
         self.runtime_memo
@@ -1255,6 +1279,29 @@ impl Worker {
             message = Some(match message {
                 Some(m) => format!("{m} · ran because {note}"),
                 None => format!("ran because {note}"),
+            });
+        }
+        // `pit run --debug`: a way back into this workspace, as the task saw it.
+        if !ok && job.debug && cfg!(unix) {
+            let script = debug::write_script(
+                &debug::dir(&self.data_dir, &job.group_id),
+                &task.name,
+                def,
+                backend,
+                ws,
+                &env,
+                &policy,
+                message.as_deref(),
+            )?;
+            let how = format!(
+                "debug: `sh {}` opens a shell where it ran, or runs a command there \
+                 (workspace kept {}m; delete the script to release it)",
+                script.display(),
+                debug::HOLD.as_secs() / 60
+            );
+            message = Some(match message {
+                Some(m) => format!("{m} · {how}"),
+                None => how,
             });
         }
         let status = if ok { Status::Passed } else { Status::Failed };

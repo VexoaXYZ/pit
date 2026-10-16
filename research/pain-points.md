@@ -2457,3 +2457,67 @@ checkout. Limits:
   has them depends on the host; not tested.
 - The pointer-file note for workers without git-lfs was not exercised here, because this machine
   has git-lfs.
+
+## P43. Debugging a CI failure means guessing from the log, or pushing an SSH step
+
+**The pain.** When a job fails in CI but not locally, the log is all GitHub Actions gives you. To
+look around (what got built, which tool versions the image has, what a file contains) you add
+[action-tmate](https://github.com/mxschmitt/action-tmate) to the workflow, push, wait for the run,
+and SSH in before the session times out. The common recipes:
+- gate the step on `if: failure()` with a timeout
+  ([nshephard](https://blog.nshephard.dev/posts/tmate/));
+- add a `workflow_dispatch` input so the debug step only runs on demand
+  ([ridingthecrest](https://www.ridingthecrest.com/blog/2024/12/04/tmate-github-actions-debug.html),
+  [Daniela Baron](https://danielabaron.me/blog/debug-github-action/));
+- forks exist for self-hosted runners behind a VPN
+  ([canonical/action-tmate](https://github.com/canonical/action-tmate));
+- RunsOn's [debug guide](https://runs-on.com/github-actions/debug/) describes the same loop.
+
+Each look costs a commit and a full run, and the shell is on a runner that disappears.
+
+**Reproduction.** A two-task `docker` group in `node:22-alpine`:
+- `build` writes `dist/app.js`;
+- `test` expects `dist/bundle.js` and fails with "dist/bundle.js missing".
+
+Before, Pit gave the same as Actions: the log line. The failed workspace was reused by the next
+run, so the only way to see what `dist/` held was to edit the task (add an `ls`) and run again. Pit
+had no command for getting into a failed task's environment.
+
+**Fix: `pit run --debug`** (and `debug: true` on the MCP `run` tool).
+
+When a task fails:
+- The worker writes a script, outside the workspace and readable by its user only. The failed
+  task's result names it: `debug: sh …/debug/<group>/test.sh opens a shell where it ran, or runs
+  a command there`.
+- The script `cd`s into the failed workspace, exports the task's variables, and runs the same
+  backend command line the task ran (`docker run … node:22-alpine`, same mount, user and network
+  setting; or `unshare` for sandbox, or `sh` for host), with an interactive shell in place of the
+  task's command.
+- Arguments replace the shell: `sh test.sh 'ls dist'`. That form works for coding agents, which
+  cannot drive a TTY.
+- Secret values are left out; the script names them.
+- The workspace stays busy (no job checks out over it) for 30 minutes, or until the script is
+  deleted.
+
+**Measured:**
+- `sh test.sh 'ls dist; cat /etc/alpine-release; echo task=$PIT_TASK'` printed `app.js`, `3.24.2`
+  and `task=test` in 1.95s: inside the task's own container, in the workspace it failed in, with
+  no commit or rerun.
+- The interactive form gave a shell with a TTY (`/workspace #`, `tty=/dev/pts/0`).
+- A run started during the hold got workspace `1`, leaving the failed `0` untouched.
+- Deleting the script released the workspace within the 2s poll.
+- Tests:
+  - e2e `debug_runs_keep_the_failed_workspace_and_a_way_in`: a task leaves a file and fails. The
+    script reads that file and `$PIT_TASK`. A second run does not touch the held workspace, and
+    deleting the script releases it.
+  - Unit tests check that the script runs commands with the right variables and quoting, leaves
+    out secret values, and that the hold ends when the scripts go.
+
+**Verdict: PARTIAL.** Debugging needs no extra commit or run, and the shell is the task's real
+environment. Limits:
+- The script is on the worker, so with a remote worker you still need a login on that machine.
+  Pit does not relay a shell the way tmate does.
+- Unix workers only.
+- The shell inherits your environment where the task got the worker's: only the task's own
+  variables are reproduced, plus, for fork-style runs, a note that the task saw a minimal
+  environment.

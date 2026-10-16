@@ -131,6 +131,11 @@ enum Command {
         /// behind (ignored build output, tool caches).
         #[arg(long)]
         fresh: bool,
+        /// When a task fails, keep its workspace for 30 minutes and print a
+        /// script that opens a shell in the task's environment there (its
+        /// container, its variables), or runs a command given to it.
+        #[arg(long)]
+        debug: bool,
         /// Stream every task's log, not just failures.
         #[arg(short, long)]
         verbose: bool,
@@ -367,6 +372,7 @@ async fn run(cli: Cli) -> Result<i32> {
             conn,
             no_cache,
             fresh,
+            debug,
             verbose,
             json,
             dir,
@@ -375,7 +381,11 @@ async fn run(cli: Cli) -> Result<i32> {
                 &cli::client(&conn.server, conn.token)?,
                 &dir,
                 tasks,
-                cli::RunOpts { no_cache, fresh },
+                cli::RunOpts {
+                    no_cache,
+                    fresh,
+                    debug,
+                },
                 verbose,
                 json,
             )
@@ -390,6 +400,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 cli::RunOpts {
                     no_cache: true,
                     fresh: true,
+                    debug: false,
                 },
                 false,
                 false,

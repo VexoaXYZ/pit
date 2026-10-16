@@ -381,7 +381,7 @@ seconds without pushing.
 | --- | --- |
 | `pit up` | Server, worker and dashboard in one process. |
 | `pit server` / `pit worker --server URL` | Run them separately, on as many machines as you like. |
-| `pit run [task…] [-v] [--json] [--no-cache] [--fresh]` | Run on the working tree. Exit code reflects the result. `--fresh` uses a new, empty workspace. |
+| `pit run [task…] [-v] [--json] [--no-cache] [--fresh] [--debug]` | Run on the working tree. Exit code reflects the result. `--fresh` uses a new, empty workspace. `--debug`: a failed task's result names a script on its worker; `sh <script>` opens a shell where it failed (its container, its variables; secrets left out), `sh <script> '<command>'` runs one there. The workspace is kept for 30 minutes or until the script is deleted. Unix workers only. |
 | `pit flaky [--days 14]` | Tasks that passed only on a retry, or both passed and failed with the same inputs. |
 | `pit verify` | `pit run --no-cache --fresh`: proves results depend neither on the cache nor on files earlier runs left in a warm workspace. |
 | `pit runs`, `pit logs RUN TASK`, `pit stats` | Inspect. |

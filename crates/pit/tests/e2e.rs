@@ -1391,6 +1391,7 @@ async fn fresh_runs_do_not_see_files_earlier_runs_left_behind() {
         pit::cli::RunOpts {
             no_cache: true,
             fresh: true,
+            debug: false,
         },
     )
     .await;
@@ -2491,4 +2492,66 @@ fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+/// `pit run --debug`: a failed task's result names a script that runs
+/// commands in the workspace it failed in, with what it left behind, and
+/// that workspace is not checked out over while the script exists.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn debug_runs_keep_the_failed_workspace_and_a_way_in() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let config = serde_json::json!({ "tasks": { "test": {
+        "run": "echo $PIT_RUN_ID > left-behind.txt; exit 1",
+        "cache": false,
+    } } });
+    write(dir, ".gitignore", "left-behind.txt\n");
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run_with(
+        &pit,
+        dir,
+        pit::cli::RunOpts {
+            debug: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let msg = view.groups[0].tasks[0].message.clone().unwrap_or_default();
+    let script = msg
+        .split('`')
+        .nth(1)
+        .and_then(|s| s.strip_prefix("sh "))
+        .unwrap_or_else(|| panic!("no debug script in {msg:?}"))
+        .to_string();
+    let out = sh(
+        dir,
+        &format!("sh {script} 'cat left-behind.txt; echo $PIT_TASK'"),
+    );
+    assert_eq!(out, format!("{}\ntest\n", view.id));
+    // Another run gets another workspace while the failed one is kept.
+    let again = run(&pit, dir).await;
+    assert_eq!(
+        sh(dir, &format!("sh {script} 'cat left-behind.txt'")).trim(),
+        view.id
+    );
+    assert_ne!(again.id, view.id);
+    // Deleting the script releases it.
+    std::fs::remove_file(&script).unwrap();
+    let parent = std::path::Path::new(&script)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while parent.exists() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the workspace was not released");
 }

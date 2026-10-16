@@ -614,6 +614,7 @@ impl Queue<'_> {
                     git_ref: Some(self.target.to_string()),
                     no_cache: false,
                     fresh: false,
+                    debug: false,
                     no_secrets: false,
                     trusted: super::trusted_branch(
                         self.target,
@@ -811,6 +812,7 @@ impl Queue<'_> {
                     git_ref: Some(format!("queue/{}", e.source)),
                     no_cache: false,
                     fresh: false,
+                    debug: false,
                     no_secrets: false,
                     // Queueing is the decision to land it on the target.
                     trusted: super::trusted_branch(

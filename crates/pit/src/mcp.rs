@@ -55,7 +55,8 @@ fn tools() -> Value {
                 "properties": {
                     "path": { "type": "string", "description": "Repository directory. Defaults to the server's working directory." },
                     "tasks": { "type": "array", "items": { "type": "string" }, "description": "Task names (`task` or `group.task`). Default: all tasks." },
-                    "noCache": { "type": "boolean", "description": "Ignore cached results." }
+                    "noCache": { "type": "boolean", "description": "Ignore cached results." },
+                    "debug": { "type": "boolean", "description": "If a task fails, keep its workspace and name a script in its result: `sh <script> '<command>'` runs a command where it failed, in its container with its variables." }
                 }
             }
         },
@@ -135,6 +136,7 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
                 })
                 .unwrap_or_default();
             let no_cache = args["noCache"].as_bool().unwrap_or(false);
+            let debug = args["debug"].as_bool().unwrap_or(false);
             let started = std::time::Instant::now();
             let sub = crate::cli::submit(
                 client,
@@ -143,6 +145,7 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
                 crate::cli::RunOpts {
                     no_cache,
                     fresh: false,
+                    debug,
                 },
             )
             .await?;
