@@ -81,6 +81,23 @@ impl GitHub {
         }))
     }
 
+    /// App mode with explicit settings (GHES, tests).
+    pub fn with_app(api: &str, app_id: &str, pem: &str) -> Result<GitHub> {
+        Ok(GitHub {
+            api: api.trim_end_matches('/').to_string(),
+            auth: Auth::App {
+                app_id: app_id.to_string(),
+                key: jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())?,
+            },
+            webhook_secret: None,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .user_agent("pit-ci")
+                .build()?,
+            tokens: Default::default(),
+        })
+    }
+
     /// Token mode with explicit settings (GHES, tests).
     pub fn with_token(api: &str, token: &str, webhook_secret: Option<String>) -> Result<GitHub> {
         Ok(GitHub {
@@ -226,11 +243,17 @@ impl GitHub {
                     view.status,
                     view.message.as_deref().unwrap_or(""),
                     &details,
+                    &[],
                 )
                 .await;
         }
         for g in &view.groups {
             let summary = summarize(g);
+            let annotations = if g.status.is_done() {
+                app.db.group_annotations(&g.id)?
+            } else {
+                vec![]
+            };
             self.report_one(
                 app,
                 &full,
@@ -240,6 +263,7 @@ impl GitHub {
                 g.status,
                 &summary,
                 &details,
+                &annotations,
             )
             .await?;
         }
@@ -257,6 +281,7 @@ impl GitHub {
         status: Status,
         summary: &str,
         details: &str,
+        annotations: &[Annotation],
     ) -> Result<()> {
         let check_name = format!("pit / {name}");
         match &self.auth {
@@ -303,18 +328,41 @@ impl GitHub {
                         .into();
                     }
                 }
+                // Failed tests show on the pull request's diff, once: GitHub
+                // appends a check's annotations on every update, at most 50
+                // per request.
+                let annotate = match group_id {
+                    Some(g) if status.is_done() && !annotations.is_empty() => {
+                        app.db.kv_claim("annotated", g)?
+                    }
+                    _ => false,
+                };
+                let mut chunks = annotations.chunks(50).map(|c| {
+                    c.iter()
+                        .map(|a| {
+                            serde_json::json!({
+                                "path": a.path, "start_line": a.line, "end_line": a.line,
+                                "annotation_level": "failure", "title": a.title, "message": a.message,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                if annotate {
+                    body["output"]["annotations"] = chunks.next().unwrap_or_default().into();
+                }
                 let existing = group_id
                     .and_then(|g| app.db.group(g).ok())
                     .and_then(|g| g.check_run_id);
-                match existing {
+                let id = match existing {
                     Some(id) => {
                         self.call(
                             full,
                             reqwest::Method::PATCH,
                             &format!("/repos/{full}/check-runs/{id}"),
-                            body,
+                            body.clone(),
                         )
                         .await?;
+                        Some(id)
                     }
                     None => {
                         let created = self
@@ -322,12 +370,27 @@ impl GitHub {
                                 full,
                                 reqwest::Method::POST,
                                 &format!("/repos/{full}/check-runs"),
-                                body,
+                                body.clone(),
                             )
                             .await?;
-                        if let (Some(g), Some(id)) = (group_id, created["id"].as_u64()) {
+                        let id = created["id"].as_u64();
+                        if let (Some(g), Some(id)) = (group_id, id) {
                             app.db.set_check_run(g, id)?;
                         }
+                        id
+                    }
+                };
+                if let (true, Some(id)) = (annotate, id) {
+                    for chunk in chunks {
+                        self.call(
+                            full,
+                            reqwest::Method::PATCH,
+                            &format!("/repos/{full}/check-runs/{id}"),
+                            serde_json::json!({ "output": {
+                                "title": body["output"]["title"], "summary": summary, "annotations": chunk,
+                            } }),
+                        )
+                        .await?;
                     }
                 }
             }

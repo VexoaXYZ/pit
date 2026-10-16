@@ -2662,3 +2662,67 @@ Tests:
 - No peak figure for docker tasks (their processes are not in the task's process group).
 - Linux only; macOS gets the signal names but no OOM or memory figures.
 - Host and sandbox tasks cannot be given a limit.
+
+## P46. Test failures don't show on the pull request's diff (and annotations stop at 10)
+
+**The pain.** GitHub shows a check's annotations inline on the PR diff, the fastest way to see
+what broke. Actions caps them at 10 errors and 10 warnings per step and 50 per job, and drops the
+rest silently:
+- [problem-matchers docs](https://github.com/actions/toolkit/blob/main/docs/problem-matchers.md),
+  [Checks API docs](https://docs.github.com/en/rest/checks/runs);
+- "If your test result has more than 10 failures reported, you'll only see the first 10"
+  ([TAP::Formatter::GitHubActions](https://metacpan.org/pod/TAP::Formatter::GitHubActions));
+- in [community #26680](https://github.com/orgs/community/discussions/26680), staff said there was
+  "no any available way to bypass the limitation"; a later comment points at calling the Checks
+  API directly, 50 per request;
+- workarounds: [Report Annotate](https://github.com/marketplace/actions/report-annotate) (overflow
+  into a PR comment), and limit errors in
+  [spectral-action#334](https://github.com/stoplightio/spectral-action/issues/334);
+- [community #61736](https://github.com/orgs/community/discussions/61736) asks for annotations
+  sorted by severity.
+
+**Reproduction.** Pit's check runs (GitHub App mode) carried a title and a summary table, and no
+annotations at all. A failing JUnit report named the tests in the result ("cart.pays (card
+declined)") but not where they failed. The JUnit parser also missed failure text inside CDATA,
+which jest-junit writes, so those failures had no message.
+
+**Fix.**
+- **Where each failure is.** The JUnit parser records candidate locations for each failure:
+  - the test case's `file` and `line` attributes (pytest and others);
+  - then `path:line` references in the failure text: stack frames `at f (src/a.ts:42:7)`,
+    Go's `a_test.go:12:`, Python's `File "x.py", line 12`, `file://` URLs and Windows paths;
+  - text is read from CDATA as well as plain text.
+- **Kept only if it's a repo file.** The worker resolves each candidate against the commit's file
+  list:
+  - it strips the workspace path, `/workspace/` (containers), `./` and `file://`;
+  - a path relative to a package dir matches the one repo file ending with it;
+  - `node_modules` frames and other non-repo paths are dropped.
+- **The message says where.** It now reads "cart.pays (Error: card declined) at
+  packages/web/src/cart.ts:17", so the CLI and agents see the place too.
+- **Annotations on the check.** The worker posts them (`POST /api/tasks/{id}/annotations`, lease
+  checked, at most 200 per task). When a group finishes, the server adds them to its check run:
+  - 50 in the completing update, the rest in follow-up PATCHes (GitHub appends them);
+  - claimed atomically per group, so later reports of the same run don't add them twice.
+
+**Measured.**
+- e2e `failed_tests_are_annotated_on_the_check` runs a mock GitHub API (App auth with a key made
+  by `openssl`, installation token, check runs). A task's report has 60 failed tests with
+  `file`/`line`:
+  - the mock received exactly 60 annotations;
+  - no request carried more than 50;
+  - the first was `src/cart.test.ts` line 1, level `failure`, message `expected 1`;
+  - two more seconds of reports added none.
+- Unit tests:
+  - stack frames, Go and Python formats, `file://` and Windows paths are found, while times and
+    URLs are not;
+  - a jest-style CDATA stack with container paths resolves to `packages/web/src/cart.ts:17`;
+  - a `node_modules` frame is dropped;
+  - the message includes the location.
+
+**Verdict: PARTIAL.** Every failure with a findable place becomes an annotation; there's no cap
+of 10 or 50, and there are no duplicates. Limits:
+- Only failures in JUnit reports are annotated, not compiler or linter output (no problem
+  matchers).
+- With a plain token (commit statuses), there are no annotations.
+- Not tried against real GitHub, only a mock of its API.
+- If a follow-up PATCH fails after the claim, the remaining annotations are not retried.

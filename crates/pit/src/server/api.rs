@@ -58,6 +58,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/events", get(all_events))
         .route("/api/tasks/{id}/log", get(task_log).post(append_log))
         .route("/api/tasks/{id}/start", post(start_task))
+        .route("/api/tasks/{id}/annotations", post(set_annotations))
         .route("/api/tasks/{id}/finish", post(finish_task))
         .route("/api/groups/{id}/heartbeat", post(heartbeat))
         .route("/api/groups/{id}/release", post(release_group))
@@ -420,6 +421,29 @@ async fn append_log(
         Some(&id),
         serde_json::json!({ "text": chunk.text }),
     );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Annotations a task keeps at most.
+const MAX_ANNOTATIONS: usize = 200;
+
+/// `POST /api/tasks/{id}/annotations`: where its failed tests are, from the
+/// running job.
+async fn set_annotations(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(mut annotations): Json<Vec<Annotation>>,
+) -> ApiResult<StatusCode> {
+    let (group_id, _, _) = app.db.task_group(&id)?;
+    annotations.truncate(MAX_ANNOTATIONS);
+    for a in &mut annotations {
+        a.title = a.title.chars().take(255).collect();
+        a.message = a.message.chars().take(1000).collect();
+    }
+    if !app.db.set_annotations(&id, lease(&headers), &annotations)? {
+        return Err(stale(&group_id));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

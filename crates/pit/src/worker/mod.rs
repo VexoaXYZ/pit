@@ -1236,7 +1236,35 @@ impl Worker {
         // Name the failed tests, from the task's JUnit reports.
         let reports = files::collect_outputs(ws, &def.reports)?;
         let paths: Vec<&std::path::PathBuf> = reports.iter().map(|(_, abs)| abs).collect();
-        let summary = junit::summarize(&paths);
+        let mut summary = junit::summarize(&paths);
+        if let Some(s) = summary.as_mut().filter(|_| !ok) {
+            let known: std::collections::HashSet<&str> =
+                files.iter().map(|(p, _)| p.as_str()).collect();
+            s.resolve(&known, ws);
+            // Where each failed test is, for an annotation on the pull request.
+            let annotations: Vec<Annotation> = s
+                .failures
+                .iter()
+                .filter_map(|(name, msg)| {
+                    let (path, line) = s.locations.get(name)?;
+                    Some(Annotation {
+                        path: path.clone(),
+                        line: *line,
+                        title: name.clone(),
+                        message: if msg.is_empty() {
+                            "failed".into()
+                        } else {
+                            msg.clone()
+                        },
+                    })
+                })
+                .collect();
+            if !annotations.is_empty() {
+                let _ = client
+                    .post_empty(&format!("/api/tasks/{}/annotations", task.id), &annotations)
+                    .await;
+            }
+        }
         // Per-file durations for the next split: from the reports when they
         // name files, otherwise this shard's time spread over its files.
         if ok && !def.shard_assigned.is_empty() {

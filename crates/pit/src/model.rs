@@ -383,6 +383,18 @@ pub struct TaskResult {
     pub message: Option<String>,
 }
 
+/// A failed test at a place in the repo, for an inline annotation on the
+/// pull request (GitHub check runs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Annotation {
+    pub path: String,
+    pub line: u32,
+    /// The test's name.
+    pub title: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupResult {

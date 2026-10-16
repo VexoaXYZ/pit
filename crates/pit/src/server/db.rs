@@ -288,6 +288,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_fresh {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0")?;
     }
+    let has_annotations: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'annotations'")?
+        .exists([])?;
+    if !has_annotations {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN annotations TEXT")?;
+    }
     let has_debug: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'debug'")?
         .exists([])?;
@@ -1128,6 +1134,36 @@ impl Db {
         )? > 0)
     }
 
+    /// Stores a running task's annotations (see `Annotation`).
+    pub fn set_annotations(
+        &self,
+        task_id: &str,
+        lease: Option<&str>,
+        annotations: &[Annotation],
+    ) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE tasks SET annotations = ?2 WHERE id = ?1 AND EXISTS (
+               SELECT 1 FROM groups_ WHERE groups_.id = tasks.group_id
+                 AND groups_.status = 'running' AND groups_.lease = ?3)",
+            params![task_id, serde_json::to_string(annotations)?, lease],
+        )? > 0)
+    }
+
+    /// Every annotation of a group's tasks.
+    pub fn group_annotations(&self, group_id: &str) -> Result<Vec<Annotation>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT annotations FROM tasks WHERE group_id = ?1 AND annotations IS NOT NULL ORDER BY position",
+        )?;
+        let rows: Vec<String> = st
+            .query_map(params![group_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .iter()
+            .flat_map(|j| serde_json::from_str::<Vec<Annotation>>(j).unwrap_or_default())
+            .collect())
+    }
+
     pub fn live_log(&self, task_id: &str) -> Result<String> {
         let c = self.conn.lock();
         let mut st = c.prepare("SELECT text FROM task_logs WHERE task_id = ?1 ORDER BY seq")?;
@@ -1474,6 +1510,14 @@ impl Db {
             }
         }
         Ok((keep, overlays))
+    }
+
+    /// Sets a key unless it is already set; true if this call set it.
+    pub fn kv_claim(&self, ns: &str, key: &str) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "INSERT OR IGNORE INTO kv (ns, key, digest, created_at) VALUES (?1, ?2, '1', ?3)",
+            params![ns, key, now_ms()],
+        )? > 0)
     }
 
     pub fn kv_put(&self, ns: &str, key: &str, digest: &str) -> Result<()> {

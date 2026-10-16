@@ -85,7 +85,7 @@ export default {
 | `deps` | Tasks in the same group that must pass first. Dependents of a failed task are skipped. |
 | `inputs` | Globs of tracked files the task reads (`!` excludes). Default: everything. Tighter inputs mean more cache hits and smaller merge queue lanes. |
 | `outputs` | Files the task produces. Uploaded on success and restored on a cache hit. |
-| `reports` | JUnit XML reports the task writes (`reports/*.xml`). A failure names the failed tests: "2 of 42 tests failed: cart.applies coupons (90 == 80); …". Old reports are deleted before each attempt. |
+| `reports` | JUnit XML reports the task writes (`reports/*.xml`). A failure names the failed tests and where they failed: "2 of 42 tests failed: cart.applies coupons (90 == 80) at src/cart.test.ts:42; …", from the test case's `file`/`line` or the first `path:line` in its failure text that is a file in the repo. With a GitHub App, every such failure is an annotation on the check, so it shows on the pull request's diff (sent 50 per request, past the 10-per-step cap Actions annotations have). Old reports are deleted before each attempt. |
 | `env` | Variables passed through and hashed into the cache key. |
 | `runtime` | Commands whose output is part of the cache key (`["node --version"]`), so a toolchain upgrade never reuses old results. |
 | `secrets` | Secrets the task needs, by name: from the worker's `--secrets-file` (or its environment), masked in logs (plain, base64, double base64), not in the cache key. Never given to fork pull requests. |

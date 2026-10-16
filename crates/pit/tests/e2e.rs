@@ -2658,3 +2658,148 @@ async fn run_with_timeout(pit: &Pit, dir: &Path, limit: Duration) -> RunView {
         .expect("run timed out")
         .unwrap()
 }
+
+/// Failed tests become annotations on the GitHub check, so they show on the
+/// pull request's diff: all of them, 50 per request (GitHub's limit), once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_tests_are_annotated_on_the_check() {
+    use axum::routing::{get, patch, post};
+    type Seen = std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>>;
+    let seen: Seen = Default::default();
+    let record = |seen: Seen| {
+        move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().push(body);
+                axum::Json(serde_json::json!({ "id": 7 }))
+            }
+        }
+    };
+    let mock = axum::Router::new()
+        .route(
+            "/repos/acme/web/installation",
+            get(|| async { axum::Json(serde_json::json!({ "id": 1 })) }),
+        )
+        .route(
+            "/app/installations/1/access_tokens",
+            post(|| async { axum::Json(serde_json::json!({ "token": "t" })) }),
+        )
+        .route("/repos/acme/web/check-runs", post(record(seen.clone())))
+        .route("/repos/acme/web/check-runs/7", patch(record(seen.clone())));
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await });
+
+    let keys = tempfile::tempdir().unwrap();
+    sh(keys.path(), "openssl genrsa -out key.pem 2048 2>/dev/null");
+    let pem = std::fs::read_to_string(keys.path().join("key.pem")).unwrap();
+    let github = pit::server::github::GitHub::with_app(&mock_url, "1", &pem).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("annotate".into()),
+        data_dir: data.path().join("worker"),
+        slots: 1,
+        parallelism: 1,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let cases: String = (1..=60)
+        .map(|i| format!(r#"<testcase classname="cart" name="case {i}" file="src/cart.test.ts" line="{i}"><failure message="expected {i}"/></testcase>"#))
+        .collect();
+    write(
+        dir,
+        "fixtures/report.xml",
+        &format!("<testsuite>{cases}</testsuite>"),
+    );
+    write(dir, "src/cart.test.ts", "test()\n");
+    write(dir, ".gitignore", "out/\n");
+    let config = serde_json::json!({ "tasks": { "test": {
+        "run": "mkdir -p out && cp fixtures/report.xml out/junit.xml && exit 1",
+        "reports": ["out/*.xml"],
+        "cache": false,
+    } } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(dir, "git rev-parse HEAD").trim().to_string();
+    app.db
+        .upsert_repo("acme/web", Some(&dir.to_string_lossy()), Some("acme/web"))
+        .unwrap();
+    let run_id = app
+        .create_run(
+            CreateRun {
+                repo: "acme/web".into(),
+                url: None,
+                sha,
+                overlay: None,
+                tasks: vec![],
+                trigger: Some("push".into()),
+                git_ref: Some("feature".into()),
+                no_cache: false,
+                fresh: false,
+                debug: false,
+                no_secrets: false,
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let client = Client::new(&base, None).unwrap();
+    let view = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&client, &run_id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.status, Status::Failed);
+    let annotations = || -> Vec<serde_json::Value> {
+        seen.lock()
+            .iter()
+            .flat_map(|b| {
+                b["output"]["annotations"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while annotations().len() < 60 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("annotations never reached the check");
+    // Later reports of the finished run do not add them again.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let all = annotations();
+    assert_eq!(all.len(), 60);
+    assert!(seen.lock().iter().all(|b| b["output"]["annotations"]
+        .as_array()
+        .is_none_or(|a| a.len() <= 50)));
+    let first = all.iter().find(|a| a["title"] == "cart.case 1").unwrap();
+    assert_eq!(first["path"], "src/cart.test.ts");
+    assert_eq!(first["start_line"], 1);
+    assert_eq!(first["annotation_level"], "failure");
+    assert_eq!(first["message"], "expected 1");
+}

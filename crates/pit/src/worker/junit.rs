@@ -25,6 +25,12 @@ pub struct Summary {
     pub failures: Vec<(String, String)>,
     /// Every failed test, once.
     failed: std::collections::HashSet<String>,
+    /// Places each kept failure points at, as the runner printed them, most
+    /// likely first: the test case's `file`/`line`, then `path:line` in its
+    /// failure text. `resolve` keeps the first that is a file in the repo.
+    candidates: std::collections::HashMap<String, Vec<(String, u32)>>,
+    /// Repo-relative `path:line` per failed test, after `resolve`.
+    pub locations: std::collections::HashMap<String, (String, u32)>,
     /// Seconds per `<testsuite name>` (Vitest, Playwright and most others
     /// name suites after the test file) or `<testcase file>`.
     pub file_times: std::collections::HashMap<String, f64>,
@@ -45,10 +51,15 @@ impl Summary {
             .iter()
             .take(SHOWN)
             .map(|(name, msg)| {
+                let at = self
+                    .locations
+                    .get(name)
+                    .map(|(p, l)| format!(" at {p}:{l}"))
+                    .unwrap_or_default();
                 if msg.is_empty() {
-                    name.clone()
+                    format!("{name}{at}")
                 } else {
-                    format!("{name} ({msg})")
+                    format!("{name} ({msg}){at}")
                 }
             })
             .collect();
@@ -66,6 +77,38 @@ impl Summary {
         )
     }
 
+    /// Picks each failure's location among files in the repo (`files`,
+    /// repo-relative). Runners print paths relative to the package, absolute
+    /// in the workspace (`ws`) or in a container (`/workspace`).
+    pub fn resolve(&mut self, files: &std::collections::HashSet<&str>, ws: &Path) {
+        let ws = ws.to_string_lossy().replace('\\', "/");
+        for (name, candidates) in &self.candidates {
+            let found = candidates.iter().find_map(|(raw, line)| {
+                let p = raw.replace('\\', "/");
+                let p = p.strip_prefix("file://").unwrap_or(&p);
+                let p = p
+                    .strip_prefix(&format!("{ws}/"))
+                    .or_else(|| p.strip_prefix("/workspace/"))
+                    .unwrap_or(p);
+                let p = p.trim_start_matches("./");
+                if files.contains(p) {
+                    return Some((p.to_string(), *line));
+                }
+                // Relative to a package directory: the one repo file that
+                // ends with it.
+                let suffix = format!("/{p}");
+                let mut matches = files.iter().filter(|f| f.ends_with(&suffix));
+                match (matches.next(), matches.next()) {
+                    (Some(f), None) if !p.starts_with('/') => Some((f.to_string(), *line)),
+                    _ => None,
+                }
+            });
+            if let Some(loc) = found {
+                self.locations.insert(name.clone(), loc);
+            }
+        }
+    }
+
     fn merge(&mut self, other: Summary) {
         self.tests += other.tests;
         self.skipped += other.skipped;
@@ -75,6 +118,9 @@ impl Summary {
             }
         }
         self.failed.extend(other.failed);
+        for (name, c) in other.candidates {
+            self.candidates.entry(name).or_insert(c);
+        }
         for (f, t) in other.file_times {
             *self.file_times.entry(f).or_default() += t;
         }
@@ -99,14 +145,73 @@ fn first_line(s: &str) -> String {
     }
 }
 
+/// Text scanned for locations, per failure.
+const SCANNED: usize = 8 << 10;
+/// Locations kept per failure.
+const CANDIDATES: usize = 5;
+
+/// `path:line` references in a failure's text: stack frames (`at f
+/// (src/a.ts:42:7)`), assertion output (`tests/a_test.go:12:`) and Python's
+/// `File "tests/test_a.py", line 12`. Only paths with an extension count.
+pub fn locations_in(text: &str) -> Vec<(String, u32)> {
+    let mut cut = text.len().min(SCANNED);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let mut push = |path: &str, line: &str| {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let Ok(line) = line.parse::<u32>() else {
+            return;
+        };
+        if line > 0
+            && name.contains('.')
+            && out.len() < CANDIDATES
+            && !out.iter().any(|(p, l)| p == path && *l == line)
+        {
+            out.push((path.to_string(), line));
+        }
+    };
+    for l in text[..cut].lines() {
+        if let Some((path, after)) = l
+            .trim_start()
+            .strip_prefix("File \"")
+            .and_then(|r| r.split_once('"'))
+        {
+            if let Some(n) = after.trim_start_matches(',').trim().strip_prefix("line ") {
+                let digits: String = n.chars().take_while(char::is_ascii_digit).collect();
+                push(path, &digits);
+            }
+        }
+        for token in l.split(|c: char| c.is_whitespace() || "()[]<>\"',".contains(c)) {
+            let token = token.strip_prefix("file://").unwrap_or(token);
+            // `src/a.ts:42:7`, `a_test.go:12:`, `C:\x\a.ts:3`: the path is
+            // everything before the first part that is a line number.
+            let parts: Vec<&str> = token.split(':').collect();
+            if let Some(i) = (1..parts.len())
+                .find(|&i| !parts[i].is_empty() && parts[i].bytes().all(|b| b.is_ascii_digit()))
+            {
+                let path = parts[..i].join(":");
+                if !path.is_empty() {
+                    push(&path, parts[i]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Counts `<testcase>` elements and their `<failure>`, `<error>` and
 /// `<skipped>` children. Malformed input yields whatever was read so far.
 pub fn parse(xml: &str) -> Summary {
     let mut reader = Reader::from_str(xml);
     let mut summary = Summary::default();
     let mut case: Option<String> = None;
+    // The current test case's own `file` and `line`.
+    let mut case_at: Option<(String, u32)> = None;
     // A failure whose message is in its text rather than an attribute.
     let mut pending: Option<(String, String)> = None;
+    let mut text = String::new();
     loop {
         let event = match reader.read_event() {
             Ok(Event::Eof) | Err(_) => break,
@@ -141,6 +246,10 @@ pub fn parse(xml: &str) -> Summary {
                 // can hold a failure.
                 if open {
                     case = Some(full);
+                    case_at = attr(&e, b"file").and_then(|f| {
+                        let line = attr(&e, b"line")?.parse().ok()?;
+                        Some((f, line))
+                    });
                 }
             }
             Event::Start(e) | Event::Empty(e)
@@ -151,9 +260,10 @@ pub fn parse(xml: &str) -> Summary {
                         .map(|m| first_line(&m))
                         .unwrap_or_default();
                     pending = Some((name.clone(), msg));
+                    text.clear();
                     // `<failure message="…"/>` has no end tag to record it at.
                     if !open {
-                        record(&mut summary, pending.take());
+                        record(&mut summary, pending.take(), case_at.clone(), "");
                     }
                 }
             }
@@ -162,15 +272,24 @@ pub fn parse(xml: &str) -> Summary {
                     summary.skipped += 1;
                 }
             }
-            Event::Text(t) => {
+            // Failure text, plain or in CDATA (jest-junit writes CDATA).
+            Event::Text(_) | Event::CData(_) if pending.is_some() => {
+                let chunk = match &event {
+                    Event::Text(t) => t.unescape().map(|c| c.to_string()).unwrap_or_default(),
+                    Event::CData(c) => String::from_utf8_lossy(c).to_string(),
+                    _ => String::new(),
+                };
+                if text.len() < SCANNED {
+                    text.push_str(&chunk);
+                }
                 if let Some((_, msg)) = pending.as_mut().filter(|(_, m)| m.is_empty()) {
-                    if let Ok(text) = t.unescape() {
-                        *msg = first_line(&text);
-                    }
+                    *msg = first_line(&chunk);
                 }
             }
             Event::End(e) => match e.name().as_ref() {
-                b"failure" | b"error" => record(&mut summary, pending.take()),
+                b"failure" | b"error" => {
+                    record(&mut summary, pending.take(), case_at.clone(), &text)
+                }
                 b"testcase" => case = None,
                 _ => {}
             },
@@ -181,9 +300,19 @@ pub fn parse(xml: &str) -> Summary {
 }
 
 /// Adds a failure once per test, even with both `<failure>` and `<error>`.
-fn record(summary: &mut Summary, failure: Option<(String, String)>) {
+fn record(
+    summary: &mut Summary,
+    failure: Option<(String, String)>,
+    at: Option<(String, u32)>,
+    text: &str,
+) {
     if let Some(f) = failure {
         if summary.failed.insert(f.0.clone()) && summary.failures.len() < KEPT {
+            let mut candidates: Vec<(String, u32)> = at.into_iter().collect();
+            candidates.extend(locations_in(text));
+            if !candidates.is_empty() {
+                summary.candidates.insert(f.0.clone(), candidates);
+            }
             summary.failures.push(f);
         }
     }
@@ -243,6 +372,67 @@ mod tests {
         assert_eq!(
             s.message(),
             "2 of 4 tests failed: cart.applies coupons (expected 90 to equal 80); cart.checks out (TypeError: x is undefined)"
+        );
+    }
+
+    #[test]
+    fn finds_where_a_failure_points() {
+        assert_eq!(
+            locations_in(
+                "AssertionError: expected 90\n    at Object.<anonymous> (/workspace/src/cart.test.ts:42:7)\n    at node:internal/x:1:2"
+            ),
+            [("/workspace/src/cart.test.ts".to_string(), 42)]
+        );
+        assert_eq!(
+            locations_in("Traceback:\n  File \"tests/test_cart.py\", line 12, in test_pay"),
+            [("tests/test_cart.py".to_string(), 12)]
+        );
+        assert_eq!(
+            locations_in("cart_test.go:31: got 1, want 2"),
+            [("cart_test.go".to_string(), 31)]
+        );
+        assert_eq!(
+            locations_in("at file:///home/u/w/a.ts:3:1 and C:\\w\\b.rs:9"),
+            [
+                ("/home/u/w/a.ts".to_string(), 3),
+                ("C:\\w\\b.rs".to_string(), 9)
+            ]
+        );
+        // Times and URLs are not places.
+        assert!(locations_in("took 12:30 at http://localhost:8080/x").is_empty());
+    }
+
+    #[test]
+    fn failures_resolve_to_repo_files() {
+        // jest-junit: the stack in CDATA, paths absolute in the container.
+        let xml = r#"<testsuites><testsuite name="cart">
+<testcase classname="cart" name="pays"><failure><![CDATA[Error: card declined
+    at pay (/workspace/packages/web/src/cart.ts:17:9)
+    at Object.<anonymous> (/workspace/packages/web/src/cart.test.ts:42:7)]]></failure></testcase>
+<testcase classname="t" name="py" file="tests/test_a.py" line="8"><failure message="assert 1 == 2"/></testcase>
+<testcase classname="t" name="vendored"><failure>at x (node_modules/lib/index.js:3:1)</failure></testcase>
+</testsuite></testsuites>"#;
+        let mut s = parse(xml);
+        assert_eq!(s.failures[0].1, "Error: card declined");
+        let files: std::collections::HashSet<&str> = [
+            "packages/web/src/cart.ts",
+            "packages/web/src/cart.test.ts",
+            "tests/test_a.py",
+        ]
+        .into_iter()
+        .collect();
+        s.resolve(&files, Path::new("/home/w/ws"));
+        assert_eq!(
+            s.locations["cart.pays"],
+            ("packages/web/src/cart.ts".to_string(), 17)
+        );
+        assert_eq!(s.locations["t.py"], ("tests/test_a.py".to_string(), 8));
+        assert!(!s.locations.contains_key("t.vendored"));
+        assert!(
+            s.message()
+                .contains("cart.pays (Error: card declined) at packages/web/src/cart.ts:17"),
+            "{}",
+            s.message()
         );
     }
 
