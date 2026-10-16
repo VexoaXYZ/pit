@@ -53,7 +53,8 @@ enum Command {
         worker_token: Option<String>,
         /// `KEY=VALUE` secrets, given only to tasks that list them in
         /// `secrets` and never to fork pull requests. Prefer it to the
-        /// worker's environment, which every task inherits.
+        /// worker's environment, which every task inherits. Host and sandbox
+        /// tasks run as the worker's user and can read the file itself.
         #[arg(long, env = "PIT_SECRETS_FILE")]
         secrets_file: Option<PathBuf>,
         /// Webhook told when main or a schedule breaks or is fixed (a Slack
@@ -112,7 +113,8 @@ enum Command {
         worker_token: Option<String>,
         /// `KEY=VALUE` secrets, given only to tasks that list them in
         /// `secrets` and never to fork pull requests. Prefer it to the
-        /// worker's environment, which every task inherits.
+        /// worker's environment, which every task inherits. Host and sandbox
+        /// tasks run as the worker's user and can read the file itself.
         #[arg(long, env = "PIT_SECRETS_FILE")]
         secrets_file: Option<PathBuf>,
     },

@@ -737,8 +737,12 @@ impl Worker {
             .filter(|t| t.def.quarantine)
             .map(|t| t.name.as_str())
             .collect();
+        // A task skipped because its dependency failed did not pass either:
+        // a quarantined `build` must not turn the `test` after it into a
+        // green run that tested nothing.
         let failed = state.iter().any(|(name, (s, _))| {
-            matches!(s, Status::Failed | Status::Error) && !quarantined.contains(name.as_str())
+            matches!(s, Status::Failed | Status::Error | Status::Skipped)
+                && !quarantined.contains(name.as_str())
         });
         if failed {
             Status::Failed
@@ -804,7 +808,9 @@ impl Worker {
                         let entry = client
                             .get_opt::<CacheEntry>(&format!("/api/cache/{key}"))
                             .await?;
-                        if entry.is_some() || *cancel.borrow() {
+                        // A fork's run writes no entry, so others must not
+                        // wait for it.
+                        if entry.is_some() || *cancel.borrow() || job.no_secrets {
                             break entry;
                         }
                         let claim: serde_json::Value = match client
@@ -951,12 +957,23 @@ impl Worker {
             ("PIT_RUN_ID".into(), job.run_id.clone()),
             ("PIT_SHA".into(), job.sha.clone()),
             ("PIT_SHARD".into(), def.shard.unwrap_or(1).to_string()),
-            ("PIT_SHARD_FILES".into(), def.shard_assigned.join(" ")),
             (
                 "PIT_SHARD_COUNT".into(),
                 def.shards.unwrap_or(1).to_string(),
             ),
         ];
+        // One file per line, so names with spaces survive `xargs -d '\n'`.
+        // The whole list is always in a file too: a big suite's list can be
+        // more than the OS lets a process environment hold.
+        if !def.shard_files.is_empty() {
+            let list = def.shard_assigned.join("\n");
+            let at = files::safe_join(ws, SHARD_LIST)?;
+            files::write_file(&at, format!("{list}\n").as_bytes(), false)?;
+            env.push(("PIT_SHARD_FILES_LIST".into(), SHARD_LIST.into()));
+            if list.len() <= SHARD_ENV_BYTES {
+                env.push(("PIT_SHARD_FILES".into(), list));
+            }
+        }
         // Never hand Pit's own settings (API token) back through `env`. Windows
         // variable names are case-insensitive, so compare uppercased.
         let mut secret_values = Vec::new();
@@ -1093,7 +1110,11 @@ impl Worker {
         }
         // A pass that needed a retry is not reused: later runs of the same
         // inputs must run it again, so the flake keeps showing until fixed.
-        if ok && !job.no_cache && failures.is_empty() {
+        // A fork's results are not shared at all: same-repo pull requests,
+        // which get secrets, read the same untrusted entries, and a task
+        // whose `inputs` miss a file the fork controls would hand them its
+        // output.
+        if ok && !job.no_cache && !job.no_secrets && failures.is_empty() {
             match def.cache {
                 CacheMode::Remote => {
                     let outputs = files::collect_outputs(ws, &def.outputs)?;
@@ -1266,17 +1287,37 @@ impl Worker {
                 out.insert(cmd.clone(), v);
                 continue;
             }
-            let (shell, flag) = if cfg!(windows) {
-                ("cmd", "/C")
+            // A runtime command is repository code like the task: the same
+            // environment rules, and a fork's runs in its container, offline,
+            // instead of on the worker.
+            let mut probe = def.clone();
+            probe.run = cmd.clone();
+            let backend = if job.no_secrets {
+                probe.network = Some(false);
+                Backend::Docker
             } else {
-                ("sh", "-c")
+                Backend::Host
             };
-            let run = tokio::process::Command::new(shell)
-                .args([flag, cmd])
-                .current_dir(ws)
+            let policy = exec::EnvPolicy {
+                hide: self.secrets.keys().cloned().collect(),
+                minimal: job.no_secrets,
+            };
+            let exec::TaskCommand {
+                cmd: mut command,
+                container,
+            } = exec::command_with(&probe, backend, ws, &[], &policy);
+            command
                 .stdin(std::process::Stdio::null())
-                .output();
-            let value = match tokio::time::timeout(Duration::from_secs(15), run).await {
+                .kill_on_drop(true);
+            let limit = Duration::from_secs(if container.is_some() { 60 } else { 15 });
+            let result = tokio::time::timeout(limit, command.output()).await;
+            if let (Err(_), Some(name)) = (&result, &container) {
+                let _ = tokio::process::Command::new("docker")
+                    .args(["rm", "-f", name])
+                    .output()
+                    .await;
+            }
+            let value = match result {
                 Ok(Ok(o)) if o.status.success() => {
                     String::from_utf8_lossy(&o.stdout).trim().to_string()
                 }
@@ -1358,6 +1399,11 @@ impl Worker {
 
 /// The local ID of a container image, pulling it first if this worker does
 /// not have it (the run would pull it anyway).
+/// Where a shard's dealt files are listed, relative to the workspace.
+const SHARD_LIST: &str = ".pit/shard-files";
+/// Lists longer than this go only in `SHARD_LIST`, not the environment.
+const SHARD_ENV_BYTES: usize = 64 << 10;
+
 async fn image_id(image: &str) -> String {
     let inspect = || async {
         tokio::process::Command::new("docker")

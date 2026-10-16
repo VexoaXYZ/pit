@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS runs (
   finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS runs_created ON runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS runs_sha ON runs(repo_id, sha);
 
 CREATE TABLE IF NOT EXISTS groups_ (
   id TEXT PRIMARY KEY,
@@ -85,6 +86,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_group ON tasks(group_id, position);
 CREATE INDEX IF NOT EXISTS tasks_run ON tasks(run_id);
 CREATE INDEX IF NOT EXISTS tasks_key ON tasks(action_key);
+CREATE INDEX IF NOT EXISTS tasks_finished ON tasks(finished_at);
 
 CREATE TABLE IF NOT EXISTS task_logs (
   task_id TEXT NOT NULL,
@@ -161,6 +163,7 @@ CREATE TABLE IF NOT EXISTS queue (
   run_id TEXT,
   landed_sha TEXT,
   reason TEXT,
+  pinned INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -230,6 +233,9 @@ pub struct QueueRow {
     pub run_id: Option<String>,
     pub landed_sha: Option<String>,
     pub reason: Option<String>,
+    /// Queued at exactly `head_sha` (a fork's pull request, approved by the
+    /// label on that commit): a later push drops it instead of retesting.
+    pub pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -286,6 +292,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_no_secrets {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN no_secrets INTEGER NOT NULL DEFAULT 0")?;
     }
+    let has_pinned: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('queue') WHERE name = 'pinned'")?
+        .exists([])?;
+    if !has_pinned {
+        conn.execute_batch("ALTER TABLE queue ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")?;
+    }
     let has_trusted: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'trusted'")?
         .exists([])?;
@@ -330,6 +342,7 @@ fn queue_row(r: &Row) -> rusqlite::Result<QueueRow> {
         run_id: r.get("run_id")?,
         landed_sha: r.get("landed_sha")?,
         reason: r.get("reason")?,
+        pinned: r.get("pinned")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })
@@ -527,6 +540,19 @@ impl Db {
         c.query_row("SELECT * FROM runs WHERE id = ?1", params![id], run_row)
             .optional()?
             .with_context(|| format!("unknown run {id}"))
+    }
+
+    /// The run a rerun of this commit copies its restrictions from: one
+    /// without secrets if any was (a fork's commit), else the newest.
+    pub fn prior_run(&self, repo_id: &str, sha: &str) -> Result<Option<RunRow>> {
+        let c = self.conn.lock();
+        Ok(c.query_row(
+            "SELECT * FROM runs WHERE repo_id = ?1 AND sha = ?2
+             ORDER BY no_secrets DESC, created_at DESC LIMIT 1",
+            params![repo_id, sha],
+            run_row,
+        )
+        .optional()?)
     }
 
     pub fn set_run_status(&self, id: &str, status: Status, message: Option<&str>) -> Result<()> {
@@ -1218,8 +1244,6 @@ impl Db {
         Ok(None)
     }
 
-    /// Whether the group holding this live lease belongs to a trusted run;
-    /// `None` if no running group holds it.
     pub fn shard_timings(
         &self,
         repo_id: &str,
@@ -1293,6 +1317,25 @@ impl Db {
             .optional()?)
     }
 
+    /// For a task of the group holding this live lease: its repo, the
+    /// group's name, and whether the run withholds secrets (a fork's).
+    pub fn lease_task(&self, lease: &str, task: &str) -> Result<Option<(String, String, bool)>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT runs.repo_id, groups_.name, runs.no_secrets FROM groups_
+                 JOIN runs ON runs.id = groups_.run_id
+                 JOIN tasks ON tasks.group_id = groups_.id
+                 WHERE groups_.lease = ?1 AND groups_.status = 'running' AND tasks.name = ?2",
+                params![lease, task],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+            )
+            .optional()?)
+    }
+
+    /// Whether the group holding this live lease belongs to a trusted run;
+    /// `None` if no running group holds it.
     pub fn lease_trust(&self, lease: &str) -> Result<Option<bool>> {
         Ok(self
             .conn
@@ -1628,13 +1671,14 @@ impl Db {
         pr: Option<u64>,
         head_sha: &str,
         target: &str,
+        pinned: bool,
     ) -> Result<String> {
         let id = new_id("q");
         let now = now_ms();
         self.conn.lock().execute(
-            "INSERT INTO queue (id, repo_id, source, pr, head_sha, target, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?7)",
-            params![id, repo_id, source, pr.map(|v| v as i64), head_sha, target, now],
+            "INSERT INTO queue (id, repo_id, source, pr, head_sha, target, status, pinned, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?8)",
+            params![id, repo_id, source, pr.map(|v| v as i64), head_sha, target, pinned, now],
         )?;
         Ok(id)
     }

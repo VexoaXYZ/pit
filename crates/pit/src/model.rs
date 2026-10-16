@@ -432,6 +432,8 @@ pub struct FlakyTask {
     pub repo: String,
     pub group: String,
     pub task: String,
+    /// Times the task finished in the window: every execution, so a run
+    /// with three shards of it counts three.
     pub runs: u64,
     pub failures: u64,
     /// Passed only on a retry.
@@ -505,6 +507,10 @@ pub struct QueueAdd {
     pub pr: Option<u64>,
     #[serde(default)]
     pub target: Option<String>,
+    /// Queue exactly this commit of the pull request, and drop it if more
+    /// commits are pushed. Set for forks by the webhook, never by clients.
+    #[serde(skip)]
+    pub sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

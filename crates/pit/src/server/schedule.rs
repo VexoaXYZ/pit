@@ -67,7 +67,7 @@ async fn repo_tick(app: &Arc<App>, repo: &super::db::Repo, first: i64, now: i64)
         Some(s) => s,
         // Errors are not cached: a timeout under load must not switch the
         // schedules off until the next commit.
-        None => match app.load_config(&mirror, &tip, None).await {
+        None => match app.load_config(&mirror, &tip, None, false).await {
             Ok(c) => {
                 read_cache()
                     .lock()

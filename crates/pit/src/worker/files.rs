@@ -20,6 +20,24 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     {
         bail!("refusing to write inside .git: {rel:?}");
     }
+    // The checkout is repository code: a committed symlink (`out -> /home`)
+    // must not turn `out/x` into a path outside the workspace. The last
+    // component may be one; callers replace or skip it rather than follow it.
+    let mut dir = root.to_path_buf();
+    let parts: Vec<_> = p.components().collect();
+    for c in &parts[..parts.len() - 1] {
+        dir.push(c);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => {
+                bail!(
+                    "refusing to follow the symlink {} in {rel:?}",
+                    dir.display()
+                )
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
     Ok(root.join(p))
 }
 
@@ -145,6 +163,31 @@ mod tests {
         for bad in ["../x", "/etc/passwd", "a/../../x", ".git/config", ""] {
             assert!(safe_join(root, bad).is_err(), "{bad}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn never_follows_a_symlinked_directory_out_of_the_workspace() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), "precious").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("r")).unwrap();
+        assert!(safe_join(ws.path(), "r/keep").is_err());
+        // A fork's `reports: ["r/**"]` deletes nothing outside, and a cached
+        // output is not written through the link.
+        assert!(clear_outputs(ws.path(), &["r/**".into()]).is_ok());
+        std::fs::create_dir(outside.path().join("pit")).unwrap();
+        std::fs::write(outside.path().join("pit/db"), "precious").unwrap();
+        assert!(clear_outputs(ws.path(), &["r/pit/**".into()]).is_err());
+        assert!(outside.path().join("pit/db").exists());
+        assert!(collect_outputs(ws.path(), &["r/keep".into()]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("keep")).unwrap(),
+            "precious"
+        );
+        // The link itself, as the last component, is fine to replace.
+        assert!(safe_join(ws.path(), "r").is_ok());
+        assert!(safe_join(ws.path(), "new/dir/file").is_ok());
     }
 
     #[test]

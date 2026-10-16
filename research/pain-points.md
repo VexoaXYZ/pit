@@ -2279,3 +2279,111 @@ has no automated test.
 **Verdict: PARTIAL.** Pit now provides the signal and safe scale-downs, but it does not scale
 anything itself; a KEDA, HPA or script still has to start and stop workers. `pit_workers_busy`
 counts workers, not slots, because the server does not know how many slots a worker has.
+
+## Review of P31–P40
+
+An independent reviewer read P31 to P40 (except the batching and OIDC code, which had been
+reviewed already). The most serious result: **P31's fork protection had three holes**, so
+"docker only, no secrets" was not true when P31 was written. Fork code could get out of the
+container three ways. All 18 findings are fixed except the two noted below (`cargo test`: 61 unit,
+31 e2e, clippy clean).
+
+Fork code escaping the container (high):
+
+1. **GitHub's "Re-run" ran a fork's commit with full privileges.** The rerun webhook created a
+   plain run: host backend, worker `env` and `secrets`, warm workspace. A rerun now copies the
+   restrictions of the commit's earlier runs (a fork's if any was one). Pit ignores a commit it
+   never ran. The e2e test reruns the fork's check and asserts the new run has no secrets and
+   still passes `test -z "$SECRET"`.
+2. **A fork's `runtime` commands ran on the worker host** with the worker's whole environment
+   (`PIT_TOKEN`, `PIT_WORKER_TOKEN`), before any fork check. Now:
+   - Runtime commands follow the task's environment rules everywhere. That also fixes trusted
+     runs, which skipped the `PIT_*` stripping.
+   - A fork's runtime commands run in its task container, with no network.
+3. **A fork's `pit.config.ts` was evaluated by Node on the server.** Clearing the environment
+   did not stop it reading the server's files: the database, and the OIDC signing key, which
+   would let it mint default-branch cloud tokens. A fork's config is now evaluated in
+   `node:22-alpine`:
+   - no network, a read-only root, all capabilities dropped, user `nobody`;
+   - nothing mounted but the config and its context file.
+
+   A unit test plants a key file and a `PIT_TOKEN` on the host. The sandboxed config reads
+   `blocked blocked none`: no file, no network, no token. Without Docker, the run fails with a
+   message pointing to `pit.config.json`.
+4. **Symlinks committed in the fork redirected the worker's file handling** (medium-high). A fork
+   committing `r -> /home/pit` with `reports: ["r/.local/share/pit/**"]` made the worker delete
+   that directory on the host before the task ran, and outputs could upload host files. The fix
+   is in `safe_join`, used for clearing, collecting, restoring and writing, and a unit test
+   covers it:
+   - A path whose existing parent directories include a symlink is now refused.
+   - A symlink as the last component is only skipped or replaced, never followed.
+
+Fork isolation (medium and low):
+
+5. **The merge queue retested whatever a fork pushed after it was queued**, as a trusted run with
+   secrets (#18). The label had also been applied to the PR head as fetched later, not the commit
+   it was added on. Fork entries are now pinned:
+   - queued at the labeled SHA (refused if the PR has already moved);
+   - removed with "new commits were pushed after it was queued; add the merge label again" when
+     its head moves.
+
+   The e2e test pushes to the fork during a 20s candidate run and sees the entry removed.
+6. **Fork results went into the shared untrusted cache**, which same-repo PRs (with secrets) read.
+   Forks now read the cache but write nothing. They take no single-flight claim, so nobody waits
+   for them, and record no shard timings.
+7. **Fork groups could land on workers without Docker**, then fail every task. Docker is now a
+   required backend for them at planning, so they wait for a worker that has it. The e2e test
+   checks that wait on machines without Docker.
+8. The minimal fork environment dropped `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG` and
+   `XDG_RUNTIME_DIR`, breaking rootless and remote Docker. Only the docker client sees them; they
+   are kept now.
+9. An image name starting with `-` is rejected at config load (it reached `docker run` as an
+   argument; not exploitable as written).
+
+Silent green and wrong coverage (medium):
+
+10. **Shard splits and timings were keyed by bare task name.** With groups `unit` and `e2e` each
+    having a sharded `test`, the second group's shards got the first group's split: its own files
+    never ran, and the run was green. Both are now keyed by group and task (`unit.test`). The
+    server also takes the key from the lease's own group, not from the worker's request. The e2e
+    test runs two such groups and checks each one's files.
+11. **`shardFiles` could pass without running anything.** Now:
+    - it needs `shards` of 2 or more;
+    - globs that match no files fail the run ("match no files");
+    - if the file index fails, planning fails instead of silently skipping the split.
+12. **Quarantine hid everything after the quarantined task.** A quarantined `build` failing made
+    its dependent `test` skip, and skips did not count, so the run was green with no tests run. A
+    dependency-skipped task now fails the group unless it is quarantined itself. The e2e test
+    checks this.
+13. **JUnit parsing could be made to hang or underflow.**
+    - Duplicate detection was a linear scan per failure, so a fork's report with a million
+      failures cost hours of CPU after the task timeout had passed.
+    - A test case with two `<skipped/>` elements underflowed the "passed" count.
+    - Now: a hash set for duplicates, 100 failures kept with messages and the rest counted, report
+      files over 64 MiB skipped, and saturating counts. 200,000 failures parse in under a second
+      in the unit test.
+
+Smaller fixes:
+
+14. `PIT_SHARD_FILES` was space-joined, so names with spaces split and a large list could exceed
+    the environment limit (E2BIG). It is now one file per line. The full list is always in
+    `PIT_SHARD_FILES_LIST` (`.pit/shard-files`), and lists over 64 KiB are left out of the
+    environment.
+15. `read_blobs` had three bugs, now fixed with a unit test:
+    - A path containing a newline shifted every later answer onto the wrong path; such paths are
+      now skipped.
+    - A git failure read as "no packages"; it is now an error.
+    - Truncated output could panic.
+16. `pit flaky` ran a weeks-long scan holding the DB lock on an async thread. It now runs on a
+    blocking thread with a `tasks(finished_at)` index. Its "runs" column counted executions; it
+    is now labeled "finished".
+17. The `--secrets-file` help now says what the README already said: host and sandbox tasks run
+    as the worker's user and can read the file itself.
+
+Not fixed: timings rows are never pruned for files that no longer exist; that growth is slow and
+bounded by the repo's history. The OIDC/queue code outside this review's scope is unchanged
+beyond #18.
+
+P31's verdict stays **PARTIAL**, now for the right reasons. A fork's code, config included, runs
+only in containers with no secrets. What remains: P31's existing limits, and the config sandbox
+needs Docker on the server.

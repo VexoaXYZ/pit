@@ -434,12 +434,12 @@ pub async fn flaky(client: &Client, days: u32) -> Result<i32> {
         return Ok(0);
     }
     println!(
-        "{:<32} {:>5} {:>8} {:>13} {:>12}  last run",
-        "task", "runs", "failed", "passed retry", "same inputs"
+        "{:<32} {:>8} {:>8} {:>13} {:>12}  last run",
+        "task", "finished", "failed", "passed retry", "same inputs"
     );
     for t in tasks {
         println!(
-            "{:<32} {:>5} {:>8} {:>13} {:>12}  {}",
+            "{:<32} {:>8} {:>8} {:>13} {:>12}  {}",
             format!("{} {}.{}", t.repo, t.group, t.task),
             t.runs,
             t.failures,
@@ -486,6 +486,7 @@ pub async fn queue_add(
                 branch: Some(branch.into()),
                 pr: None,
                 target,
+                sha: None,
             },
         )
         .await?;

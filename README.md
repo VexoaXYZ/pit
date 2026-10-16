@@ -96,7 +96,7 @@ export default {
 | `timeout` | Seconds; default 3600, `0` for no limit. The whole process group is killed. |
 | `idleTimeout` | Seconds without any output before the task is stopped as hung; default 900, `0` for no limit. |
 | `shards` | Split the task into N groups that spread across workers; each gets `PIT_SHARD` and `PIT_SHARD_COUNT` (`vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`). |
-| `shardFiles` | Globs of the files to split (`["e2e/**/*.spec.ts"]`). Pit deals them out longest first from recorded durations and gives each shard its list in `PIT_SHARD_FILES` (`playwright test $PIT_SHARD_FILES`), so one shard does not get all the slow files. A shard dealt nothing passes without running. |
+| `shardFiles` | Globs of the files to split (`["e2e/**/*.spec.ts"]`). Pit deals them out longest first from recorded durations and gives each shard its list in `PIT_SHARD_FILES`, one per line (`playwright test $PIT_SHARD_FILES`; `xargs -d '\n'` for names with spaces), and always in the file `PIT_SHARD_FILES_LIST` (`.pit/shard-files`), since a very long list is left out of the environment. One shard does not get all the slow files. Needs `shards` of 2 or more; globs that match no files fail the run, and a shard dealt nothing passes without running. |
 | `retries` | Extra attempts after a failure. A pass on a retry is reported as `flaky:` and is not cached. |
 | `quarantine` | `true`: the task still runs and reports, but its failure does not fail the run or eject a queued change. For a known-flaky task while it is fixed; `pit flaky` finds them. |
 
@@ -241,9 +241,15 @@ label to a pull request queues it.
 included, is someone else's. A maintainer who has read it adds the `pit:run` label, which
 runs that one commit. A later push needs the label again, so nobody can swap code in after a
 review. The run gets a throwaway workspace, no `secrets` and no `env` values, only a minimal
-inherited environment (`PATH`, `HOME`, locale, temp dirs), an untrusted cache scope, and
-the `docker` backend whatever its config says, so it cannot read the worker's files. A worker
-without Docker refuses it.
+inherited environment (`PATH`, `HOME`, locale, temp dirs), and the `docker` backend whatever
+its config says, so it cannot read the worker's files; only workers with Docker take it. Its
+`runtime` commands run in the task's container too, offline. Its `pit.config.ts` is evaluated
+in a `node:22-alpine` container (`PIT_CONFIG_IMAGE`) with no network, no capabilities and no
+mounts but the file itself, because evaluating it on the server would expose the server's files
+(its database, its OIDC signing key). It may read cached results but writes none, so nothing it
+builds reaches a same-repo pull request, and it records no shard timings. "Re-run" on its check
+keeps all of this, and a fork queued with `pit:merge` is queued at the labeled commit: a later
+push drops it from the queue instead of testing the new code with the queue's trust.
 
 **Secrets on workers.** Every task inherits the worker's environment (minus `PIT_*`), so a
 token exported there can be read by any task, declared or not. Put secrets in

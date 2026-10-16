@@ -41,6 +41,10 @@ const EVAL_ENV: &[&str] = &[
     "LOCALAPPDATA",
 ];
 
+/// The image an untrusted config (a fork's) is evaluated in, unless
+/// `PIT_CONFIG_IMAGE` names another with Node 22.6+.
+pub const SANDBOX_IMAGE: &str = "node:22-alpine";
+
 fn cache() -> &'static Mutex<HashMap<String, PitConfig>> {
     static CACHE: OnceLock<Mutex<HashMap<String, PitConfig>>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
@@ -49,12 +53,16 @@ fn cache() -> &'static Mutex<HashMap<String, PitConfig>> {
 /// Parses config source. `name` is the file name it came from, which decides
 /// whether it is JSON or TypeScript. A TypeScript config that exports a
 /// function is called with `ctx` (see `workspace`). Results are memoized by
-/// content hash.
+/// content hash. A `sandboxed` config (a fork's) runs in a container with no
+/// network, no capabilities and nothing of the host but itself: evaluating
+/// it on the server would hand the fork the server's files, signing key
+/// included.
 pub async fn parse(
     name: &str,
     source: &[u8],
     scratch: &Path,
     ctx: &crate::workspace::Context,
+    sandboxed: bool,
 ) -> Result<PitConfig> {
     let ctx = serde_json::to_vec(ctx)?;
     let key = format!(
@@ -68,14 +76,14 @@ pub async fn parse(
     let config = if name.ends_with(".json") {
         serde_json::from_slice::<PitConfig>(source).context("parsing pit.config.json")?
     } else {
-        eval_ts(source, &ctx, scratch).await?
+        eval_ts(source, &ctx, scratch, sandboxed).await?
     };
     let config = normalize(config)?;
     cache().lock().insert(key, config.clone());
     Ok(config)
 }
 
-async fn eval_ts(source: &[u8], ctx: &[u8], scratch: &Path) -> Result<PitConfig> {
+async fn eval_ts(source: &[u8], ctx: &[u8], scratch: &Path, sandboxed: bool) -> Result<PitConfig> {
     std::fs::create_dir_all(scratch)?;
     // `.mts` makes both Node and Bun treat the file as an ES module.
     // Unique per evaluation: two plans of the same commit may run at once.
@@ -84,8 +92,11 @@ async fn eval_ts(source: &[u8], ctx: &[u8], scratch: &Path) -> Result<PitConfig>
     let ctx_file = scratch.join(format!("{id}.json"));
     std::fs::write(&file, source)?;
     std::fs::write(&ctx_file, ctx)?;
-    let file_arg = file.to_string_lossy().to_string();
-    let result = eval_files(&file_arg, &ctx_file.to_string_lossy()).await;
+    let result = if sandboxed {
+        eval_sandboxed(&file, &ctx_file).await
+    } else {
+        eval_files(&file.to_string_lossy(), &ctx_file.to_string_lossy()).await
+    };
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_file(&ctx_file);
     result
@@ -128,6 +139,64 @@ async fn eval_files(file_arg: &str, ctx_arg: &str) -> Result<PitConfig> {
         "no JavaScript runtime found to evaluate {CONFIG_TS} (tried node and bun; set PIT_JS_RUNTIME, \
          or use {CONFIG_JSON}): {last_err}"
     )
+}
+
+async fn eval_sandboxed(file: &Path, ctx: &Path) -> Result<PitConfig> {
+    // The container's user is nobody; the files hold repository data only.
+    #[cfg(unix)]
+    for f in [file, ctx] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644))?;
+    }
+    let image = std::env::var("PIT_CONFIG_IMAGE").unwrap_or_else(|_| SANDBOX_IMAGE.into());
+    let name = crate::model::new_id("pit-config");
+    let mount =
+        |src: &Path, dst: &str| format!("type=bind,src={},dst={dst},readonly", src.display());
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.args(["run", "--rm", "--name", &name])
+        .args(["--network", "none", "--read-only", "--tmpfs", "/tmp"])
+        .args(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
+        .args([
+            "--user",
+            "65534:65534",
+            "--memory",
+            "512m",
+            "--pids-limit",
+            "64",
+        ])
+        .arg("--mount")
+        .arg(mount(file, "/pit/config.mts"))
+        .arg("--mount")
+        .arg(mount(ctx, "/pit/ctx.json"))
+        .arg(&image)
+        .args(["node", "--experimental-strip-types", "--no-warnings", "-e"])
+        .args([EVAL_SCRIPT, "/pit/config.mts", "/pit/ctx.json"]);
+    // The docker client passes nothing of its environment into the
+    // container unless asked; it only needs to find the daemon.
+    cmd.stdin(Stdio::null()).kill_on_drop(true);
+    // A first use pulls the image.
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => bail!(
+            "a fork's {CONFIG_TS} is evaluated in a container, and docker is not available ({e}); \
+             use {CONFIG_JSON} for fork pull requests"
+        ),
+        Err(_) => {
+            let _ = tokio::process::Command::new("docker")
+                .args(["rm", "-f", &name])
+                .output()
+                .await;
+            bail!("evaluating {CONFIG_TS} in {image} timed out")
+        }
+    };
+    if !out.status.success() {
+        bail!(
+            "evaluating {CONFIG_TS} in {image} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&out.stdout)
+        .with_context(|| format!("{CONFIG_TS} must default-export a config object"))
 }
 
 fn runtimes() -> Vec<(String, Vec<String>)> {
@@ -187,6 +256,15 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
             if task.image.is_none() {
                 task.image = group.image.clone();
             }
+            if task.image.as_deref().is_some_and(|i| i.starts_with('-')) {
+                bail!(
+                    "task {gname}.{tname}: image {:?} is not an image name",
+                    task.image
+                );
+            }
+            if !task.shard_files.is_empty() && task.shards.unwrap_or(1) < 2 {
+                bail!("task {gname}.{tname}: shardFiles needs shards of 2 or more");
+            }
             if task.image.is_some() && task.backend.is_none() {
                 task.backend = Some(crate::model::Backend::Docker);
             }
@@ -206,21 +284,79 @@ mod tests {
         let bad = br#"{"tasks":{"test":{"run":"true","imputs":["src/**"]}}}"#;
         let err = format!(
             "{:#}",
-            parse(CONFIG_JSON, bad, dir.path(), &Default::default())
+            parse(CONFIG_JSON, bad, dir.path(), &Default::default(), false)
                 .await
                 .unwrap_err()
         );
         assert!(err.contains("unknown field `imputs`"), "{err}");
         let bad_group = br#"{"groups":{"ci":{"oss":["linux"],"tasks":{}}}}"#;
-        assert!(
-            parse(CONFIG_JSON, bad_group, dir.path(), &Default::default())
-                .await
-                .is_err()
-        );
+        assert!(parse(
+            CONFIG_JSON,
+            bad_group,
+            dir.path(),
+            &Default::default(),
+            false
+        )
+        .await
+        .is_err());
+        for bad in [
+            &br#"{"tasks":{"t":{"run":"true","shardFiles":["src/**"]}}}"#[..],
+            br#"{"tasks":{"t":{"run":"true","shards":1,"shardFiles":["src/**"]}}}"#,
+            br#"{"tasks":{"t":{"run":"true","image":"--privileged"}}}"#,
+        ] {
+            assert!(
+                parse(CONFIG_JSON, bad, dir.path(), &Default::default(), false)
+                    .await
+                    .is_err(),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
         let good = br#"{"tasks":{"test":{"run":"true","inputs":["src/**"],"cache":false}}}"#;
-        assert!(parse(CONFIG_JSON, good, dir.path(), &Default::default())
+        assert!(
+            parse(CONFIG_JSON, good, dir.path(), &Default::default(), false)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_config_sees_nothing_of_the_host() {
+        if !crate::worker::exec::detect_backends()
             .await
-            .is_ok());
+            .contains(&crate::model::Backend::Docker)
+        {
+            eprintln!("skipped: no docker");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("server-key");
+        std::fs::write(&secret, "hunter2").unwrap();
+        // The config reports what it could reach in the task's command.
+        let src = format!(
+            r#"
+import {{ readFileSync }} from "node:fs";
+let file = "blocked";
+try {{ file = readFileSync({secret:?}, "utf8"); }} catch {{}}
+let net = "blocked";
+try {{ await fetch("http://1.1.1.1", {{ signal: AbortSignal.timeout(3000) }}); net = "open"; }} catch {{}}
+export default {{ tasks: {{ t: {{ run: `${{file}} ${{net}} ${{process.env.PIT_TOKEN ?? "none"}}` }} }} }};
+"#
+        );
+        std::env::set_var("PIT_TOKEN", "server-token");
+        let config = parse(
+            CONFIG_TS,
+            src.as_bytes(),
+            dir.path(),
+            &Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            config.groups["default"].tasks["t"].run,
+            "blocked blocked none"
+        );
     }
 
     #[tokio::test]
@@ -254,7 +390,9 @@ export default ({ packages }: PitContext): PitConfig => ({
                 inputs: vec!["apps/web/**".into()],
             }],
         };
-        let config = parse(CONFIG_TS, src, dir.path(), &ctx).await.unwrap();
+        let config = parse(CONFIG_TS, src, dir.path(), &ctx, false)
+            .await
+            .unwrap();
         let task = &config.groups["default"].tasks["typecheck:web"];
         assert_eq!(
             task.inputs.as_deref(),

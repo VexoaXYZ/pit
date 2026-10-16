@@ -471,6 +471,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 .context("pull_request.head.sha")?
                 .to_string();
             let repo = register(app, &r)?;
+            let fork = pr["head"]["repo"]["full_name"].as_str() != Some(r.full_name.as_str());
             if action == "labeled" && payload["label"]["name"].as_str() == Some(MERGE_LABEL) {
                 let entry = super::queue::add(
                     app,
@@ -480,12 +481,14 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         branch: None,
                         pr: Some(number),
                         target: pr["base"]["ref"].as_str().map(String::from),
+                        // A fork's label approves the commit it was added
+                        // on, not whatever the fork pushes next.
+                        sha: fork.then(|| sha.clone()),
                     },
                 )
                 .await?;
                 return Ok(serde_json::json!({ "queued": entry.id }));
             }
-            let fork = pr["head"]["repo"]["full_name"].as_str() != Some(r.full_name.as_str());
             // The label approves the commit it was added on. A fork's later
             // pushes need it again, so nobody can swap in new code after a
             // maintainer looked.
@@ -562,6 +565,12 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 .context("head_sha")?
                 .to_string();
             let repo = register(app, &r)?;
+            // GitHub shows a Re-run button on every check Pit posts, fork
+            // commits included. The rerun keeps the restrictions the commit
+            // ran under; a commit Pit never ran is not Pit's to run.
+            let Some(prior) = app.db.prior_run(&repo.id, &sha)? else {
+                return Ok(serde_json::json!({ "ignored": "Pit has not run this commit" }));
+            };
             let id = app
                 .create_run(
                     CreateRun {
@@ -571,13 +580,13 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         overlay: None,
                         tasks: vec![],
                         trigger: Some("rerun".into()),
-                        git_ref: None,
+                        git_ref: prior.git_ref,
                         no_cache: false,
-                        fresh: false,
-                        no_secrets: false,
+                        fresh: prior.fresh || prior.no_secrets,
+                        no_secrets: prior.no_secrets,
                         trusted: false,
                     },
-                    None,
+                    prior.github_pr,
                 )
                 .await?;
             Ok(serde_json::json!({ "run": id }))

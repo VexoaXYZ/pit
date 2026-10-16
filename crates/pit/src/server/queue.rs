@@ -117,6 +117,11 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
             ),
             None => format!("{source} not found in {}", repo.url),
         })?;
+    if let Some(approved) = &req.sha {
+        if *approved != head {
+            bail!("{source} moved to {head} after {approved} was approved; add the label again");
+        }
+    }
     let target = match req.target {
         Some(t) => t,
         None => default_branch(&mirror).await?,
@@ -134,7 +139,7 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     }
     let id = app
         .db
-        .queue_insert(&repo.id, &source, req.pr, &head, &target)?;
+        .queue_insert(&repo.id, &source, req.pr, &head, &target, req.sha.is_some())?;
     app.emit(
         "queue.updated",
         None,
@@ -360,6 +365,14 @@ impl Queue<'_> {
                 self.remove_entry(i, "branch deleted")?;
                 continue;
             };
+            if head != self.entries[i].head_sha && self.entries[i].pinned {
+                // Only the approved commit may run with the queue's trust.
+                self.remove_entry(
+                    i,
+                    "new commits were pushed after it was queued; add the merge label again",
+                )?;
+                continue;
+            }
             if head != self.entries[i].head_sha && self.entries[i].status != "landed" {
                 let (lane, pos) = (
                     self.entries[i].lane.clone(),
@@ -635,7 +648,11 @@ impl Queue<'_> {
                 continue;
             };
             let changed = git::changed_files(&self.mirror, &self.tip, &merged).await?;
-            let config = match self.app.load_config(&self.mirror, &merged, None).await {
+            let config = match self
+                .app
+                .load_config(&self.mirror, &merged, None, false)
+                .await
+            {
                 Ok(c) => c,
                 Err(err) => {
                     let e = &mut self.entries[i];

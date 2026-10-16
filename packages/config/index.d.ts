@@ -83,7 +83,9 @@ export interface TaskDef {
    * With `shards`: globs of the files to split, e.g. `["e2e/**\/*.spec.ts"]`.
    * Pit deals them out longest first by recorded duration (from JUnit
    * `reports` when they name files, otherwise estimated from each shard's
-   * time) and gives each shard its list in `PIT_SHARD_FILES`.
+   * time) and gives each shard its list in `PIT_SHARD_FILES`, one file per
+   * line, and in the file named by `PIT_SHARD_FILES_LIST`. Needs `shards` of
+   * 2 or more; globs that match nothing fail the run.
    */
   shardFiles?: string[];
   /**

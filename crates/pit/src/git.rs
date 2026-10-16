@@ -65,6 +65,10 @@ pub async fn read_blobs(
         .spawn()
         .context("running git cat-file --batch")?;
     let mut stdin = child.stdin.take().context("cat-file stdin")?;
+    // The batch protocol is line based: a path with a newline in it cannot
+    // be asked for, and would shift every answer after it onto the wrong
+    // path.
+    let paths: Vec<&String> = paths.iter().filter(|p| !p.contains('\n')).collect();
     let input: String = paths.iter().map(|p| format!("{sha}:{p}\n")).collect();
     // Write while reading, or a large batch fills the pipes and deadlocks.
     let writer = tokio::spawn(async move {
@@ -72,10 +76,16 @@ pub async fn read_blobs(
     });
     let output = child.wait_with_output().await?;
     let _ = writer.await;
+    if !output.status.success() {
+        bail!("git cat-file --batch failed ({})", output.status);
+    }
     let data = output.stdout;
     let mut pos = 0;
     for path in paths {
-        let Some(nl) = data[pos..].iter().position(|b| *b == b'\n') else {
+        let Some(nl) = data
+            .get(pos..)
+            .and_then(|rest| rest.iter().position(|b| *b == b'\n'))
+        else {
             break;
         };
         let header = String::from_utf8_lossy(&data[pos..pos + nl]).to_string();
@@ -91,7 +101,7 @@ pub async fn read_blobs(
         if pos + size > data.len() {
             break;
         }
-        out.insert(path.clone(), data[pos..pos + size].to_vec());
+        out.insert((*path).clone(), data[pos..pos + size].to_vec());
         pos += size + 1;
     }
     Ok(out)
@@ -354,15 +364,25 @@ mod tests {
         ] {
             git(d, args).await.unwrap();
         }
-        let paths: Vec<String> = ["a/package.json", "missing.txt", "b.txt", "empty"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        // A newline in a path cannot shift later answers onto other paths.
+        let paths: Vec<String> = [
+            "a/package.json",
+            "evil\nb.txt",
+            "missing.txt",
+            "b.txt",
+            "empty",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let got = read_blobs(d, "HEAD", &paths).await.unwrap();
         assert_eq!(got["a/package.json"], b"{\"name\":\"a\"}\n");
         assert_eq!(got["b.txt"], b"line 1\nline 2\n");
         assert_eq!(got["empty"], b"");
         assert!(!got.contains_key("missing.txt"));
+        assert!(!got.contains_key("evil\nb.txt"));
+        // A failing git is an error, not "no files".
+        assert!(read_blobs(&d.join("nope"), "HEAD", &paths).await.is_err());
     }
 
     use super::*;

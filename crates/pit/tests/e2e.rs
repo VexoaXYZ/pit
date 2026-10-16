@@ -238,6 +238,7 @@ async fn merge_queue_lands_disjoint_lanes_in_parallel_and_ejects_failures() {
                     branch: Some(b.into()),
                     pr: None,
                     target: None,
+                    sha: None,
                 },
             )
             .await
@@ -665,6 +666,7 @@ async fn removed_queue_entry_never_lands() {
                     branch: Some(b.into()),
                     pr: None,
                     target: None,
+                    sha: None,
                 },
             )
             .await
@@ -821,6 +823,7 @@ async fn merge_queue_retries_flakes_once_and_flags_them() {
                 branch: Some("innocent".into()),
                 pr: None,
                 target: None,
+                sha: None,
             },
         )
         .await
@@ -995,6 +998,7 @@ async fn merge_queue_waits_out_an_origin_outage() {
                 branch: Some("feature".into()),
                 pr: None,
                 target: None,
+                sha: None,
             },
         )
         .await
@@ -1278,6 +1282,7 @@ async fn untrusted_runs_cannot_poison_trusted_ones() {
                 branch: Some("docs".into()),
                 pr: None,
                 target: None,
+                sha: None,
             },
         )
         .await
@@ -1678,7 +1683,7 @@ async fn fork_pull_requests_run_on_a_label_without_secrets() {
         Some(github),
     )
     .unwrap();
-    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
     tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
         server: base.clone(),
         token: None,
@@ -1703,11 +1708,33 @@ async fn fork_pull_requests_run_on_a_label_without_secrets() {
         repo.path(),
         "git init -q -b main && git add -A && git commit -qm fork",
     );
-    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
-    let send = |action: &str, label: Option<&str>| {
+    let head = || sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    let sha = head();
+    let post = |event: &'static str, payload: serde_json::Value| {
+        let body = payload.to_string();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+        mac.update(body.as_bytes());
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let base = base.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{base}/webhooks/github"))
+                .header("x-github-event", event)
+                .header("x-hub-signature-256", sig)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let repository = serde_json::json!({ "full_name": "acme/widgets", "clone_url": repo.path().to_string_lossy(), "default_branch": "main" });
+    let pr_event = |action: &str, label: Option<&str>, sha: &str| {
         let mut payload = serde_json::json!({
             "action": action,
-            "repository": { "full_name": "acme/widgets", "clone_url": repo.path().to_string_lossy(), "default_branch": "main" },
+            "repository": repository,
             "pull_request": {
                 "number": 7,
                 "head": { "sha": sha, "repo": { "full_name": "mallory/widgets" } },
@@ -1717,33 +1744,41 @@ async fn fork_pull_requests_run_on_a_label_without_secrets() {
         if let Some(l) = label {
             payload["label"] = serde_json::json!({ "name": l });
         }
-        let body = payload.to_string();
-        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
-        mac.update(body.as_bytes());
-        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        reqwest::Client::new()
-            .post(format!("{base}/webhooks/github"))
-            .header("x-github-event", "pull_request")
-            .header("x-hub-signature-256", sig)
-            .body(body)
-            .send()
+        post("pull_request", payload)
     };
-    let opened: serde_json::Value = send("opened", None).await.unwrap().json().await.unwrap();
+    let send = |action: &str, label: Option<&str>| pr_event(action, label, &sha);
+    let opened = send("opened", None).await;
     assert!(
         opened["ignored"].as_str().unwrap().contains("pit:run"),
         "{opened}"
     );
-    let labeled: serde_json::Value = send("labeled", Some("pit:run"))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let labeled = send("labeled", Some("pit:run")).await;
     let run_id = labeled["run"]
         .as_str()
         .expect("the label starts a run")
         .to_string();
     let client = Client::new(&base, None).unwrap();
+    // Fork code only runs in a container: without Docker it waits for a
+    // worker that has it.
+    if !pit::worker::exec::detect_backends()
+        .await
+        .contains(&pit::model::Backend::Docker)
+    {
+        let waiting = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let v: serde_json::Value =
+                    client.get(&format!("/api/runs/{run_id}")).await.unwrap();
+                if v.to_string().contains("backend docker") {
+                    return v;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("the fork's run should wait for a Docker worker");
+        assert!(waiting.to_string().contains("waiting"), "{waiting}");
+        return;
+    }
     let view = tokio::time::timeout(
         Duration::from_secs(180),
         pit::cli::wait(&client, &run_id, |_| {}),
@@ -1751,18 +1786,79 @@ async fn fork_pull_requests_run_on_a_label_without_secrets() {
     .await
     .unwrap()
     .unwrap();
-    // Fork code only runs in a container; without Docker it does not run.
-    let task = &view.groups[0].tasks[0];
-    if task.status == Status::Error {
-        let msg = task.message.as_deref().unwrap_or_default();
-        assert!(msg.contains("docker"), "{view:?}");
-    } else {
-        assert_eq!(
-            view.status,
-            Status::Passed,
-            "the fork saw the secret: {view:?}"
-        );
-    }
+    assert_eq!(
+        view.status,
+        Status::Passed,
+        "the fork saw the secret: {view:?}"
+    );
+    // GitHub's "Re-run" on the fork's check keeps the fork's restrictions.
+    let rerun = post(
+        "check_run",
+        serde_json::json!({ "action": "rerequested", "repository": repository, "check_run": { "head_sha": sha } }),
+    )
+    .await;
+    let rerun = rerun["run"].as_str().expect("a rerun").to_string();
+    let row = app.db.run(&rerun).unwrap();
+    assert!(
+        row.no_secrets && row.fresh,
+        "the rerun lost the fork's limits"
+    );
+    let view = tokio::time::timeout(
+        Duration::from_secs(180),
+        pit::cli::wait(&client, &rerun, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        view.status,
+        Status::Passed,
+        "the rerun saw the secret: {view:?}"
+    );
+    // A commit Pit never ran is not rerun.
+    let unknown = post(
+        "check_run",
+        serde_json::json!({ "action": "rerequested", "repository": repository, "check_run": { "head_sha": "0".repeat(40) } }),
+    )
+    .await;
+    assert!(unknown["ignored"].is_string(), "{unknown}");
+    // Queued with the merge label, the fork is queued at the labeled commit;
+    // a later push drops it rather than testing new code with the queue's
+    // trust.
+    let slow = serde_json::json!({ "tasks": { "slow": { "run": "sleep 20", "cache": false } } });
+    write(repo.path(), "pit.config.json", &slow.to_string());
+    sh(
+        repo.path(),
+        "git commit -qam slow && git update-ref refs/pull/7/head HEAD",
+    );
+    let queued = pr_event("labeled", Some("pit:merge"), &head()).await;
+    let entry = queued["queued"].as_str().expect("queued").to_string();
+    sh(
+        repo.path(),
+        "git commit -q --allow-empty -m sneaky && git update-ref refs/pull/7/head HEAD",
+    );
+    let removed = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let entries: Vec<QueueEntryView> = client.get("/api/queue").await.unwrap();
+            if let Some(e) = entries
+                .into_iter()
+                .find(|e| e.id == entry && e.status == "removed")
+            {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("the fork's entry stayed queued after a push");
+    assert!(
+        removed
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("new commits"),
+        "{removed:?}"
+    );
 }
 
 /// Flaky tasks are found from history (passed on a retry, or the same inputs
@@ -1822,6 +1918,22 @@ async fn flaky_tasks_are_reported_and_quarantine_keeps_runs_green() {
         get("broken").is_none(),
         "always failing is broken, not flaky"
     );
+    // A task that needed the quarantined one did not run, and that fails the
+    // run: quarantine hides one flaky task, not everything after it.
+    let config = serde_json::json!({ "tasks": {
+        "broken": { "run": "exit 3", "quarantine": true, "cache": false },
+        "after": { "run": "true", "deps": ["broken"], "cache": false },
+    } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(dir, "git commit -qam dependent");
+    let view = run(&pit, dir).await;
+    let after = view.groups[0]
+        .tasks
+        .iter()
+        .find(|t| t.name == "after")
+        .unwrap();
+    assert_eq!(after.status, Status::Skipped);
+    assert_eq!(view.status, Status::Failed);
 }
 
 /// A task's JUnit reports name the failed tests in its result, and a report
@@ -1913,6 +2025,7 @@ async fn merge_queue_batches_waiting_changes_and_bisects_failures() {
                     branch: Some(b.into()),
                     pr: None,
                     target: None,
+                    sha: None,
                 },
             )
             .await
@@ -2017,6 +2130,7 @@ async fn a_change_batched_into_a_removed_one_still_lands() {
                     branch: Some(b.into()),
                     pr: None,
                     target: None,
+                    sha: None,
                 },
             )
             .await
@@ -2196,26 +2310,42 @@ async fn oidc_tokens_only_for_trusted_github_runs() {
 }
 
 /// `shardFiles`: every matching file is dealt to exactly one shard, each
-/// shard gets its list in `PIT_SHARD_FILES`, and a shard dealt nothing passes
-/// without running its command (which would otherwise run every test).
+/// shard gets its list in `PIT_SHARD_FILES` (and `PIT_SHARD_FILES_LIST`), and
+/// a shard dealt nothing passes without running its command (which would
+/// otherwise run every test). Two groups' `test` tasks are split separately,
+/// and globs that match nothing fail the run instead of passing empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shard_files_are_dealt_once_each() {
     let pit = start().await;
     let repo = tempfile::tempdir().unwrap();
     let dir = repo.path();
-    let log = dir
-        .join("..")
-        .join(format!("shards-{}.log", std::process::id()));
+    let log = |g: &str| {
+        dir.join("..")
+            .join(format!("shards-{g}-{}.log", std::process::id()))
+    };
     for f in ["a", "b", "c"] {
         write(dir, &format!("t/{f}.test"), "x\n");
     }
+    for f in ["x", "y"] {
+        write(dir, &format!("e/{f}.spec"), "x\n");
+    }
     write(dir, "t/notes.md", "not a test\n");
-    let config = serde_json::json!({ "tasks": { "test": {
-        "run": format!("test -n \"$PIT_SHARD_FILES\" && echo \"$PIT_SHARD_FILES\" >> {}", log.display()),
-        "shards": 5,
-        "shardFiles": ["t/*.test"],
-        "cache": false,
-    } } });
+    let task = |g: &str, n: u32, glob: &str| {
+        serde_json::json!({
+            "run": format!(
+                "test -n \"$PIT_SHARD_FILES\" && [ \"$(cat $PIT_SHARD_FILES_LIST)\" = \"$PIT_SHARD_FILES\" ] && echo \"$PIT_SHARD_FILES\" >> {}",
+                log(g).display()
+            ),
+            "shards": n,
+            "shardFiles": [glob],
+            "cache": false,
+        })
+    };
+    let config = serde_json::json!({ "groups": {
+        "unit": { "tasks": { "test": task("unit", 5, "t/*.test") } },
+        "e2e": { "tasks": { "test": task("e2e", 2, "e/*.spec") } },
+    } });
+    write(dir, ".gitignore", ".pit/\n");
     write(dir, "pit.config.json", &config.to_string());
     sh(
         dir,
@@ -2223,13 +2353,17 @@ async fn shard_files_are_dealt_once_each() {
     );
     let view = run(&pit, dir).await;
     assert_eq!(view.status, Status::Passed, "{view:?}");
-    let mut dealt: Vec<String> = std::fs::read_to_string(&log)
-        .unwrap()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
-    dealt.sort();
-    assert_eq!(dealt, ["t/a.test", "t/b.test", "t/c.test"]);
+    let dealt = |g: &str| {
+        let mut d: Vec<String> = std::fs::read_to_string(log(g))
+            .unwrap()
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        d.sort();
+        d
+    };
+    assert_eq!(dealt("unit"), ["t/a.test", "t/b.test", "t/c.test"]);
+    assert_eq!(dealt("e2e"), ["e/x.spec", "e/y.spec"]);
     let empty = view
         .groups
         .iter()
@@ -2237,6 +2371,13 @@ async fn shard_files_are_dealt_once_each() {
         .filter(|t| t.message.as_deref() == Some("no files were dealt to this shard"))
         .count();
     assert_eq!(empty, 2, "{view:?}");
+    // A glob that matches nothing (a typo, a moved directory).
+    let config = serde_json::json!({ "tasks": { "test": task("typo", 2, "tests/*.test") } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(dir, "git commit -qam typo");
+    let view = run(&pit, dir).await;
+    assert_ne!(view.status, Status::Passed, "{view:?}");
+    assert!(format!("{view:?}").contains("match no files"), "{view:?}");
 }
 
 /// `/metrics` reports what an autoscaler needs: work waiting per OS and how

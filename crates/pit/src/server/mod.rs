@@ -171,6 +171,7 @@ impl App {
         mirror: &Path,
         sha: &str,
         overlay: Option<&Overlay>,
+        untrusted_code: bool,
     ) -> Result<PitConfig> {
         let scratch = self.data_dir.join("tmp");
         for name in crate::config::CONFIG_FILES {
@@ -191,7 +192,7 @@ impl App {
             } else {
                 Default::default()
             };
-            return crate::config::parse(name, &src, &scratch, &ctx).await;
+            return crate::config::parse(name, &src, &scratch, &ctx, untrusted_code).await;
         }
         bail!("no {} at {sha}", crate::config::CONFIG_TS)
     }
@@ -352,7 +353,7 @@ impl App {
             .map(|d| self.load_overlay(d))
             .transpose()?;
         let config = self
-            .load_config(&mirror, &req.sha, overlay.as_ref())
+            .load_config(&mirror, &req.sha, overlay.as_ref(), req.no_secrets)
             .await?;
         let t_config = t0.elapsed();
         let mut groups = crate::graph::plan(&config, &req.tasks)?;
@@ -371,9 +372,13 @@ impl App {
             .iter()
             .any(|g| g.tasks.iter().any(|(_, t)| !t.shard_files.is_empty()));
         let index = if sharded || !req.no_cache {
-            resolve::file_index(&mirror, &req.sha, overlay.as_ref())
-                .await
-                .ok()
+            match resolve::file_index(&mirror, &req.sha, overlay.as_ref()).await {
+                Ok(index) => Some(index),
+                // Without the files there is nothing to deal, and shards
+                // with no files pass without running.
+                Err(e) if sharded => return Err(e.context("listing the files to deal to shards")),
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -403,6 +408,10 @@ impl App {
                 .filter_map(|(_, t)| t.backend)
                 .filter(|b| *b != Backend::Host)
                 .collect();
+            // A fork's tasks run in containers only.
+            if req.no_secrets {
+                backends.push(Backend::Docker);
+            }
             backends.sort_by_key(|b| b.as_str());
             backends.dedup();
             // Locks are per repo: one repo's runs cannot hold another's.

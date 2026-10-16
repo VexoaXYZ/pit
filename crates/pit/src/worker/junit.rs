@@ -10,13 +10,21 @@ use quick_xml::Reader;
 
 const SHOWN: usize = 5;
 const MESSAGE_CHARS: usize = 120;
+/// Failures kept with their message; the rest are only counted.
+const KEPT: usize = 100;
+/// Report files larger than this are skipped: reading one is a fork's
+/// cheapest way to hold a worker after its task's timeout has passed.
+pub const MAX_REPORT_BYTES: u64 = 64 << 20;
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub struct Summary {
     pub tests: u64,
     pub skipped: u64,
-    /// `suite.test` and the first line of its failure message.
+    /// `suite.test` and the first line of its failure message, for the
+    /// first `KEPT` failed tests.
     pub failures: Vec<(String, String)>,
+    /// Every failed test, once.
+    failed: std::collections::HashSet<String>,
     /// Seconds per `<testsuite name>` (Vitest, Playwright and most others
     /// name suites after the test file) or `<testcase file>`.
     pub file_times: std::collections::HashMap<String, f64>,
@@ -24,13 +32,13 @@ pub struct Summary {
 
 impl Summary {
     pub fn failed(&self) -> u64 {
-        self.failures.len() as u64
+        self.failed.len() as u64
     }
 
     /// "2 of 120 tests failed: a.b (expected 1); c.d (timeout)".
     pub fn message(&self) -> String {
         if self.failures.is_empty() {
-            return format!("{} tests passed", self.tests - self.skipped);
+            return format!("{} tests passed", self.tests.saturating_sub(self.skipped));
         }
         let shown: Vec<String> = self
             .failures
@@ -44,7 +52,7 @@ impl Summary {
                 }
             })
             .collect();
-        let more = self.failures.len().saturating_sub(SHOWN);
+        let more = (self.failed() as usize).saturating_sub(SHOWN.min(self.failures.len()));
         let tail = if more > 0 {
             format!(" and {more} more")
         } else {
@@ -61,7 +69,12 @@ impl Summary {
     fn merge(&mut self, other: Summary) {
         self.tests += other.tests;
         self.skipped += other.skipped;
-        self.failures.extend(other.failures);
+        for f in other.failures {
+            if self.failures.len() < KEPT && !self.failed.contains(&f.0) {
+                self.failures.push(f);
+            }
+        }
+        self.failed.extend(other.failed);
         for (f, t) in other.file_times {
             *self.file_times.entry(f).or_default() += t;
         }
@@ -170,7 +183,7 @@ pub fn parse(xml: &str) -> Summary {
 /// Adds a failure once per test, even with both `<failure>` and `<error>`.
 fn record(summary: &mut Summary, failure: Option<(String, String)>) {
     if let Some(f) = failure {
-        if !summary.failures.iter().any(|(n, _)| *n == f.0) {
+        if summary.failed.insert(f.0.clone()) && summary.failures.len() < KEPT {
             summary.failures.push(f);
         }
     }
@@ -180,6 +193,9 @@ fn record(summary: &mut Summary, failure: Option<(String, String)>) {
 pub fn summarize(files: &[impl AsRef<Path>]) -> Option<Summary> {
     let mut total: Option<Summary> = None;
     for f in files {
+        if std::fs::metadata(f).map_or(true, |m| m.len() > MAX_REPORT_BYTES) {
+            continue;
+        }
         let Ok(xml) = std::fs::read_to_string(f) else {
             continue;
         };
@@ -228,6 +244,28 @@ mod tests {
             s.message(),
             "2 of 4 tests failed: cart.applies coupons (expected 90 to equal 80); cart.checks out (TypeError: x is undefined)"
         );
+    }
+
+    #[test]
+    fn huge_and_odd_reports_stay_cheap() {
+        // Many failures: counted in linear time, a bounded number kept.
+        let mut xml = String::from("<testsuite>");
+        for i in 0..200_000 {
+            xml.push_str(&format!(
+                r#"<testcase name="t{i}"><failure message="x"/></testcase>"#
+            ));
+        }
+        xml.push_str("</testsuite>");
+        let t = std::time::Instant::now();
+        let s = parse(&xml);
+        assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+        assert_eq!(s.failed(), 200_000);
+        assert_eq!(s.failures.len(), KEPT);
+        assert!(s.message().ends_with("and 199995 more"), "{}", s.message());
+        // Two <skipped/> in one case cannot underflow the passed count.
+        let s =
+            parse(r#"<testsuite><testcase name="a"><skipped/><skipped/></testcase></testsuite>"#);
+        assert_eq!(s.message(), "0 tests passed");
     }
 
     #[test]

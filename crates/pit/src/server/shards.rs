@@ -10,10 +10,21 @@
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use super::App;
 use crate::graph::PlannedGroup;
+
+/// What durations and splits are kept under: the task within its group, not
+/// counting the shard (`ci#2`) or OS, so every shard reads and feeds the same
+/// numbers.
+pub fn timing_key(group: &str, task: &str) -> String {
+    let base = match group.rsplit_once('#') {
+        Some((base, k)) if !k.is_empty() && k.chars().all(|c| c.is_ascii_digit()) => base,
+        _ => group,
+    };
+    format!("{base}.{task}")
+}
 
 /// Greedy longest-processing-time packing. Deterministic: ties go to the
 /// lower shard, and files are ordered by path within a shard.
@@ -64,17 +75,23 @@ pub fn plan(
             if def.shard_files.is_empty() {
                 continue;
             }
-            if !splits.contains_key(name) {
+            let key = timing_key(&g.name, name);
+            if !splits.contains_key(&key) {
                 let set = crate::graph::globset(&def.shard_files)?;
                 let matching: Vec<String> = files
                     .iter()
                     .map(|(p, _)| p.clone())
                     .filter(|p| set.is_match(p))
                     .collect();
-                let weights = app.db.shard_timings(repo_id, name)?;
-                splits.insert(name.clone(), assign(&matching, &weights, n));
+                // A typo or a moved directory must not pass as green shards
+                // that ran nothing.
+                if matching.is_empty() {
+                    bail!("{key}: shardFiles {:?} match no files", def.shard_files);
+                }
+                let weights = app.db.shard_timings(repo_id, &key)?;
+                splits.insert(key.clone(), assign(&matching, &weights, n));
             }
-            def.shard_assigned = splits[name.as_str()]
+            def.shard_assigned = splits[&key]
                 .get(k as usize - 1)
                 .cloned()
                 .unwrap_or_default();
@@ -86,6 +103,14 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_are_per_group() {
+        assert_eq!(timing_key("unit#2", "test"), "unit.test");
+        assert_eq!(timing_key("e2e#10", "test"), "e2e.test");
+        assert_eq!(timing_key("e2e", "test"), "e2e.test");
+        assert_eq!(timing_key("a#b", "test"), "a#b.test");
+    }
 
     #[test]
     fn deals_longest_first_to_the_least_loaded_shard() {

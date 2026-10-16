@@ -120,6 +120,14 @@ const MINIMAL_ENV: &[&str] = &[
     "NUMBER_OF_PROCESSORS",
     "PROCESSOR_ARCHITECTURE",
     "OS",
+    // Where the docker client finds its daemon (rootless, remote, contexts).
+    // Only the client sees these; the container gets none of them.
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_CONFIG",
+    "DOCKER_CERT_PATH",
+    "DOCKER_TLS_VERIFY",
+    "XDG_RUNTIME_DIR",
 ];
 
 pub fn command(

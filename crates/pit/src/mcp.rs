@@ -200,6 +200,7 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
                         branch: Some(branch.into()),
                         pr: None,
                         target: args["target"].as_str().map(String::from),
+                        sha: None,
                     },
                 )
                 .await?;

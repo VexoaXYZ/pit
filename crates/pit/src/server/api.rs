@@ -771,18 +771,29 @@ async fn record_timings(
     headers: HeaderMap,
     Json(body): Json<TimingsBody>,
 ) -> ApiResult<StatusCode> {
-    let run_id = lease(&headers)
-        .map(|l| app.db.lease_run(l))
+    // Only for a task of the job's own group, keyed the way planning reads
+    // it: two groups' `test` tasks are different tasks.
+    let (repo_id, group, no_secrets) = lease(&headers)
+        .map(|l| app.db.lease_task(l, &body.task))
         .transpose()?
         .flatten()
-        .ok_or_else(|| ApiError(StatusCode::CONFLICT, anyhow::anyhow!("no live job")))?;
-    let run = app.db.run(&run_id)?;
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::CONFLICT,
+                anyhow::anyhow!("no live job runs that task"),
+            )
+        })?;
+    // A fork's numbers would steer the split of trusted runs.
+    if no_secrets {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let task = super::shards::timing_key(&group, &body.task);
     let mut times = body.times;
     if let (Some(total), false) = (
         body.total.filter(|t| t.is_finite() && *t >= 0.0),
         body.files.is_empty(),
     ) {
-        let known = app.db.shard_timings(&run.repo_id, &body.task)?;
+        let known = app.db.shard_timings(&repo_id, &task)?;
         let average = if known.is_empty() {
             1.0
         } else {
@@ -799,8 +810,7 @@ async fn record_timings(
         .filter(|(_, s)| s.is_finite() && *s >= 0.0)
         .take(10_000)
         .collect();
-    app.db
-        .record_shard_timings(&run.repo_id, &body.task, &times)?;
+    app.db.record_shard_timings(&repo_id, &task, &times)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -815,10 +825,13 @@ async fn flaky(
     Query(q): Query<FlakyQuery>,
 ) -> ApiResult<Json<Vec<FlakyTask>>> {
     let days = q.days.unwrap_or(14).clamp(1, 90);
-    Ok(Json(
-        app.db
-            .flaky_tasks(crate::model::now_ms() - days * 86_400_000)?,
-    ))
+    // A scan of weeks of history: keep it off the async threads that answer
+    // workers' heartbeats.
+    let since = crate::model::now_ms() - days * 86_400_000;
+    let rows = tokio::task::spawn_blocking(move || app.db.flaky_tasks(since))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(rows))
 }
 
 #[derive(Deserialize)]
