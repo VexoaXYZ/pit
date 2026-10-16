@@ -2285,7 +2285,7 @@ counts workers, not slots, because the server does not know how many slots a wor
 An independent reviewer read P31 to P40 (except the batching and OIDC code, which had been
 reviewed already). The most serious result: **P31's fork protection had three holes**, so
 "docker only, no secrets" was not true when P31 was written. Fork code could get out of the
-container three ways. All 18 findings are fixed except the two noted below (`cargo test`: 61 unit,
+container three ways. All 18 findings are fixed except one part of #15 (old timing rows are never pruned) (`cargo test`: 61 unit,
 31 e2e, clippy clean).
 
 Fork code escaping the container (high):
