@@ -150,6 +150,14 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Tasks that passed only on a retry, or passed and failed with the same
+    /// inputs.
+    Flaky {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, default_value_t = 14)]
+        days: u32,
+    },
     /// Print a task's log.
     Logs {
         run: String,
@@ -381,6 +389,9 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Runs { conn, limit } => {
             cli::runs(&cli::client(&conn.server, conn.token)?, limit).await
+        }
+        Command::Flaky { conn, days } => {
+            cli::flaky(&cli::client(&conn.server, conn.token)?, days).await
         }
         Command::Logs { run, task, conn } => {
             cli::logs(&cli::client(&conn.server, conn.token)?, &run, &task).await

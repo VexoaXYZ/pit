@@ -1769,3 +1769,59 @@ During this iteration the full e2e suite failed once with two timing-sensitive t
 `merge_queue_lands_disjoint_lanes_in_parallel_and_ejects_failures`) while the box was at load
 average 7–11. Three reruns, two of them full suites, passed. Those tests may be flaky under
 heavy load.
+
+## P33. Nobody knows which tests are flaky
+
+**Pain.** GitHub Actions has no flaky-test tracking, and "re-running jobs hides flakes rather than
+surfacing them". The reliable signal is the same code producing different outcomes, and the
+usual remedy is to quarantine the test while it is fixed. Teams buy this separately: Trunk,
+BuildPulse, Datadog CI Visibility
+([BuildPulse guide](https://buildpulse.io/compare/best-flaky-test-tools),
+[BuildPulse](https://buildpulse.io/products/flaky-tests),
+[Trunk vs BuildPulse](https://trunk.io/compare/trunk-vs-buildpulse),
+[Panto](https://www.getpanto.ai/blog/best-flaky-test-tools),
+[Blacksmith](https://info.blacksmith.sh/task/blog/github-actions-reduce-flaky-test-noise),
+[tinycto](https://tinycto.tv/learn/flaky-test-quarantine-and-ci-pipeline-trust)).
+
+**Before** (research/pain-hunt at P32): Pit flagged a pass on a retry as `flaky:` (P2), counted
+it in stats, and did not cache it. It had no per-task history and no way to keep a known flake
+from blocking. **PARTIAL.**
+
+**Fix** (research/pain-hunt):
+- **`pit flaky [--days N]`** (`/api/flaky`). Every task result already carries its action key,
+  so "same inputs, different outcome" is a single query: input sets of a task that have both
+  passed and failed, plus passes that needed a retry.
+- **`quarantine: true` on a task.** It still runs and reports, with its failure marked
+  "quarantined", but it does not fail the group, the run, or a merge queue candidate.
+
+**Live** (`/tmp/painhunt/p33`, an `e2e-checkout` task that fails every third run with a selector
+timeout; identical code each run):
+
+```
+4 runs: passed, failed, passed, passed
+
+$ pit flaky --days 1
+task                              runs   failed  passed retry  same inputs  last run
+work default.flaky                   7        3             2            2  run_2763889c0e1c
+app-cb0e0b default.test              6        3             0            3  run_06775e9a4abc
+app-676dfe default.test              8        2             0            2  run_c2a4f1cb8038
+t3code ci.test-web                  14        6             0            2  run_31b7d4e8dff3
+a integration.e2e                    6        1             0            1  run_4c3e0b022f70
+app-210a93 default.e2e-checkout      4        1             0            1  run_b86ab98d0ccb
+tc17 default.test                    5        1             0            1  run_0b3a4856bd6a
+
+after `quarantine: true`:
+✗ e2e-checkout exit 1 — quarantined, so this does not fail the run: exited with 1
+passed in 245ms
+```
+
+The report also picked up the earlier hunt repos, and one entry is real: T3 Code's `test-web`
+failed 6 of 14 times, twice with identical inputs. Those are the contention timeouts from P21,
+flakes caused by the environment. Covered by the e2e test
+`flaky_tasks_are_reported_and_quarantine_keeps_runs_green`: a retried pass, a same-inputs flip,
+and an always-failing quarantined task that is reported as broken, not flaky.
+
+**Verdict: SOLVED** at task level. Not done:
+- **Task-level only.** A task is usually a whole test suite, so this names `test-web`, not the
+  one test inside it. Per-test tracking would need JUnit output parsing.
+- **Manual quarantine.** Nothing quarantines automatically or lifts it after N clean days.

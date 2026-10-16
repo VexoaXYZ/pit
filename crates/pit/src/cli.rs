@@ -426,6 +426,32 @@ pub async fn runs(client: &Client, limit: usize) -> Result<i32> {
     Ok(0)
 }
 
+/// Flaky tasks over the last `days`, worst first.
+pub async fn flaky(client: &Client, days: u32) -> Result<i32> {
+    let tasks: Vec<FlakyTask> = client.get(&format!("/api/flaky?days={days}")).await?;
+    if tasks.is_empty() {
+        println!("no flaky tasks in the last {days} day(s)");
+        return Ok(0);
+    }
+    println!(
+        "{:<32} {:>5} {:>8} {:>13} {:>12}  last run",
+        "task", "runs", "failed", "passed retry", "same inputs"
+    );
+    for t in tasks {
+        println!(
+            "{:<32} {:>5} {:>8} {:>13} {:>12}  {}",
+            format!("{} {}.{}", t.repo, t.group, t.task),
+            t.runs,
+            t.failures,
+            t.flaky_passes,
+            t.mixed_inputs,
+            t.last_run
+        );
+    }
+    println!("\n\"same inputs\": input sets that both passed and failed. Quarantine a task with `quarantine: true` while it is fixed.");
+    Ok(0)
+}
+
 pub async fn logs(client: &Client, run: &str, task: &str) -> Result<i32> {
     let text = client
         .get_text(&format!(

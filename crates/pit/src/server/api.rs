@@ -66,6 +66,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/cache/last/{scope}", get(cache_last))
         .route("/api/cache/failed/{key}", get(cache_failed))
         .route("/api/cache/{key}/claim", post(cache_claim))
+        .route("/api/flaky", get(flaky))
         .route("/api/gc", post(gc_now))
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
@@ -574,6 +575,23 @@ async fn cache_last(
             anyhow::anyhow!("previous result was evicted"),
         )
     })
+}
+
+#[derive(Deserialize)]
+struct FlakyQuery {
+    days: Option<i64>,
+}
+
+/// `GET /api/flaky?days=14`: see `Db::flaky_tasks`.
+async fn flaky(
+    State(app): State<Arc<App>>,
+    Query(q): Query<FlakyQuery>,
+) -> ApiResult<Json<Vec<FlakyTask>>> {
+    let days = q.days.unwrap_or(14).clamp(1, 90);
+    Ok(Json(
+        app.db
+            .flaky_tasks(crate::model::now_ms() - days * 86_400_000)?,
+    ))
 }
 
 #[derive(Deserialize)]

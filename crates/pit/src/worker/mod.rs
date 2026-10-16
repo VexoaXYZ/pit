@@ -10,7 +10,7 @@ pub mod exec;
 pub mod files;
 pub mod mask;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -620,9 +620,15 @@ impl Worker {
             }
         }
         save_warm(ws, &warm.lock());
-        let failed = state
-            .values()
-            .any(|(s, _)| matches!(s, Status::Failed | Status::Error));
+        let quarantined: HashSet<&str> = job
+            .tasks
+            .iter()
+            .filter(|t| t.def.quarantine)
+            .map(|t| t.name.as_str())
+            .collect();
+        let failed = state.iter().any(|(name, (s, _))| {
+            matches!(s, Status::Failed | Status::Error) && !quarantined.contains(name.as_str())
+        });
         if failed {
             Status::Failed
         } else {
@@ -991,6 +997,9 @@ impl Worker {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "a signal".into())
             ));
+        }
+        if !ok && def.quarantine {
+            message = message.map(|m| format!("quarantined, so this does not fail the run: {m}"));
         }
         // Say why the task ran instead of coming from the cache.
         if let Some(note) = miss_note {

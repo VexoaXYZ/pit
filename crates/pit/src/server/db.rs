@@ -1391,6 +1391,54 @@ impl Db {
         Ok(())
     }
 
+    /// Tasks that passed only on a retry, or both passed and failed with the
+    /// same inputs, since `since` (ms).
+    pub fn flaky_tasks(&self, since: i64) -> Result<Vec<FlakyTask>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "WITH recent AS (
+               SELECT t.name AS task, g.name AS grp, repos.name AS repo, t.status, t.message,
+                      t.action_key, t.run_id, t.finished_at
+               FROM tasks t JOIN groups_ g ON g.id = t.group_id
+               JOIN runs r ON r.id = t.run_id JOIN repos ON repos.id = r.repo_id
+               WHERE t.finished_at > ?1 AND t.status IN ('passed', 'cached', 'failed', 'error')
+             ),
+             mixed AS (
+               SELECT repo, grp, task, COUNT(*) AS n FROM (
+                 SELECT repo, grp, task, action_key FROM recent WHERE action_key IS NOT NULL
+                 GROUP BY repo, grp, task, action_key
+                 HAVING SUM(status IN ('failed', 'error')) > 0 AND SUM(status IN ('passed', 'cached')) > 0
+               ) GROUP BY repo, grp, task
+             )
+             SELECT recent.repo, recent.grp, recent.task, COUNT(*),
+                    SUM(recent.status IN ('failed', 'error')),
+                    SUM(COALESCE(recent.message, '') LIKE 'flaky:%'),
+                    COALESCE(MAX(mixed.n), 0),
+                    (SELECT run_id FROM recent r2 WHERE r2.repo = recent.repo AND r2.grp = recent.grp
+                       AND r2.task = recent.task ORDER BY finished_at DESC LIMIT 1)
+             FROM recent LEFT JOIN mixed
+               ON mixed.repo = recent.repo AND mixed.grp = recent.grp AND mixed.task = recent.task
+             GROUP BY recent.repo, recent.grp, recent.task
+             HAVING SUM(COALESCE(recent.message, '') LIKE 'flaky:%') > 0 OR COALESCE(MAX(mixed.n), 0) > 0
+             ORDER BY SUM(COALESCE(recent.message, '') LIKE 'flaky:%') + COALESCE(MAX(mixed.n), 0) DESC",
+        )?;
+        let rows = st
+            .query_map(params![since], |r| {
+                Ok(FlakyTask {
+                    repo: r.get(0)?,
+                    group: r.get(1)?,
+                    task: r.get(2)?,
+                    runs: r.get::<_, i64>(3)? as u64,
+                    failures: r.get::<_, i64>(4)? as u64,
+                    flaky_passes: r.get::<_, i64>(5)? as u64,
+                    mixed_inputs: r.get::<_, i64>(6)? as u64,
+                    last_run: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// The run of a task, if the task is running now.
     pub fn running_task_run(&self, id: &str) -> Result<Option<String>> {
         Ok(self

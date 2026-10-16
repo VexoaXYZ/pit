@@ -109,6 +109,11 @@ pub struct TaskDef {
     /// reported as flaky.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
+    /// Still runs and reports, but its failure does not fail the run (or
+    /// eject a merge queue change): for a known-flaky task while it is being
+    /// fixed. Tasks that depend on it are skipped when it fails.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quarantine: bool,
     /// Split the task into this many shards. Each runs in its own group (so
     /// shards spread across workers) with `PIT_SHARD` (1-based) and
     /// `PIT_SHARD_COUNT` set, e.g. `vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`.
@@ -400,6 +405,23 @@ pub struct Event {
     pub task_id: Option<String>,
     #[serde(default)]
     pub data: serde_json::Value,
+}
+
+/// A task with signs of flakiness over a period (`pit flaky`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlakyTask {
+    pub repo: String,
+    pub group: String,
+    pub task: String,
+    pub runs: u64,
+    pub failures: u64,
+    /// Passed only on a retry.
+    pub flaky_passes: u64,
+    /// Input sets (action keys) that both passed and failed: the same code,
+    /// different outcomes.
+    pub mixed_inputs: u64,
+    pub last_run: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

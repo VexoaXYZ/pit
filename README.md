@@ -96,6 +96,7 @@ export default {
 | `idleTimeout` | Seconds without any output before the task is stopped as hung; default 900, `0` for no limit. |
 | `shards` | Split the task into N groups that spread across workers; each gets `PIT_SHARD` and `PIT_SHARD_COUNT` (`vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`). |
 | `retries` | Extra attempts after a failure. A pass on a retry is reported as `flaky:` and is not cached. |
+| `quarantine` | `true`: the task still runs and reports, but its failure does not fail the run or eject a queued change. For a known-flaky task while it is fixed; `pit flaky` finds them. |
 
 ### Monorepos: one task per package
 
@@ -309,6 +310,7 @@ seconds without pushing.
 | `pit up` | Server, worker and dashboard in one process. |
 | `pit server` / `pit worker --server URL` | Run them separately, on as many machines as you like. |
 | `pit run [task…] [-v] [--json] [--no-cache] [--fresh]` | Run on the working tree. Exit code reflects the result. `--fresh` uses a new, empty workspace. |
+| `pit flaky [--days 14]` | Tasks that passed only on a retry, or both passed and failed with the same inputs. |
 | `pit verify` | `pit run --no-cache --fresh`: proves results depend neither on the cache nor on files earlier runs left in a warm workspace. |
 | `pit runs`, `pit logs RUN TASK`, `pit stats` | Inspect. |
 | `pit queue add BRANCH`, `pit queue list` | Merge queue. |

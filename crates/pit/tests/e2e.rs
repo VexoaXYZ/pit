@@ -1752,3 +1752,62 @@ async fn fork_pull_requests_run_on_a_label_without_secrets() {
         );
     }
 }
+
+/// Flaky tasks are found from history (passed on a retry, or the same inputs
+/// both passed and failed), and a quarantined failure does not fail the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flaky_tasks_are_reported_and_quarantine_keeps_runs_green() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let marks = dir
+        .join("..")
+        .join(format!("flaky-marks-{}", std::process::id()));
+    std::fs::create_dir_all(&marks).unwrap();
+    let config = serde_json::json!({ "tasks": {
+        // Fails the first attempt of every run, passes the retry.
+        "retried": {
+            "run": format!("f={}/$PIT_RUN_ID; if [ -f $f ]; then exit 0; else touch $f; exit 1; fi", marks.display()),
+            "retries": 1,
+            "cache": false,
+        },
+        // Same inputs every run; passes, fails, passes.
+        "flips": {
+            "run": format!(
+                "c={}/../flips-count; n=$(cat $c 2>/dev/null || echo 0); echo $((n + 1)) > $c; [ $((n % 2)) -eq 0 ]",
+                marks.display()
+            ),
+            "cache": false,
+        },
+        "broken": { "run": "exit 3", "quarantine": true, "cache": false },
+    } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    for _ in 0..3 {
+        let view = run(&pit, dir).await;
+        let broken = view.groups[0]
+            .tasks
+            .iter()
+            .find(|t| t.name == "broken")
+            .unwrap();
+        assert_eq!(broken.status, Status::Failed);
+        assert!(broken
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("quarantined"));
+    }
+    let flaky: Vec<FlakyTask> = pit.client.get("/api/flaky?days=1").await.unwrap();
+    let get = |n: &str| flaky.iter().find(|t| t.task == n).cloned();
+    let retried = get("retried").expect("a task that passed on a retry is flaky");
+    assert_eq!(retried.flaky_passes, 3);
+    let flips = get("flips").expect("same inputs, different outcomes is flaky");
+    assert_eq!(flips.mixed_inputs, 1, "{flips:?}");
+    assert!(
+        get("broken").is_none(),
+        "always failing is broken, not flaky"
+    );
+}

@@ -60,6 +60,13 @@ export interface TaskDef {
    */
   retries?: number;
   /**
+   * The task still runs and reports, but its failure does not fail the run
+   * or eject a merge queue change. For a known-flaky task while it is fixed
+   * (`pit flaky` lists candidates). Tasks that depend on it are skipped when
+   * it fails.
+   */
+  quarantine?: boolean;
+  /**
    * Split the task into this many shards, each in its own group so they spread
    * across workers. Each gets `PIT_SHARD` (1-based) and `PIT_SHARD_COUNT`:
    * `vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`. The task's deps run in every
