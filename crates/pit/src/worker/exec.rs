@@ -79,6 +79,9 @@ pub struct TaskCommand {
 }
 
 /// Builds the command for a task on the chosen backend.
+/// The image a `docker` task without one runs in.
+pub const DEFAULT_IMAGE: &str = "ubuntu:24.04";
+
 /// Which of the worker's own environment a task inherits.
 #[derive(Clone, Default)]
 pub struct EnvPolicy {
@@ -189,7 +192,7 @@ pub fn command_with(
             for (k, _) in env {
                 a.extend(["-e".into(), k.clone()]);
             }
-            a.push(task.image.clone().unwrap_or_else(|| "ubuntu:24.04".into()));
+            a.push(task.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.into()));
             a.extend(["sh".into(), "-c".into(), task.run.clone()]);
             ("docker".into(), a)
         }

@@ -1985,3 +1985,56 @@ either way.
 - **Only waiting runs are batched.** A run a worker has already started is never cancelled to
   batch, so on an idle fleet each change still gets its own run. There it costs nothing extra,
   since the slots were free.
+
+## P37. Docker Hub rate limits, and container tags that move
+
+**Pain.** Docker Hub caps unauthenticated pulls at **10 per hour per IPv4 address or IPv6 /64**
+(100 per hour for free authenticated users) since April 2025. CI jobs on shared or ephemeral
+runners pull their images every time, so a modest suite hits `toomanyrequests` (HTTP 429)
+within minutes. The fixes are logging in on every job, mirrors, or moving images to another
+registry ([Docker docs change](https://github.com/docker/docs/pull/22081/files),
+[Blacksmith](https://www.blacksmith.sh/blog/you-have-5-days-before-the-new-dockerhub-limits-f-ck-you-over),
+[Docker forums](https://forums.docker.com/t/toomanyrequests-you-have-reached-your-unauthenticated-pull-rate-limit/147241),
+[daily.dev](https://daily.dev/posts/new-docker-hub-pull-rate-limits-what-you-have-to-do--8xrvbqcio),
+[OneUptime](https://oneuptime.com/blog/post/2026-02-08-how-to-fix-docker-too-many-requests-rate-limit-errors/view),
+[devopslesson](https://devopslesson.com/troubleshooting/toomanyrequests-docker-hub-rate-limit)).
+
+**Reproduction** (`/tmp/painhunt/p37`): a `docker` task with an image this machine did not have
+(`busybox:1.36`), run 5 times on 5 commits while counting `docker events` pulls. Docker Hub's
+`ratelimit-remaining` header was read before and after a run with an image already present.
+
+```
+5 runs, image not present at first:  1 pull (first run 5.5s; then 1.4–2.4s)
+5 runs, image present:               0 pulls; Docker Hub ratelimit-remaining 100 → 100
+```
+
+Pit runs `docker run` without `--pull`, so a worker uses its local image and never contacts the
+registry again. Rate limits: **SOLVED** by having long-lived workers, with nothing to configure.
+
+**Gap found (the flip side):** a worker keeps the image a tag pointed to when it first pulled
+it, and the cache key held only the image *name*. Simulated by re-tagging `pit-demo:stable` from
+busybox to alpine:
+
+```
+before (research/pain-hunt at P36):   tag moved → ◆ test cached     (result from the old image)
+```
+
+**Fix** (research/pain-hunt): the worker measures the local image ID of every `docker` task, and
+of every fork run, which is forced into Docker. It pulls first if the image is missing. The ID
+goes into the action key as an implicit runtime input (P17), and the server never answers
+container tasks from cache, since only the worker knows what a tag means there.
+
+```
+after:  tag on busybox → ✓ ran because `docker image pit-demo:stable` is now part of the key (sha256:73aaf0…)
+        same again     → ◆ cached
+        tag moved      → ✓ ran because `docker image pit-demo:stable` changed (sha256:73aaf0… → sha256:d9e853…)   prints "alpine"
+```
+
+Unit test `a_moved_image_tag_changes_the_key`.
+
+**Verdict: SOLVED** for rate limits and for stale results. Not done:
+- **No refresh.** Workers do not pull a moved tag by themselves; run `docker pull` or pin a
+  digest. Different workers can run different images for one tag, and the key now keeps their
+  results apart, but tests can still behave differently per worker.
+- **One-time cache miss.** Existing cached results of `docker` tasks miss once after upgrading,
+  because the key now includes the image.

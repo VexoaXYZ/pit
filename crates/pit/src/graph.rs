@@ -360,8 +360,21 @@ pub fn key_inputs_with_runtime(
             )
         })
         .collect();
+    // Measured by the worker without being asked: the image a container
+    // task really ran in (see `worker::Worker::measure_runtime`).
+    let mut implicit: Vec<(String, String)> = runtime
+        .iter()
+        .filter(|(k, _)| k.starts_with(IMAGE_INPUT))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    implicit.sort();
+    inputs.runtime.extend(implicit);
     Ok(inputs)
 }
+
+/// Runtime input naming a container image; its value is the local image ID,
+/// so a moved tag (`node:22`) never reuses results built with the old one.
+pub const IMAGE_INPUT: &str = "docker image ";
 
 pub fn key_inputs(
     task: &TaskDef,
@@ -685,6 +698,28 @@ mod tests {
                 .unwrap()
                 .key(),
             action_key(&plain, "linux", &[], &[]).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_moved_image_tag_changes_the_key() {
+        let task = TaskDef {
+            run: "npm test".into(),
+            image: Some("node:22".into()),
+            ..Default::default()
+        };
+        let files = vec![("a.js".to_string(), "1".to_string())];
+        let measured = |id: &str| {
+            std::collections::HashMap::from([(format!("{IMAGE_INPUT}node:22"), id.to_string())])
+        };
+        let a =
+            key_inputs_with_runtime(&task, "linux", &files, &[], &measured("sha256:aaa")).unwrap();
+        let b =
+            key_inputs_with_runtime(&task, "linux", &files, &[], &measured("sha256:bbb")).unwrap();
+        assert_ne!(a.key(), b.key());
+        assert_eq!(
+            explain_miss(&a, &b, &[]),
+            "`docker image node:22` changed (sha256:aaa → sha256:bbb)"
         );
     }
 

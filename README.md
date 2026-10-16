@@ -167,6 +167,13 @@ Workers are long-lived, so their Docker daemon keeps its layer cache and BuildKi
 cache: the image lives in that worker's daemon, not in the task's outputs, so a remote cache
 hit on another worker would skip a build whose image is not there.
 
+Images for `docker` tasks are pulled once per worker and then run from its local store, so a
+fleet does not hit Docker Hub's pull limits (10 per hour per IP when unauthenticated). The
+flip side is that a tag like `node:22` stays at whatever it pointed to when that worker pulled
+it. The local image ID is part of the task's cache key, so results never cross image versions
+("`docker image node:22` changed (sha256:… → sha256:…)"). Run `docker pull` on the workers to
+move them to a new image, or pin a digest (`node:22@sha256:…`).
+
 ## How it works
 
 ```

@@ -1071,6 +1071,27 @@ impl Worker {
         def: &TaskDef,
     ) -> HashMap<String, String> {
         let mut out = HashMap::new();
+        // The image a container task runs in is part of its key, by ID: the
+        // tag alone can point at different images on different workers.
+        let image = (def.backend == Some(Backend::Docker) || def.image.is_some() || job.no_secrets)
+            .then(|| {
+                def.image
+                    .clone()
+                    .unwrap_or_else(|| exec::DEFAULT_IMAGE.into())
+            });
+        if let Some(image) = image {
+            let memo_key = format!("{}\0image {image}", job.group_id);
+            let cached = self.runtime_memo.lock().get(&memo_key).cloned();
+            let id = match cached {
+                Some(id) => id,
+                None => {
+                    let id = image_id(&image).await;
+                    self.runtime_memo.lock().insert(memo_key, id.clone());
+                    id
+                }
+            };
+            out.insert(format!("{}{image}", crate::graph::IMAGE_INPUT), id);
+        }
         for cmd in &def.runtime {
             let memo_key = format!("{}\0{cmd}", job.group_id);
             if let Some(v) = self.runtime_memo.lock().get(&memo_key).cloned() {
@@ -1165,6 +1186,30 @@ impl Worker {
         }
         Some(crate::graph::explain_miss(&prev, inputs, deps))
     }
+}
+
+/// The local ID of a container image, pulling it first if this worker does
+/// not have it (the run would pull it anyway).
+async fn image_id(image: &str) -> String {
+    let inspect = || async {
+        tokio::process::Command::new("docker")
+            .args(["image", "inspect", "--format", "{{.Id}}", image])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    if let Some(id) = inspect().await {
+        return id;
+    }
+    let _ = tokio::process::Command::new("docker")
+        .args(["pull", "-q", image])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+    inspect().await.unwrap_or_else(|| "unavailable".into())
 }
 
 /// `KEY=VALUE` lines; blank lines and `#` comments are skipped, and a value

@@ -74,8 +74,12 @@ pub fn resolve(
             .filter_map(|d| keys.get(d.as_str()).cloned())
             .collect();
         let key = key_inputs(def, &os, files, &dep_keys)?.key();
-        // Only the worker knows its toolchain; let it decide.
-        if !def.runtime.is_empty() {
+        // Only the worker knows its toolchain, and which image a tag
+        // points at there; let it decide.
+        if !def.runtime.is_empty()
+            || def.image.is_some()
+            || def.backend == Some(crate::model::Backend::Docker)
+        {
             return Ok(None);
         }
         let result = match def.cache {
