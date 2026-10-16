@@ -1873,3 +1873,49 @@ caught a parser bug: self-closing `<failure message="…"/>` elements were dropp
 - **Wrong runner arguments show up as wrong reports.** A misconfigured runner produces a
   misleading report. On the way, `node --test test/` with Node 22 treated the directory as one
   file, and the report said "1 of 1 tests failed".
+
+## P35. The merge queue becomes the bottleneck
+
+**Pain.** A serial queue lands one change per CI run. With 15-minute CI and 10 queued pull
+requests, the last one waits 2.5 hours; at about 10 PRs an hour, changes sit in the queue for
+hours. GitHub's merge queue answers this with batching (up to 5 PRs tested as one merge commit
+by default) and build concurrency (up to 100). Bigger batches trade latency against bisection
+when a batch fails, and flaky tests make that worse
+([humanwhocodes](https://humanwhocodes.com/blog/2026/04/improving-developer-velocity-github-merge-queue/),
+[tenki](https://tenki.cloud/blog/github-merge-queue-setup),
+[7tonshark](https://7tonshark.com/posts/rushjs-merge-queue/),
+[Mergify batches](https://docs.mergify.com/merge-queue/batches/),
+[Mergify analytics](https://mergify.com/learn/queue-analytics),
+[moderngitacademy](https://moderngitacademy.com/github/pull-requests/merge-queues/)).
+
+**Reproduction** (`/tmp/painhunt/p35`): a repo with 10 packages, each with its own 5-second
+`test<i>`, and a 5-second `integration` task that reads `shared/**`. Twenty branches:
+- `dis0..9`: each changes only its own package (disjoint).
+- `ovl0..9`: each adds a file under `shared/` (all overlap on `integration`).
+
+All 10 of a set are queued at once on the 2-slot worker; the clock stops when all 10 have landed.
+
+```
+disjoint (10 lanes):            10 PRs landed in 27.2s
+overlapping (1 lane, chain):    10 PRs landed in 29.9s
+a serial queue, same work:      ≥ 50s (10 × 5s, one after another)
+lower bound on 2 slots:         25s for 10 five-second runs
+```
+
+Both sets landed at close to the speed of the hardware. Disjoint changes form independent lanes
+(each tested only on its own `test<i>`); overlapping changes are tested speculatively on top of
+each other (`tip+A`, `tip+A+B`, …), and those candidate runs execute in parallel and, with P22,
+ahead of other work.
+
+**Gap found:** each candidate is a full CI run. 10 overlapping PRs cost 10 runs; a batch of 5
+(GitHub's default) would test them in about 2. When workers, not latency, are the limit, batching
+lands more per CPU, and Pit has no batching. Also, every landing gets a post-merge run of
+everything (the backstop for undeclared inputs). In this test, with `cache: false`, the 10
+post-merge runs kept the box busy for about a minute after the queue had drained. With caching
+on, as is the default, most of that is cache hits.
+
+**Verdict: PARTIAL.**
+- **Latency: SOLVED.** Lanes and speculative chains in parallel; measured near the lower bound.
+- **CI cost per landed change: NOT SOLVED.** There is no batching, which would mean testing only
+  a lane's newest candidate and bisecting on failure. That is a larger change to the queue,
+  left for later.
