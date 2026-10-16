@@ -322,11 +322,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_sandboxed_config_sees_nothing_of_the_host() {
-        if !crate::worker::exec::detect_backends()
-            .await
-            .contains(&crate::model::Backend::Docker)
+        // The sandbox image is a Linux one (Windows runners have Windows
+        // containers only).
+        if !cfg!(target_os = "linux")
+            || !crate::worker::exec::detect_backends()
+                .await
+                .contains(&crate::model::Backend::Docker)
         {
-            eprintln!("skipped: no docker");
+            eprintln!("skipped: no Linux docker");
             return;
         }
         let dir = tempfile::tempdir().unwrap();

@@ -246,7 +246,8 @@ its config says, so it cannot read the worker's files; only workers with Docker 
 `runtime` commands run in the task's container too, offline. Its `pit.config.ts` is evaluated
 in a `node:22-alpine` container (`PIT_CONFIG_IMAGE`) with no network, no capabilities and no
 mounts but the file itself, because evaluating it on the server would expose the server's files
-(its database, its OIDC signing key). It may read cached results but writes none, so nothing it
+(its database, its OIDC signing key). That needs Docker with Linux containers on the server; without
+it a fork's `pit.config.ts` run fails, and `pit.config.json` still works. It may read cached results but writes none, so nothing it
 builds reaches a same-repo pull request, and it records no shard timings. "Re-run" on its check
 keeps all of this, and a fork queued with `pit:merge` is queued at the labeled commit: a later
 push drops it from the queue instead of testing the new code with the queue's trust.
