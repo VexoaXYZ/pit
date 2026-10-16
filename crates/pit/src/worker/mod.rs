@@ -529,14 +529,14 @@ impl Worker {
                 message: Some(format!("preparing workspace: {e:#}")),
                 prepare_ms,
             },
-            Ok(files) => {
+            Ok((files, note)) => {
                 let status = self
                     .clone()
                     .run_tasks(&job, &ws, Arc::new(files), cancel_rx)
                     .await;
                 GroupResult {
                     status,
-                    message: None,
+                    message: note,
                     prepare_ms,
                 }
             }
@@ -567,16 +567,43 @@ impl Worker {
     }
 
     /// Gets the workspace to exactly `sha` plus the overlay, keeping ignored
-    /// files warm. Returns the input file index used for action keys.
-    async fn prepare(&self, job: &Job, ws: &Path) -> Result<Vec<(String, String)>> {
+    /// files warm. Returns the input file index used for action keys, and a
+    /// note for the group's result.
+    async fn prepare(
+        &self,
+        job: &Job,
+        ws: &Path,
+    ) -> Result<(Vec<(String, String)>, Option<String>)> {
         let mirror = self
             .data_dir
             .join("mirrors")
             .join(format!("{}.git", safe_name(&job.repo)));
+        // Git LFS: the mirror fetches the commit's large files, once per
+        // worker, and every workspace reads them from there. Each checkout
+        // would otherwise download its own copy (CI checkouts are what use
+        // up an LFS bandwidth quota), and a workspace cloned from the mirror
+        // cannot download them at all: its remote is the mirror.
+        let mut note = None;
+        let mut lfs = false;
         {
             let lock = self.mirror_lock(&job.repo);
             let _g = lock.lock().await;
             git::ensure_commit(&mirror, &job.url, &job.sha).await?;
+            if git::uses_lfs(&mirror, &job.sha).await {
+                let skip = std::env::var_os("GIT_LFS_SKIP_SMUDGE").is_some_and(|v| v == "1");
+                if !skip && git::lfs_available().await {
+                    git::git(&mirror, &["lfs", "fetch", "origin", &job.sha])
+                        .await
+                        .context("fetching Git LFS files")?;
+                    lfs = true;
+                } else {
+                    note = Some(
+                        "this commit uses Git LFS, but git-lfs is not installed on this worker \
+                         (or GIT_LFS_SKIP_SMUDGE=1): LFS files are pointer files"
+                            .to_string(),
+                    );
+                }
+            }
         }
         if !ws.join(".git").exists() {
             std::fs::create_dir_all(ws.parent().unwrap())?;
@@ -595,6 +622,11 @@ impl Worker {
                 ],
             )
             .await?;
+        }
+        if lfs {
+            let storage = mirror.join("lfs");
+            git::git(ws, &["lfs", "install", "--local", "--skip-repo"]).await?;
+            git::git(ws, &["config", "lfs.storage", &storage.to_string_lossy()]).await?;
         }
         git::git(ws, &["checkout", "-q", "--force", "--detach", &job.sha]).await?;
         // Untracked files go, ignored ones (dependencies, build dirs) stay warm.
@@ -623,7 +655,7 @@ impl Worker {
         }
         let mut files: Vec<(String, String)> = index.into_iter().collect();
         files.sort();
-        Ok(files)
+        Ok((files, note))
     }
 
     /// A blob from the node-local cache, fetched from the server on a miss.

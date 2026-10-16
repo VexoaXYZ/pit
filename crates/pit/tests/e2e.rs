@@ -2417,3 +2417,78 @@ async fn metrics_show_queue_depth_for_autoscaling() {
     assert!(metrics.contains(&format!("pit_oldest_queued_seconds{{os=\"{other}\"}}")));
     assert!(metrics.contains("pit_workers_online 1"), "{metrics}");
 }
+
+/// Git LFS files arrive with their content, fetched once into the worker's
+/// mirror and read from there by every workspace (fresh ones included),
+/// instead of one download per checkout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn git_lfs_files_are_fetched_once_per_worker() {
+    if !std::process::Command::new("git")
+        .args(["lfs", "version"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        eprintln!("skipped: no git-lfs");
+        return;
+    }
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    write(&work, "model.bin", "the real large content\n");
+    write(
+        &work,
+        "pit.config.json",
+        r#"{"tasks":{"check":{"run":"grep -q 'the real large content' model.bin","cache":false}}}"#,
+    );
+    sh(
+        &work,
+        "git init -q -b main && git lfs install --local >/dev/null && git lfs track '*.bin' >/dev/null \
+         && git add -A && git commit -qm lfs && git remote add origin ../origin.git && git push -q origin main 2>/dev/null",
+    );
+    // Stored as a pointer in git; the content lives in the LFS store.
+    assert!(sh(&work, "git show HEAD:model.bin").starts_with("version https://git-lfs"));
+    let view = run(&pit, &work).await;
+    assert_eq!(view.status, Status::Passed, "{view:?}");
+    let view = run_with(
+        &pit,
+        &work,
+        pit::cli::RunOpts {
+            fresh: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(view.status, Status::Passed, "a fresh workspace: {view:?}");
+    // One copy, in the mirror; no workspace keeps its own.
+    let worker = pit._data.path().join("worker");
+    let copies = |dir: &Path| {
+        walkdir(dir)
+            .into_iter()
+            .filter(|p| {
+                p.to_string_lossy()
+                    .replace('\\', "/")
+                    .contains("/lfs/objects/")
+                    && p.file_name().is_some_and(|n| n.len() == 64)
+            })
+            .count()
+    };
+    assert_eq!(copies(&worker.join("mirrors")), 1);
+    assert_eq!(copies(&worker.join("workspaces")), 0);
+}
+
+fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walkdir(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}

@@ -200,6 +200,10 @@ move them to a new image, or pin a digest (`node:22@sha256:…`).
    claims a whole group and picks the warmest free workspace for that repo.
 3. **Prepare.** The mirror fetches only if the commit is missing. The workspace checks out
    the commit, removes untracked files but keeps ignored ones, then writes the overlay.
+   Git LFS files are fetched into the mirror once per worker (only objects it lacks) and every
+   workspace, fresh ones included, reads them from there, so CI no longer downloads each LFS
+   file on every checkout. This needs `git-lfs` on the worker; without it, or with
+   `GIT_LFS_SKIP_SMUDGE=1`, LFS files stay pointer files and the group says so.
 4. **Execute.** For each task in the DAG, the worker computes the action key from git blob
    ids (free, from the index) and overlay digests of the matching inputs, plus dependency
    keys. Cache hit: restore outputs, replay the log. Miss: run, stream logs live, upload

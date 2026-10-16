@@ -192,6 +192,28 @@ pub async fn ensure_commit(dir: &Path, url: &str, sha: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether the commit's `.gitattributes` send any path through Git LFS.
+pub async fn uses_lfs(dir: &Path, sha: &str) -> bool {
+    git_ok(
+        dir,
+        &[
+            "grep",
+            "-q",
+            "-F",
+            "filter=lfs",
+            sha,
+            "--",
+            ":(glob)**/.gitattributes",
+        ],
+    )
+    .await
+}
+
+/// Whether `git lfs` is installed.
+pub async fn lfs_available() -> bool {
+    git_ok(Path::new("."), &["lfs", "version"]).await
+}
+
 pub async fn rev_parse(dir: &Path, rev: &str) -> Result<Option<String>> {
     let out = git_raw(
         dir,

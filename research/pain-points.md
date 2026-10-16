@@ -2387,3 +2387,73 @@ beyond #18.
 P31's verdict stays **PARTIAL**, now for the right reasons. A fork's code, config included, runs
 only in containers with no secrets. What remains: P31's existing limits, and the config sandbox
 needs Docker on the server.
+
+## P42. Git LFS: every CI checkout downloads every large file again
+
+**The pain.** On GitHub, every LFS download counts against the repository owner's LFS bandwidth,
+CI checkouts included. GitHub staff confirmed `actions/checkout` downloads count
+([community #26775](https://github.com/orgs/community/discussions/26775)). Because a fresh runner
+downloads every object on every run, frequent builds use up the quota. When it runs out, downloads
+fail with "This repository exceeded its LFS budget"
+([community #151710](https://github.com/orgs/community/discussions/151710)).
+[actions/checkout#165](https://github.com/actions/checkout/issues/165), "Cache for LFS", has been
+open since 2020. The workarounds:
+- a hand-built `actions/cache` of `.git/lfs` keyed on `git lfs ls-files`
+  ([mikepenz](https://blog.mikepenz.dev/a/caching-in-ga/));
+- drop-in actions such as
+  [action-cached-lfs-checkout](https://github.com/nschloe/action-cached-lfs-checkout);
+- skipping LFS entirely with `GIT_LFS_SKIP_SMUDGE=1`.
+
+**Reproduction.**
+- A repo with a 5 MB random `model.bin` tracked by LFS, and a task that checks its sha256 against
+  `expected.txt`.
+- To count bandwidth, a small Git LFS server (batch API, basic transfer, about 70 lines of Python)
+  served the objects and counted downloads. The repo points at it through `.lfsconfig`.
+- git-lfs 3.4.1 installed the Ubuntu way, which sets the LFS filter in the system git config.
+
+Before:
+- **A repo without `.lfsconfig` (most repos: the LFS URL comes from the remote) did not run at
+  all.** The workspace is a `--shared` clone of the worker's mirror, so its LFS remote is the
+  mirror, which never had the objects. Checkout failed: `smudge filter lfs failed … remote
+  missing object`. Every task was skipped and the group errored.
+- With `.lfsconfig`, it ran:
+  - each warm workspace downloaded its own copy: one 5 MB download for three runs in the same
+    workspace;
+  - another 5 MB for `--fresh`;
+  - the same again for every other workspace (each slot, the trusted and untrusted pools).
+- For comparison, three fresh clones (what an ephemeral runner does) downloaded 15 MB.
+
+**Fix.**
+- When a commit's `.gitattributes` use `filter=lfs` and `git-lfs` is installed, the worker runs
+  `git lfs fetch origin <sha>` in its mirror, under the mirror lock. That downloads only the
+  objects the mirror lacks.
+- Each workspace gets the LFS filter (`git lfs install --local --skip-repo`) and
+  `lfs.storage = <mirror>/lfs`, so checkout smudges from the mirror's copy without downloading
+  anything.
+- Without `git-lfs`, or with `GIT_LFS_SKIP_SMUDGE=1`, files stay pointers and the group's result
+  says so, instead of a task failing later on a 130-byte "model".
+- Cache keys are unchanged: they hash the pointer blob, which names the content's sha256.
+- `pit run` overlays were already right: `git diff` applies the clean filter, so only LFS files
+  actually edited travel, with their content.
+
+After, measured against the counting server, with the mirror's and workspaces' LFS stores
+deleted first:
+
+| | downloads | bytes |
+| --- | --- | --- |
+| 3 fresh clones (ephemeral runners) | 3 | 15 MB |
+| Pit before: 3 runs + 1 `--fresh` | 2 | 10 MB, plus 5 MB per extra workspace |
+| Pit after: 3 runs + 2 `--fresh` | **1** | **5 MB** |
+
+- The no-`.lfsconfig` repo now passes, and the task saw the real content (its sha256 matched).
+- The e2e test `git_lfs_files_are_fetched_once_per_worker` pushes an LFS file to a bare origin
+  and runs a normal workspace and a fresh one. Both see the content; the worker holds exactly
+  one copy, in its mirror, and no workspace holds its own.
+
+**Verdict: SOLVED** for one worker: each LFS object is downloaded once per worker, not once per
+checkout. Limits:
+- Each worker still downloads once; the server does not share LFS objects through its CAS.
+- A fork's new LFS objects are fetched from the base repo's LFS endpoint, so they work only where
+  the host serves the fork network from there (GitHub does).
+- The pointer-file note for workers without git-lfs was not exercised here, because this machine
+  has git-lfs.
