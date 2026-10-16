@@ -65,8 +65,9 @@ pub struct Worker {
     /// Groups running now, by id: their lease, to hand back on a hard stop,
     /// and the switch that stops their tasks.
     running: Mutex<HashMap<String, Running>>,
-    /// Service containers of the groups running now, by group id.
-    services: Mutex<HashMap<String, Arc<services::Running>>>,
+    /// Service containers of the groups running now, by lease: started by
+    /// the first task that runs (not a cache hit), shared by the rest.
+    services: Mutex<HashMap<String, ServiceSlot>>,
     /// Identifies this worker's data dir across restarts, unlike its name
     /// (the hostname by default, shared by workers on one machine). Its
     /// service containers are labelled with it.
@@ -185,6 +186,16 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
             // running in a workspace nobody owns, and give them a moment.
             for (_, (_, cancel)) in &running {
                 let _ = cancel.send(true);
+            }
+            // Their services go too, not left for the next start.
+            let started: Vec<Arc<services::Running>> = w
+                .services
+                .lock()
+                .values()
+                .filter_map(|slot| slot.get().and_then(|r| r.as_ref().ok().cloned()))
+                .collect();
+            for s in started {
+                s.stop().await;
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
             tracing::info!("stopped: running groups handed back to the server");
@@ -568,44 +579,27 @@ impl Worker {
                 prepare_ms,
             },
             Ok((files, note)) => {
-                let wanted = job
-                    .tasks
-                    .first()
-                    .map(|t| t.def.services.clone())
-                    .unwrap_or_default();
-                let started = if wanted.is_empty() {
-                    Ok(None)
-                } else {
-                    services::start(&self.instance, &job.group_id, &wanted)
-                        .await
-                        .map(Some)
-                };
-                match started {
-                    Err(e) => GroupResult {
-                        status: Status::Error,
-                        message: Some(format!("{e:#}")),
-                        prepare_ms,
-                    },
-                    Ok(svc) => {
-                        if let Some(s) = svc {
-                            self.services
-                                .lock()
-                                .insert(job.group_id.clone(), Arc::new(s));
-                        }
-                        let status = self
-                            .clone()
-                            .run_tasks(&job, &ws, Arc::new(files), cancel_rx)
-                            .await;
-                        GroupResult {
-                            status,
-                            message: note,
-                            prepare_ms,
-                        }
-                    }
+                if job.tasks.iter().any(|t| !t.def.services.is_empty()) {
+                    self.services
+                        .lock()
+                        .insert(job.lease.clone(), Default::default());
+                }
+                let status = self
+                    .clone()
+                    .run_tasks(&job, &ws, Arc::new(files), cancel_rx)
+                    .await;
+                GroupResult {
+                    status,
+                    message: note,
+                    prepare_ms,
                 }
             }
         };
-        let services = self.services.lock().remove(&job.group_id);
+        let services = self
+            .services
+            .lock()
+            .remove(&job.lease)
+            .and_then(|slot| slot.get().and_then(|r| r.as_ref().ok().cloned()));
         hb.abort();
         let debug_dir = debug::dir(&self.data_dir, &job.group_id);
         if job.debug && debug::has_scripts(&debug_dir) {
@@ -1084,17 +1078,23 @@ impl Worker {
             ("PIT_RUN_ID".into(), job.run_id.clone()),
             ("PIT_SHA".into(), job.sha.clone()),
             ("PIT_SHARD".into(), def.shard.unwrap_or(1).to_string()),
-            // The same names `nx-set-shas` and Turborepo use.
-            ("NX_HEAD".into(), job.sha.clone()),
-            ("TURBO_SCM_HEAD".into(), job.sha.clone()),
             (
                 "PIT_SHARD_COUNT".into(),
                 def.shards.unwrap_or(1).to_string(),
             ),
         ];
+        // The same names `nx-set-shas` and Turborepo use.
         if let Some(base) = &job.base_sha {
             for k in ["PIT_BASE_SHA", "NX_BASE", "TURBO_SCM_BASE"] {
                 env.push((k.into(), base.clone()));
+            }
+            // A head makes them diff `base...head` only. `pit run` changes
+            // are in the working tree, not in a commit, and must count:
+            // without a head the tools diff the working tree.
+            if job.overlay.is_none() {
+                for k in ["NX_HEAD", "TURBO_SCM_HEAD"] {
+                    env.push((k.into(), job.sha.clone()));
+                }
             }
         }
         // One file per line, so names with spaces survive `xargs -d '\n'`.
@@ -1162,8 +1162,10 @@ impl Worker {
             secret_values.push(token.clone());
             env.push(("PIT_OIDC_TOKEN".into(), token));
         }
-        // Where the group's services are, from this task's backend.
-        let services = self.services.lock().get(&job.group_id).cloned();
+        // Where the group's services are, from this task's backend. The
+        // first task that gets here starts them; a group answered by the
+        // cache never pulls or starts a database.
+        let services = self.group_services(job, def, cancel.clone()).await?;
         if let Some(s) = &services {
             env.extend(s.env(backend));
         }
@@ -1322,7 +1324,8 @@ impl Worker {
         let reports = files::collect_outputs(ws, &def.reports)?;
         let paths: Vec<&std::path::PathBuf> = reports.iter().map(|(_, abs)| abs).collect();
         let mut summary = junit::summarize(&paths);
-        if let Some(s) = summary.as_mut().filter(|_| !ok) {
+        // A quarantined failure is no news for the pull request's diff.
+        if let Some(s) = summary.as_mut().filter(|_| !ok && !def.quarantine) {
             let known: std::collections::HashSet<&str> =
                 files.iter().map(|(p, _)| p.as_str()).collect();
             s.resolve(&known, ws);
@@ -1332,14 +1335,16 @@ impl Worker {
                 .iter()
                 .filter_map(|(name, msg)| {
                     let (path, line) = s.locations.get(name)?;
+                    // Test output can hold a secret ("expected ghp_… to
+                    // equal …"); annotations are public on public repos.
                     Some(Annotation {
                         path: path.clone(),
                         line: *line,
-                        title: name.clone(),
+                        title: masker.mask(name),
                         message: if msg.is_empty() {
                             "failed".into()
                         } else {
-                            msg.clone()
+                            masker.mask(msg)
                         },
                     })
                 })
@@ -1379,7 +1384,7 @@ impl Worker {
             let _ = client.post_empty("/api/timings", &body).await;
         }
         if let Some(summary) = summary {
-            let text = summary.message();
+            let text = masker.mask(&summary.message());
             let _ = client
                 .post_empty(
                     &format!("/api/tasks/{}/log", task.id),
@@ -1434,6 +1439,7 @@ impl Worker {
                 None => how,
             });
         }
+        let message = message.map(|m| masker.mask(&m));
         let status = if ok { Status::Passed } else { Status::Failed };
         let r = finish(
             status,
@@ -1448,6 +1454,39 @@ impl Worker {
         Ok((status, Some(key)))
     }
 }
+
+impl Worker {
+    async fn group_services(
+        &self,
+        job: &Job,
+        def: &TaskDef,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<Arc<services::Running>>> {
+        if def.services.is_empty() {
+            return Ok(None);
+        }
+        let Some(slot) = self.services.lock().get(&job.lease).cloned() else {
+            return Ok(None);
+        };
+        // Names carry the lease: a group reclaimed on the same docker host
+        // never collides with, or removes, an earlier claim's services.
+        let prefix = format!("{}-{}", job.group_id, &job.lease[..job.lease.len().min(8)]);
+        let started = slot
+            .get_or_init(|| async {
+                services::start(&self.instance, &prefix, &def.services, cancel)
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| format!("{e:#}"))
+            })
+            .await;
+        match started {
+            Ok(s) => Ok(Some(s.clone())),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    }
+}
+
+type ServiceSlot = Arc<tokio::sync::OnceCell<std::result::Result<Arc<services::Running>, String>>>;
 
 /// A random id kept in the data dir, made on first start.
 fn instance_id(data_dir: &Path) -> String {

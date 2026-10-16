@@ -353,33 +353,40 @@ impl GitHub {
                 let existing = group_id
                     .and_then(|g| app.db.group(g).ok())
                     .and_then(|g| g.check_run_id);
-                let id = match existing {
-                    Some(id) => {
-                        self.call(
+                let sent = match existing {
+                    Some(id) => self
+                        .call(
                             full,
                             reqwest::Method::PATCH,
                             &format!("/repos/{full}/check-runs/{id}"),
                             body.clone(),
                         )
-                        .await?;
-                        Some(id)
-                    }
-                    None => {
-                        let created = self
-                            .call(
-                                full,
-                                reqwest::Method::POST,
-                                &format!("/repos/{full}/check-runs"),
-                                body.clone(),
-                            )
-                            .await?;
-                        let id = created["id"].as_u64();
-                        if let (Some(g), Some(id)) = (group_id, id) {
-                            app.db.set_check_run(g, id)?;
+                        .await
+                        .map(|_| Some(id)),
+                    None => self
+                        .call(
+                            full,
+                            reqwest::Method::POST,
+                            &format!("/repos/{full}/check-runs"),
+                            body.clone(),
+                        )
+                        .await
+                        .map(|created| created["id"].as_u64()),
+                };
+                // The claim is only spent once GitHub has the first chunk; a
+                // failed request leaves them for the next report.
+                let id = match sent {
+                    Ok(id) => id,
+                    Err(e) => {
+                        if let (true, Some(g)) = (annotate, group_id) {
+                            app.db.kv_delete("annotated", g)?;
                         }
-                        id
+                        return Err(e);
                     }
                 };
+                if let (None, Some(g), Some(id)) = (existing, group_id, id) {
+                    app.db.set_check_run(g, id)?;
+                }
                 if let (true, Some(id)) = (annotate, id) {
                     for chunk in chunks {
                         self.call(
@@ -556,11 +563,13 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 .to_string();
             let repo = register(app, &r)?;
             let fork = pr["head"]["repo"]["full_name"].as_str() != Some(r.full_name.as_str());
-            // Remembered so a fork queued through the API is pinned too.
-            if fork {
-                app.db
-                    .kv_put("fork-pr", &format!("{}/{number}", repo.id), &sha)?;
-            }
+            // Remembered so a pull request queued through the API is pinned
+            // unless it is known to come from the repo itself.
+            app.db.kv_put(
+                "pr-origin",
+                &format!("{}/{number}", repo.id),
+                if fork { "fork" } else { "same" },
+            )?;
             if action == "labeled" && payload["label"]["name"].as_str() == Some(MERGE_LABEL) {
                 let entry = super::queue::add(
                     app,

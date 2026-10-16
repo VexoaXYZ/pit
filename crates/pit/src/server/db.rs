@@ -10,12 +10,12 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use crate::model::*;
 
 /// `kv` namespaces that are Pit's own records, not cache entries: never
-/// evicted or counted as artifacts. `last` (a task's last result), `fork-pr`
-/// (pull requests known to come from forks), `annotated` (checks whose
-/// annotations were sent).
+/// evicted or counted as artifacts. `last` (a task's last result),
+/// `pr-origin` (whether a pull request comes from a fork), `annotated`
+/// (checks whose annotations were sent).
 macro_rules! internal_kv {
     () => {
-        "('last', 'fork-pr', 'annotated')"
+        "('last', 'pr-origin', 'annotated')"
     };
 }
 
@@ -1198,11 +1198,13 @@ impl Db {
         )? > 0)
     }
 
-    /// Every annotation of a group's tasks.
+    /// Every annotation of a group's failed tasks (an attempt that was
+    /// requeued and then passed leaves its annotations behind).
     pub fn group_annotations(&self, group_id: &str) -> Result<Vec<Annotation>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
-            "SELECT annotations FROM tasks WHERE group_id = ?1 AND annotations IS NOT NULL ORDER BY position",
+            "SELECT annotations FROM tasks WHERE group_id = ?1 AND annotations IS NOT NULL
+               AND status IN ('failed', 'error') ORDER BY position",
         )?;
         let rows: Vec<String> = st
             .query_map(params![group_id], |r| r.get(0))?
@@ -1326,12 +1328,15 @@ impl Db {
         Ok(())
     }
 
-    /// Commits of `branch` whose trusted run passed, newest first.
+    /// Commits of `branch` whose trusted run passed, newest first. Only full
+    /// runs count (pushes and post-merge backstops): a scheduled run of one
+    /// task passing says nothing about the rest.
     pub fn green_commits(&self, repo_id: &str, branch: &str, limit: usize) -> Result<Vec<String>> {
         let c = self.conn.lock();
         let mut st = c.prepare_cached(
             "SELECT sha FROM runs WHERE repo_id = ?1 AND ref = ?2 AND trusted = 1
                AND status = 'passed' AND overlay IS NULL
+               AND trigger IN ('push', 'post-merge')
              ORDER BY created_at DESC LIMIT ?3",
         )?;
         let rows = st
@@ -1590,6 +1595,26 @@ impl Db {
             }
         }
         Ok((keep, overlays))
+    }
+
+    pub fn kv_delete(&self, ns: &str, key: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "DELETE FROM kv WHERE ns = ?1 AND key = ?2",
+            params![ns, key],
+        )?;
+        Ok(())
+    }
+
+    /// Marks the groups of a run that hold a failed task as failed (a run
+    /// stopped early leaves them skipped, and their check would read
+    /// "cancelled").
+    pub fn fail_groups_with_failures(&self, run_id: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE groups_ SET status = 'failed' WHERE run_id = ?1 AND EXISTS (
+               SELECT 1 FROM tasks WHERE tasks.group_id = groups_.id AND tasks.status IN ('failed', 'error'))",
+            params![run_id],
+        )?;
+        Ok(())
     }
 
     /// Sets a key unless it is already set; true if this call set it.

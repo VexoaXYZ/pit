@@ -247,8 +247,9 @@ pub fn parse(xml: &str) -> Summary {
                 if open {
                     case = Some(full);
                     case_at = attr(&e, b"file").and_then(|f| {
-                        let line = attr(&e, b"line")?.parse().ok()?;
-                        Some((f, line))
+                        let line: u32 = attr(&e, b"line")?.parse().ok()?;
+                        // GitHub rejects a whole request over one line 0.
+                        (line > 0).then_some((f, line))
                     });
                 }
             }

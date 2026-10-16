@@ -118,16 +118,16 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
             None => format!("{source} not found in {}", repo.url),
         })?;
     // A fork's pull request is queued at this commit only: a later push
-    // drops it rather than testing new code with the queue's trust. Forks
-    // are known from the label's webhook (`sha`) or any earlier webhook.
-    let fork = req.pr.is_some_and(|n| {
-        app.db
-            .kv_get("fork-pr", &format!("{}/{n}", repo.id))
-            .ok()
-            .flatten()
-            .is_some()
+    // drops it rather than testing new code with the queue's trust. Unless
+    // a webhook said the pull request comes from the repo itself, it is
+    // treated as a fork: a missed webhook pins, it never trusts.
+    let same_repo = req.pr.is_some_and(|n| {
+        matches!(
+            app.db.kv_get("pr-origin", &format!("{}/{n}", repo.id)),
+            Ok(Some(o)) if o == "same"
+        )
     });
-    let pinned = req.sha.is_some() || fork;
+    let pinned = req.sha.is_some() || (req.pr.is_some() && !same_repo);
     if let Some(approved) = &req.sha {
         if *approved != head {
             bail!("{source} moved to {head} after {approved} was approved; add the label again");
@@ -437,6 +437,7 @@ impl Queue<'_> {
                 if let Some(task) = self.app.db.run_failed_task(&run_id)? {
                     let why = format!("stopped early: {task} failed");
                     if self.app.db.cancel_run_because(&run_id, &why)? {
+                        self.app.db.fail_groups_with_failures(&run_id)?;
                         self.cancelled.push(run_id.clone());
                     }
                     run = self.app.db.run(&run_id)?;

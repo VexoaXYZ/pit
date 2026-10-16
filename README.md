@@ -134,8 +134,10 @@ one `nrwl/nx-set-shas` would pick: the newest commit of the default branch whose
 passed and that this commit contains (a red commit is skipped). Without one, it's where the commit
 left the default branch, or its parent on the default branch. Workspaces have the full history
 (they are clones of the worker's mirror), so there is no `fetch-depth: 0` to remember. A task whose
-command mentions the base or `affected` has the base in its cache key, so a cached result from a
-different base is never replayed.
+command mentions the base or `affected` has the base in its cache key. A task that reaches
+`nx affected` through a script (`pnpm ci`) is not detected: give it `cache: false`. With
+uncommitted changes (`pit run`), `NX_HEAD`/`TURBO_SCM_HEAD` are left unset, so the tools diff the
+working tree and count those changes.
 
 ### Shared resources
 
@@ -158,9 +160,10 @@ api: {
 }
 ```
 
-Each service starts before the group's first task, on a network of the group's own, and is
-removed after its last task, however the group ended (a worker that died mid-job cleans up when it
-starts again). Pit waits for `ready` to succeed in the container, or for the first port to accept
+Each service starts when the group's first task that is not a cache hit begins (a group the cache
+answers starts none), on a network of the group's own, and is removed after the group, including
+on cancel and on a hard stop (a worker that crashed cleans up its own when it starts again with the
+same data dir). Pit waits for `ready` to succeed in the container, or for the first port to accept
 connections, and if the service exits or isn't ready after 90 seconds, the group fails with its
 last log lines.
 

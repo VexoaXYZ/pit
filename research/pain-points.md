@@ -3049,3 +3049,66 @@ already in place:
 
 What stays: capacity is the workers'. Pit doesn't add machines, and P41's `/metrics` is what an
 autoscaler would use. Runs are first come, first served, with no fairness between agents.
+
+## Review of P46–P49
+
+A third independent reviewer read P46 to P49 and the previous review's fixes. It found no way for
+fork code to use `services` to reach another group or the host, but it did find 3 high and 8 medium
+findings, plus several low ones. Fixed (`cargo test` 72 unit and 40 e2e, run twice; clippy clean):
+
+High:
+
+1. **H1. Annotations and failure summaries skipped secret masking.** A failing test that printed a
+   token put it on the GitHub check, which is public on public repos. Annotation titles and
+   messages, the report summary in the log, and every task message now go through the run's
+   masker.
+2. **H2. A fork could hold a worker slot forever with `ready: "sleep infinity"`.** `docker exec`
+   had no timeout and cancelling didn't stop service start-up. Now:
+   - each readiness check is capped at 10s, within the 90s deadline;
+   - start-up watches the run's cancel switch, and anything started is removed.
+3. **H3. With uncommitted changes, `NX_HEAD`/`TURBO_SCM_HEAD` made `nx affected` diff `base...head`
+   only.** It skipped the projects just edited and could report green. They are now unset for
+   overlay runs, so the tools diff the working tree.
+
+Medium:
+
+4. **M1.** A scheduled run of one task could become the "green" base. Only full push and
+   post-merge runs count now.
+5. **M2.** The base used main/master/trunk only. A repo whose default is `develop` got no base at
+   all, because a missing branch skipped the fallback. The default branch now comes from the
+   mirror's `HEAD`; without one, the parent commit is used.
+6. **M3.** Services started even when every task was a cache hit, and an unready database could
+   fail a fully cached group. They now start with the first task that actually runs.
+7. **M5.** Annotations from a requeued attempt could land on a green check. Only failed tasks'
+   annotations are sent, and quarantined failures post none.
+8. **M6.** The annotation claim was spent before the first request succeeded. It is released when
+   that request fails, and JUnit `line="0"` is dropped (GitHub rejects the whole request for one).
+9. **M7.** A group reclaimed on the same Docker host collided with, or removed, the earlier claim's
+   services. Names and the worker's map now include the lease.
+10. **M8.** Fork pinning failed open for a PR Pit had no webhook for. Pull requests are now
+    recorded as fork or same-repo, and any PR not known to be same-repo is pinned.
+
+Low, fixed:
+
+- A failed `docker run` left its container behind; the container is recorded before the run.
+- A hard stop now removes running services.
+- A run stopped early (fail-fast) marks the group holding the failed task as failed, not
+  skipped, so its check doesn't read "cancelled".
+
+Not fixed (limits):
+
+- **M4.** Without `ready`, readiness uses the container's address. That address isn't reachable
+  from the worker under rootless Docker or a containerised worker (the group then times out), and
+  on Docker Desktop the published-port fallback can report ready early. Give services a `ready`
+  command there.
+- The `affected` cache key only covers commands that name the variables (README now says so).
+- Green bases are ordered by creation time, not history.
+- `annotated` and `pr-origin` rows, and stored annotations, are never pruned.
+- The OOM note uses the machine-wide counter.
+- `pit up` waits out an in-flight 20s claim on Ctrl-C.
+
+Claims corrected:
+
+- P48's "removed however the group ended": hard stops are now covered; a panic or a crash still
+  relies on the next start.
+- P49's "never replayed": only for commands that name the base.

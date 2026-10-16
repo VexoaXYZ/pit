@@ -347,7 +347,33 @@ impl App {
     /// commit contains. Otherwise where this commit left the default branch,
     /// or, on the default branch itself, its parent.
     async fn base_commit(&self, mirror: &Path, repo: &db::Repo, sha: &str) -> Option<String> {
-        let branch = queue::default_branch(mirror).await.ok()?;
+        // The mirror's HEAD is the remote's default branch (`develop` too);
+        // main, master or trunk otherwise.
+        let head = crate::git::git(mirror, &["symbolic-ref", "--short", "HEAD"])
+            .await
+            .ok()
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
+        let branch = match head {
+            Some(b)
+                if crate::git::rev_parse(mirror, &format!("refs/heads/{b}"))
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some() =>
+            {
+                b
+            }
+            _ => match queue::default_branch(mirror).await {
+                Ok(b) => b,
+                Err(_) => {
+                    return crate::git::rev_parse(mirror, &format!("{sha}^"))
+                        .await
+                        .ok()
+                        .flatten()
+                }
+            },
+        };
         let greens = match self.db.green_commits(&repo.id, &branch, 20) {
             Ok(g) => g,
             Err(e) => {

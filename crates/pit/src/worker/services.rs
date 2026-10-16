@@ -57,6 +57,7 @@ pub async fn start(
     worker: &str,
     group_id: &str,
     services: &BTreeMap<String, ServiceDef>,
+    cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Running> {
     let network = format!("pit-{group_id}");
     let label = format!("{LABEL}={worker}");
@@ -66,7 +67,7 @@ pub async fn start(
         containers: vec![],
         ports: vec![],
     };
-    if let Err(e) = start_all(&mut running, &label, group_id, services).await {
+    if let Err(e) = start_all(&mut running, &label, group_id, services, &cancel).await {
         running.stop().await;
         return Err(e);
     }
@@ -78,6 +79,7 @@ async fn start_all(
     label: &str,
     group_id: &str,
     services: &BTreeMap<String, ServiceDef>,
+    cancel: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     for (name, svc) in services {
         let container = format!("pit-{group_id}-{name}");
@@ -102,10 +104,12 @@ async fn start_all(
         args.push(svc.image.clone());
         args.extend(svc.command.iter().cloned());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Recorded first: a `docker run` that fails can still leave the
+        // container behind (created, never started).
+        running.containers.push(container.clone());
         docker(&refs)
             .await
             .with_context(|| format!("starting service {name} ({})", svc.image))?;
-        running.containers.push(container.clone());
         for &port in &svc.ports {
             // "127.0.0.1:49153"
             let mapped = docker(&["port", &container, &format!("{port}/tcp")]).await?;
@@ -117,7 +121,7 @@ async fn start_all(
                 .with_context(|| format!("service {name}: no host port for {port} ({mapped:?})"))?;
             running.ports.push((name.clone(), port, host_port));
         }
-        wait_ready(name, svc, &container, running).await?;
+        wait_ready(name, svc, &container, running, cancel).await?;
     }
     Ok(())
 }
@@ -127,6 +131,7 @@ async fn wait_ready(
     svc: &ServiceDef,
     container: &str,
     running: &Running,
+    cancel: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let started = Instant::now();
     // The published port accepts connections as soon as docker's proxy is
@@ -153,8 +158,26 @@ async fn wait_ready(
             }
         });
     loop {
+        if *cancel.borrow() {
+            bail!("cancelled while service {name} was starting");
+        }
+        // Each check is bounded too: a `ready` that never returns (`sleep
+        // infinity`, a request without a timeout) must not hold the slot.
+        let left = READY_TIMEOUT.saturating_sub(started.elapsed());
         let ready = match (&svc.ready, &target) {
-            (Some(cmd), _) => docker(&["exec", container, "sh", "-c", cmd]).await.is_ok(),
+            (Some(cmd), _) => {
+                let check = Command::new("docker")
+                    .args(["exec", container, "sh", "-c", cmd])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .status();
+                matches!(
+                    tokio::time::timeout(left.min(Duration::from_secs(10)), check).await,
+                    Ok(Ok(s)) if s.success()
+                )
+            }
             (None, Some((host, port))) => tokio::time::timeout(
                 Duration::from_secs(1),
                 tokio::net::TcpStream::connect((host.as_str(), *port)),
