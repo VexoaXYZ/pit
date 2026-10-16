@@ -2131,3 +2131,42 @@ host where no task runs: a same-user task can read the key file or the worker's 
 - **One audience per task.**
 - **Short-lived only from issuance.** Anyone with the API token can create a `pit run` and get a
   `local` token; that is why its `sub` is distinct, so no main-branch policy matches it.
+
+## P39. Every push to a pull request runs CI twice
+
+**Pain.** With both `on: push` and `on: pull_request`, a push to a branch with an open PR fires
+both events for the same commit. Identical runs execute in parallel, double the minutes, and
+clutter the checks list. The fixes each cost something:
+- **Restricting `push` to `main`** loses CI on branches without a PR.
+- **`concurrency` with `head_ref || ref`** cancels one run, and a cancelled run does not satisfy
+  a required check, which can leave the PR unmergeable.
+- **`skip-duplicate-actions`** is another dependency.
+
+Sources: [community#26940](https://github.com/orgs/community/discussions/26940),
+[open-telemetry-python#1370](https://github.com/open-telemetry/opentelemetry-python/issues/1370),
+[oboete#221](https://github.com/ojungo69/oboete/issues/221),
+[personal_website#18](https://github.com/studiobaeric/personal_website/issues/18),
+[jupytext#1041](https://github.com/mwouts/jupytext/pull/1041),
+[coder/boundary#9](https://github.com/coder/boundary/pull/9),
+[DEV](https://dev.to/ace2932/cancel-duplicate-github-actions-runs-with-one-block-and-the-one-place-you-shouldnt-2m3k),
+[wildwolf](https://wildwolf.name/github-actions-how-to-avoid-running-the-same-workflow-multiple-times/),
+[Latenode](https://community.latenode.com/t/prevent-github-actions-from-running-twice-when-pushing-to-branch-with-open-pull-request/25028).
+
+**Reproduction** (`/tmp/painhunt/p39`): a second Pit server (`pit up --addr 127.0.0.1:7171`)
+with a GitHub webhook secret. Signed `push` (branch `feature`) and `pull_request` (`synchronize`,
+PR #7) webhooks are sent back to back for the same commit, which is what GitHub does. The commit
+has `build` (4s) then `test` (3s), and each execution appends a line to `work.log`.
+
+```
+push:          run_dc4b0397b3de     build passed, test passed   (ran)
+pull_request:  run_9a1b62c38fe1     build cached "waited 4.4s for the same task …", test cached "waited 3.1s"
+both finished after 8.7s;  work.log: 1 build, 1 test
+```
+
+Both events still create a run and both report green, so required checks are satisfied and
+nothing is cancelled. But the work happens once. The second run waits for the first's identical
+tasks (P30) and is answered from the cache, so the pair costs one run's compute and wall time,
+with no change to the CI config.
+
+**Verdict: SOLVED** for the cost. The leftover is cosmetic: two runs appear in Pit's run list,
+and the waiting run holds a worker slot while it waits (P30's open point).
