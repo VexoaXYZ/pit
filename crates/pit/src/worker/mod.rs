@@ -8,6 +8,7 @@
 pub mod disk;
 pub mod exec;
 pub mod files;
+pub mod junit;
 pub mod mask;
 
 use std::collections::{HashMap, HashSet};
@@ -883,6 +884,7 @@ impl Worker {
         let mut attempt = 0;
         let outcome = loop {
             attempt += 1;
+            files::clear_outputs(ws, &def.reports)?;
             let (tx, rx) = mpsc::unbounded_channel::<String>();
             let forwarder = tokio::spawn(forward_logs(
                 client.clone(),
@@ -997,6 +999,32 @@ impl Worker {
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "a signal".into())
             ));
+        }
+        // Name the failed tests, from the task's JUnit reports.
+        let reports = files::collect_outputs(ws, &def.reports)?;
+        let paths: Vec<&std::path::PathBuf> = reports.iter().map(|(_, abs)| abs).collect();
+        if let Some(summary) = junit::summarize(&paths) {
+            let text = summary.message();
+            let _ = client
+                .post_empty(
+                    &format!("/api/tasks/{}/log", task.id),
+                    &LogChunk {
+                        text: format!("[pit: {text}]\n"),
+                    },
+                )
+                .await;
+            if !ok && summary.failed() > 0 {
+                message = message.map(|m| format!("{m}; {text}"));
+            }
+        } else if !def.reports.is_empty() {
+            let _ = client
+                .post_empty(
+                    &format!("/api/tasks/{}/log", task.id),
+                    &LogChunk {
+                        text: "[pit: no test report matched `reports`]\n".into(),
+                    },
+                )
+                .await;
         }
         if !ok && def.quarantine {
             message = message.map(|m| format!("quarantined, so this does not fail the run: {m}"));

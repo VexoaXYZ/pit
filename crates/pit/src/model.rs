@@ -76,6 +76,11 @@ pub struct TaskDef {
     /// Globs of files this task produces. Restored from the cache on a hit.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// Globs of JUnit XML reports the task writes (`reports/junit.xml`). A
+    /// failure then names the tests that failed. Old reports are deleted
+    /// before each attempt, so a warm workspace never reports stale results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<String>,
     /// Environment variable names that are passed through and hashed.
     #[serde(default)]
     pub env: Vec<String>,

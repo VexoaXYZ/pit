@@ -1811,3 +1811,41 @@ async fn flaky_tasks_are_reported_and_quarantine_keeps_runs_green() {
         "always failing is broken, not flaky"
     );
 }
+
+/// A task's JUnit reports name the failed tests in its result, and a report
+/// left in the warm workspace by an earlier run is never read again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn junit_reports_name_failed_tests() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let failing = r#"<testsuite><testcase classname="cart" name="adds"/><testcase classname="cart" name="pays"><failure message="card declined"/></testcase></testsuite>"#;
+    let config = |run: String| {
+        serde_json::json!({ "tasks": { "test": { "run": run, "reports": ["out/*.xml"], "cache": false } } })
+            .to_string()
+    };
+    write(dir, ".gitignore", "out/\n");
+    write(
+        dir,
+        "pit.config.json",
+        &config(format!(
+            "mkdir -p out && echo '{failing}' > out/junit.xml && exit 1"
+        )),
+    );
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run(&pit, dir).await;
+    let msg = view.groups[0].tasks[0].message.clone().unwrap_or_default();
+    assert!(
+        msg.contains("1 of 2 tests failed: cart.pays (card declined)"),
+        "{msg}"
+    );
+    // Fails again without writing a report: the old one must not be blamed.
+    write(dir, "pit.config.json", &config("exit 1".into()));
+    sh(dir, "git commit -qam again");
+    let view = run(&pit, dir).await;
+    let msg = view.groups[0].tasks[0].message.clone().unwrap_or_default();
+    assert!(!msg.contains("cart.pays"), "stale report read: {msg}");
+}

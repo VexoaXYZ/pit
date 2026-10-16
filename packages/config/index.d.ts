@@ -67,6 +67,13 @@ export interface TaskDef {
    */
   quarantine?: boolean;
   /**
+   * Globs of JUnit XML reports the task writes, e.g. `["reports/*.xml"]`
+   * (Jest, Vitest, `node --test`, pytest, Go via gotestsum, JUnit,
+   * cargo-nextest). A failure then names the failed tests. Old reports are
+   * deleted before each attempt.
+   */
+  reports?: string[];
+  /**
    * Split the task into this many shards, each in its own group so they spread
    * across workers. Each gets `PIT_SHARD` (1-based) and `PIT_SHARD_COUNT`:
    * `vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`. The task's deps run in every

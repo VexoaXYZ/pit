@@ -1825,3 +1825,51 @@ and an always-failing quarantined task that is reported as broken, not flaky.
 - **Task-level only.** A task is usually a whole test suite, so this names `test-web`, not the
   one test inside it. Per-test tracking would need JUnit output parsing.
 - **Manual quarantine.** Nothing quarantines automatically or lifts it after N clean days.
+
+## P34. "Exited with 1": finding the failed test means reading the log
+
+**Pain.** A failed test job on GitHub Actions shows a red step and its log. Finding which test
+failed means scrolling the runner's output. The usual fix is a third-party action that parses
+JUnit XML into a check run or job summary: `dorny/test-reporter` or `mikepenz/action-junit-report`.
+Each needs `if: always()` (or it is skipped exactly when tests fail), `checks: write`
+permission, and a separate `workflow_run` workflow for pull requests from forks
+([dorny/test-reporter](https://github.com/dorny/test-reporter),
+[action-junit-report](https://github.com/marketplace/actions/junit-report-action),
+[zendesk fork](https://github.com/zendesk/action-junit-report),
+[dev.tools](https://dev.tools/blog/junit-reports-for-api-tests-make-github-actions-show-failures-cleanly/),
+[Octopus](https://octopus.com/blog/githubactions-running-unit-tests),
+[DZone](https://dzone.com/articles/running-unit-tests-in-github-actions),
+[CI Cube](https://cicube.io/workflow-hub/dorny-test-reporter/)).
+
+**Before** (research/pain-hunt at P33): Pit said "exited with 1". P16's error excerpt helps, but
+it guesses from keywords; it does not know which tests failed.
+
+**Reproduction** (`/tmp/painhunt/p34`): 42 `node --test` tests, two of them failing, with Node's
+JUnit reporter writing `reports/junit.xml`.
+
+```
+without `reports`:  ✗ default.test: exited with 1                    (82 log lines to read)
+with `reports`:     ✗ default.test: exited with 1; 2 of 42 tests failed:
+                      test.cart applies coupons (90 == 80);
+                      test.cart checks out (Cannot read properties of undefined (reading 'pay'))
+after the fix:      ✓ test   log: [pit: 42 tests passed]
+```
+
+**Fix** (research/pain-hunt): a `reports` field on a task (JUnit XML globs).
+- **Before each attempt** the worker deletes matching files. Reports usually live in ignored
+  directories, which survive in warm workspaces, so an old failure must not be reported again.
+- **After the run** it parses the reports with `quick-xml` (new dependency), counting test
+  cases, failures, errors and skips. The failed tests and the first line of each message are
+  appended to the failure message, which the CLI, dashboard, GitHub and MCP agents (P16) all
+  show. A passing run logs the count.
+
+Covered by unit tests (`names_the_failed_tests`, `a_clean_report_and_garbage`) and the e2e test
+`junit_reports_name_failed_tests`, which includes the stale-report case. Writing the e2e test
+caught a parser bug: self-closing `<failure message="…"/>` elements were dropped.
+
+**Verdict: SOLVED** for naming failed tests, from any runner that writes JUnit XML. Not done:
+- **No line annotations.** There are no file and line annotations on GitHub check runs.
+- **Task-level flakiness.** `pit flaky` (P33) still works per task, not per test.
+- **Wrong runner arguments show up as wrong reports.** A misconfigured runner produces a
+  misleading report. On the way, `node --test test/` with Node 22 treated the directory as one
+  file, and the report said "1 of 1 tests failed".
