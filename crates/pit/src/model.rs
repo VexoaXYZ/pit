@@ -329,6 +329,10 @@ pub struct Job {
     /// See `CreateRun::debug`.
     #[serde(default)]
     pub debug: bool,
+    /// What `affected` tools diff against (`PIT_BASE_SHA`); see
+    /// `App::base_commit`.
+    #[serde(default)]
+    pub base_sha: Option<String>,
     pub tasks: Vec<JobTask>,
 }
 

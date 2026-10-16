@@ -2936,3 +2936,65 @@ Other details:
   - No `depends_on` between services: they start in name order, each waiting until ready.
   - Service `env` values appear in `docker run`'s arguments, visible to `ps` on the worker.
   - No health status beyond `ready`.
+
+## P49. `nx affected` in CI: full history, a base commit, and an action to find it
+
+**The pain.**
+- Affected-only tools (`nx affected`, `turbo --affected`) diff against a base commit.
+- On GitHub that needs `fetch-depth: 0`, or the base isn't in a shallow clone ("Unable to find
+  base SHA", "bad object") ([latchkey](https://latchkey.dev/learn/monorepo-tools/nx-affected-base-sha-not-found-in-ci)).
+- It also needs an action to choose the base: Nx recommends the last commit on main whose CI
+  passed, found through the API by [nrwl/nx-set-shas](https://github.com/nrwl/nx-set-shas)
+  ([Nx docs](https://nx.dev/docs/features/ci-features/affected)), plus forks
+  ([step-security](https://github.com/step-security/nx-set-shas),
+  [postmanlabs](https://github.com/postmanlabs/nx-set-shas),
+  [LayZeeDK](https://github.com/LayZeeDK/nrwl-nx-set-shas)).
+- It goes wrong:
+  - [nx-set-shas#219](https://github.com/nrwl/nx-set-shas/issues/219) sometimes picks a
+    month-old base and marks the whole repo affected;
+  - [dmr.is#1520](https://github.com/DMR-is/dmr.is/pull/1520) replaced the action with its own
+    logic, and notes how `cancel-in-progress` interferes with "last successful run";
+  - the Aviator write-up covers partial-clone workarounds for big repos
+    ([Aviator](https://www.aviator.co/blog/monorepos-mergequeue-nx/),
+    [techplained](https://www.techplained.com/monorepo-ci-pipeline)).
+
+**Reproduction.** A repo with three commits on main and a feature branch; the task prints its
+history depth and any base. Before:
+
+```
+affected │ history=5 base=none nx=none
+affected │ changed:apps/web/a.txt   (git diff HEAD~1...HEAD, the only fallback)
+```
+
+The history was already complete (workspaces are clones of the worker's full mirror), so there
+was no `fetch-depth` problem. But Pit gave tasks no base, so a tool fell back to `HEAD~1` and
+missed every earlier commit of a multi-commit branch.
+
+**Fix.** At planning, the server picks the base and stores it on the run (`runs.base_sha`):
+- the newest commit of the default branch whose trusted run passed and that is an ancestor of
+  this commit (`nx-set-shas`' rule);
+- otherwise the merge-base with the default branch;
+- on the default branch itself, the commit's parent.
+
+Tasks get it as `PIT_BASE_SHA`, `NX_BASE` and `TURBO_SCM_BASE`, and the head as `NX_HEAD` and
+`TURBO_SCM_HEAD`. A task whose command mentions those names or `affected` has the base in its
+cache key. Otherwise a run on the same files with a different base could replay a result that
+tested fewer projects.
+
+A bug found on the way: the first version's query used the wrong column name, and the error was
+swallowed, so every run silently got no base (the fallback never ran). Now the history lookup
+logs its error and falls through to the merge-base.
+
+**Measured.**
+- The repro now prints `base=9af1fd7f… nx=9af1fd7f…`, the feature branch's fork point.
+- e2e `tasks_get_the_last_green_commit_as_their_base`, with trusted runs on main:
+  - c1 green, c2 red, c3 green;
+  - c3's base is c1: the red c2 is skipped, where `HEAD~1` would have used c2;
+  - a two-commit feature branch off c3 gets c3, and its diff from the base lists both commits'
+    files (`c.txt d.txt`).
+- Not tested: the base-in-cache-key rule.
+
+**Verdict: SOLVED** for picking the base: no history settings and no action. `cancel-in-progress`
+can't interfere, because superseded runs never count as green. Caveat: the base comes from Pit's
+own trusted runs. A repo whose main runs elsewhere (or not on Pit yet) gets the merge-base
+fallback until its first green trusted run on Pit.

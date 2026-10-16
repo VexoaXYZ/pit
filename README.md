@@ -126,6 +126,17 @@ Inputs come from declared dependencies. A package that reads another without lis
 in `package.json` needs that directory added by hand, or a change there will be a cache hit.
 [`bench/t3code.packages.pit.config.ts`](bench/t3code.packages.pit.config.ts) is a full example.
 
+### Affected-only tools (`nx affected`, `turbo --affected`)
+
+Every task gets `PIT_BASE_SHA`, also exported as `NX_BASE` and `TURBO_SCM_BASE` (with `NX_HEAD` and
+`TURBO_SCM_HEAD` set to the commit), so `nx affected -t test` works with no setup. The base is the
+one `nrwl/nx-set-shas` would pick: the newest commit of the default branch whose trusted run
+passed and that this commit contains (a red commit is skipped). Without one, it's where the commit
+left the default branch, or its parent on the default branch. Workspaces have the full history
+(they are clones of the worker's mirror), so there is no `fetch-depth: 0` to remember. A task whose
+command mentions the base or `affected` has the base in its cache key, so a cached result from a
+different base is never replayed.
+
 ### Shared resources
 
 `lock: "staging-db"` on a group makes groups with that lock run one at a time, across every run

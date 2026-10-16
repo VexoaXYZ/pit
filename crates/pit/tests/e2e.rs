@@ -2947,3 +2947,102 @@ async fn groups_get_their_own_service_containers() {
     );
     assert!(left.trim().is_empty(), "left behind: {left}");
 }
+
+/// Tasks get the commit to diff against for `nx affected` and friends
+/// (`PIT_BASE_SHA`, `NX_BASE`, `TURBO_SCM_BASE`): the newest commit of the
+/// default branch whose trusted run passed and that the run's commit
+/// contains, skipping a red one, as `nx-set-shas` does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tasks_get_the_last_green_commit_as_their_base() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    let out = tmp.path().join("bases");
+    std::fs::create_dir_all(&out).unwrap();
+    let config = serde_json::json!({ "tasks": { "affected": {
+        "run": format!(
+            "echo \"$NX_BASE $(git diff --name-only $PIT_BASE_SHA...HEAD | sort | tr '\\n' ' ')\" > {}/$PIT_SHA; test ! -f red",
+            out.display()
+        ),
+        "cache": false,
+    } } });
+    write(&work, "pit.config.json", &config.to_string());
+    write(&work, "a.txt", "1\n");
+    sh(&work, "git init -q -b main && git add -A && git commit -qm c1 && git remote add origin ../origin.git && git push -q origin main");
+    let url = tmp.path().join("origin.git").to_string_lossy().to_string();
+    let head = || sh(&work, "git rev-parse HEAD").trim().to_string();
+    let c1 = head();
+    assert_eq!(
+        run_ref(&pit, &url, c1.clone(), "main", true).await.status,
+        Status::Passed
+    );
+    // c2 is red.
+    sh(
+        &work,
+        "touch red && git add -A && git commit -qm c2 && git push -q origin main",
+    );
+    let c2 = head();
+    assert_eq!(
+        run_ref(&pit, &url, c2.clone(), "main", true).await.status,
+        Status::Failed
+    );
+    sh(&work, "git rm -q red && echo 2 > b.txt && git add -A && git commit -qm c3 && git push -q origin main");
+    let c3 = head();
+    assert_eq!(
+        run_ref(&pit, &url, c3.clone(), "main", true).await.status,
+        Status::Passed
+    );
+    let seen = |sha: &str| {
+        std::fs::read_to_string(out.join(sha))
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    // The red c2 is skipped: c3 is compared with c1, not its parent. (`red`,
+    // added in c2 and removed in c3, nets out.)
+    assert_eq!(seen(&c3), format!("{c1} b.txt"));
+    // A two-commit branch off c3 is compared with c3, both commits included.
+    sh(&work, "git checkout -q -b feature && echo x > c.txt && git add -A && git commit -qm f1 && echo y > d.txt && git add -A && git commit -qm f2 && git push -q origin feature");
+    let f = head();
+    assert_eq!(
+        run_ref(&pit, &url, f.clone(), "feature", false)
+            .await
+            .status,
+        Status::Passed
+    );
+    assert_eq!(seen(&f), format!("{c3} c.txt d.txt"));
+}
+
+/// Starts a run of a pushed commit the way a webhook does, and waits for it.
+async fn run_ref(pit: &Pit, url: &str, sha: String, git_ref: &str, trusted: bool) -> RunView {
+    let id = pit
+        .app
+        .create_run(
+            CreateRun {
+                repo: "affected".into(),
+                url: Some(url.into()),
+                sha,
+                overlay: None,
+                tasks: vec![],
+                trigger: Some("push".into()),
+                git_ref: Some(git_ref.into()),
+                no_cache: false,
+                fresh: false,
+                debug: false,
+                no_secrets: false,
+                trusted,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&pit.client, &id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}

@@ -341,6 +341,38 @@ impl App {
         Ok(run_id)
     }
 
+    /// The commit tasks diff against to find what changed (`nx affected`,
+    /// `turbo --affected`), as `nrwl/nx-set-shas` picks it: the newest
+    /// commit of the default branch whose trusted run passed and that this
+    /// commit contains. Otherwise where this commit left the default branch,
+    /// or, on the default branch itself, its parent.
+    async fn base_commit(&self, mirror: &Path, repo: &db::Repo, sha: &str) -> Option<String> {
+        let branch = queue::default_branch(mirror).await.ok()?;
+        let greens = match self.db.green_commits(&repo.id, &branch, 20) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("finding the last green commit: {e:#}");
+                vec![]
+            }
+        };
+        for green in greens {
+            if green != sha && crate::git::is_ancestor(mirror, &green, sha).await {
+                return Some(green);
+            }
+        }
+        let fork_point = crate::git::merge_base(mirror, sha, &format!("refs/heads/{branch}"))
+            .await
+            .ok()
+            .flatten()?;
+        if fork_point != sha {
+            return Some(fork_point);
+        }
+        crate::git::rev_parse(mirror, &format!("{sha}^"))
+            .await
+            .ok()
+            .flatten()
+    }
+
     async fn plan_run(
         self: &Arc<Self>,
         run_id: &str,
@@ -350,6 +382,9 @@ impl App {
         let t0 = std::time::Instant::now();
         let mirror = self.ensure_commit(repo, &req.sha).await?;
         let t_commit = t0.elapsed();
+        if let Some(base) = self.base_commit(&mirror, repo, &req.sha).await {
+            self.db.set_run_base(run_id, &base)?;
+        }
         let overlay = req
             .overlay
             .as_deref()

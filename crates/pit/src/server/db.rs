@@ -204,6 +204,7 @@ pub struct RunRow {
     pub fresh: bool,
     pub no_secrets: bool,
     pub debug: bool,
+    pub base_sha: Option<String>,
 }
 
 pub struct WaitingGroup {
@@ -298,6 +299,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_fresh {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0")?;
     }
+    let has_base: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'base_sha'")?
+        .exists([])?;
+    if !has_base {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN base_sha TEXT")?;
+    }
     let has_annotations: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'annotations'")?
         .exists([])?;
@@ -386,6 +393,7 @@ fn run_row(r: &Row) -> rusqlite::Result<RunRow> {
         trusted: r.get::<_, i64>("trusted")? != 0,
         fresh: r.get::<_, i64>("fresh")? != 0,
         debug: r.get::<_, i64>("debug")? != 0,
+        base_sha: r.get("base_sha")?,
         no_secrets: r.get::<_, i64>("no_secrets")? != 0,
     })
 }
@@ -883,6 +891,7 @@ impl Db {
             fresh: run.fresh,
             no_secrets: run.no_secrets,
             debug: run.debug,
+            base_sha: run.base_sha,
             tasks,
         };
         Ok((Some(job), held))
@@ -1307,6 +1316,28 @@ impl Db {
             .lock()
             .execute("UPDATE runs SET no_secrets = 1 WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    pub fn set_run_base(&self, id: &str, base: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE runs SET base_sha = ?2 WHERE id = ?1",
+            params![id, base],
+        )?;
+        Ok(())
+    }
+
+    /// Commits of `branch` whose trusted run passed, newest first.
+    pub fn green_commits(&self, repo_id: &str, branch: &str, limit: usize) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT sha FROM runs WHERE repo_id = ?1 AND ref = ?2 AND trusted = 1
+               AND status = 'passed' AND overlay IS NULL
+             ORDER BY created_at DESC LIMIT ?3",
+        )?;
+        let rows = st
+            .query_map(params![repo_id, branch, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     pub fn set_run_debug(&self, id: &str) -> Result<()> {

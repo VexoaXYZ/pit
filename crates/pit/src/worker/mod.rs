@@ -1084,11 +1084,19 @@ impl Worker {
             ("PIT_RUN_ID".into(), job.run_id.clone()),
             ("PIT_SHA".into(), job.sha.clone()),
             ("PIT_SHARD".into(), def.shard.unwrap_or(1).to_string()),
+            // The same names `nx-set-shas` and Turborepo use.
+            ("NX_HEAD".into(), job.sha.clone()),
+            ("TURBO_SCM_HEAD".into(), job.sha.clone()),
             (
                 "PIT_SHARD_COUNT".into(),
                 def.shards.unwrap_or(1).to_string(),
             ),
         ];
+        if let Some(base) = &job.base_sha {
+            for k in ["PIT_BASE_SHA", "NX_BASE", "TURBO_SCM_BASE"] {
+                env.push((k.into(), base.clone()));
+            }
+        }
         // One file per line, so names with spaces survive `xargs -d '\n'`.
         // The whole list is always in a file too: a big suite's list can be
         // more than the OS lets a process environment hold.
@@ -1495,6 +1503,15 @@ impl Worker {
                 }
             };
             out.insert(format!("{}{image}", crate::graph::IMAGE_INPUT), id);
+        }
+        // `nx affected` on the same files does different work against a
+        // different base: a task that uses the base keys on it, or a cache
+        // hit could replay a run that tested fewer projects.
+        let uses_base = ["PIT_BASE_SHA", "NX_BASE", "TURBO_SCM_BASE", "affected"]
+            .iter()
+            .any(|w| def.run.contains(w));
+        if let (true, Some(base)) = (uses_base, &job.base_sha) {
+            out.insert("affected base".into(), base.clone());
         }
         // A test's result depends on the database it ran against: each
         // service's image (by ID), command and variables are inputs too.
