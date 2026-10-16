@@ -2046,3 +2046,78 @@ async fn a_change_batched_into_a_removed_one_still_lands() {
     .unwrap_or_else(|_| panic!("queue did not settle"));
     assert_eq!(entries[0].status, "landed", "{entries:?}");
 }
+
+/// A task asks for an OIDC token and gets one a cloud would accept: signed
+/// with the key at the server's public JWKS, for its audience, with claims
+/// from the run. Without a live job lease there is no token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tasks_get_verifiable_oidc_tokens() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let out = dir
+        .join("..")
+        .join(format!("oidc-{}.jwt", std::process::id()));
+    let config = serde_json::json!({ "tasks": { "deploy": {
+        "run": format!("printf %s \"$PIT_OIDC_TOKEN\" > {}; echo token: $PIT_OIDC_TOKEN", out.display()),
+        "oidc": "sts.amazonaws.com",
+        "cache": false,
+    } } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run(&pit, dir).await;
+    assert_eq!(view.status, Status::Passed, "{view:?}");
+    let token = std::fs::read_to_string(&out).unwrap();
+    assert!(token.split('.').count() == 3, "{token}");
+
+    // Verify the way a cloud does: discovery, then the JWKS, then the token.
+    let base = pit.client.base.clone();
+    let http = reqwest::Client::new();
+    let discovery: serde_json::Value = http
+        .get(format!("{base}/.well-known/openid-configuration"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(discovery["issuer"], base);
+    let jwks: jsonwebtoken::jwk::JwkSet = http
+        .get(discovery["jwks_uri"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let key = jsonwebtoken::DecodingKey::from_jwk(&jwks.keys[0]).unwrap();
+    let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+    v.set_audience(&["sts.amazonaws.com"]);
+    v.set_issuer(&[base.as_str()]);
+    let claims = jsonwebtoken::decode::<serde_json::Value>(&token, &key, &v)
+        .unwrap()
+        .claims;
+    assert_eq!(claims["sub"], format!("repo:{}:local:main", view.repo));
+    assert_eq!(claims["trusted"], false);
+    assert_eq!(claims["sha"], view.sha);
+
+    // The token never shows in the log.
+    let log: String = pit
+        .client
+        .get_text(&format!("/api/runs/{}/tasks/deploy/log", view.id))
+        .await
+        .unwrap();
+    assert!(log.contains("token: ***") && !log.contains(&token), "{log}");
+
+    // No lease, no token.
+    let denied = http
+        .post(format!("{base}/api/oidc/token"))
+        .json(&serde_json::json!({ "audience": "sts.amazonaws.com" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+}

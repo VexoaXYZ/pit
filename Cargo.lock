@@ -1166,6 +1166,7 @@ dependencies = [
  "parking_lot",
  "quick-xml",
  "reqwest",
+ "ring",
  "rusqlite",
  "rust-embed",
  "serde",

@@ -74,6 +74,12 @@ export interface TaskDef {
    */
   reports?: string[];
   /**
+   * An OIDC audience, e.g. `"sts.amazonaws.com"`. The task gets a 10-minute
+   * token signed by the Pit server in `PIT_OIDC_TOKEN`, to trade for cloud
+   * credentials instead of storing keys. Never given to fork pull requests.
+   */
+  oidc?: string;
+  /**
    * Split the task into this many shards, each in its own group so they spread
    * across workers. Each gets `PIT_SHARD` (1-based) and `PIT_SHARD_COUNT`:
    * `vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`. The task's deps run in every

@@ -250,6 +250,27 @@ token exported there can be read by any task, declared or not. Put secrets in
 reach only tasks that list them in `secrets`. On the `host` backend a task still runs as the
 worker's user and could read the file itself, so run untrusted code in `docker`.
 
+## Cloud credentials (OIDC)
+
+A task with `oidc: "sts.amazonaws.com"` gets a 10-minute token in `PIT_OIDC_TOKEN`, signed by the
+server, to trade for cloud credentials instead of storing access keys. The server is the OIDC
+issuer. Its keys are at `<PIT_PUBLIC_URL>/.well-known/openid-configuration` and
+`/.well-known/jwks.json`, which a cloud must be able to reach over HTTPS. Tokens are issued only
+to a running job, with claims taken from the run, and never to pull requests from forks.
+
+| Claim | Value |
+| --- | --- |
+| `sub` | `repo:<repo>:ref:refs/heads/<branch>` for trusted branch runs (pushes to the default branch, post-merge, schedules); `repo:<repo>:merge_queue:<branch>`, `repo:<repo>:pull_request`, `repo:<repo>:local:<branch>` otherwise |
+| `trusted`, `trigger`, `repo`, `ref`, `sha`, `run_id` | From the run |
+
+Match on `sub` exactly, and on `aud`, as you would for GitHub: a policy for
+`repo:acme/app:ref:refs/heads/main` never matches a pull request or a `pit run`.
+
+```sh
+# AWS: the SDKs read the token from a file
+echo "$PIT_OIDC_TOKEN" > /tmp/oidc && AWS_ROLE_ARN=arn:aws:iam::123456789012:role/deploy AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/oidc aws sts get-caller-identity
+```
+
 ## Notifications
 
 `pit server --notify-url https://hooks.slack.com/services/…` (or `PIT_NOTIFY_URL`) posts

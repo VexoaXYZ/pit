@@ -67,6 +67,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/cache/failed/{key}", get(cache_failed))
         .route("/api/cache/{key}/claim", post(cache_claim))
         .route("/api/flaky", get(flaky))
+        .route("/api/oidc/token", post(oidc_token))
+        .route("/.well-known/openid-configuration", get(oidc_discovery))
+        .route("/.well-known/jwks.json", get(oidc_jwks))
         .route("/api/gc", post(gc_now))
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
@@ -97,7 +100,12 @@ async fn auth(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if req.uri().path() == "/api/health" || app.authorized(header, q.token.as_deref()) {
+    // OIDC discovery and keys are public: clouds fetch them to verify tokens.
+    let path = req.uri().path();
+    if path == "/api/health"
+        || path.starts_with("/.well-known/")
+        || app.authorized(header, q.token.as_deref())
+    {
         next.run(req).await
     } else {
         (
@@ -575,6 +583,62 @@ async fn cache_last(
             anyhow::anyhow!("previous result was evicted"),
         )
     })
+}
+
+async fn oidc_discovery(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    Json(app.oidc.discovery(&app.public_url))
+}
+
+async fn oidc_jwks(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    Json(app.oidc.jwks())
+}
+
+#[derive(Deserialize)]
+struct OidcRequest {
+    audience: String,
+}
+
+/// `POST /api/oidc/token`: a token for the job holding this lease. The
+/// claims come from the run as the server recorded it, never from the
+/// request; fork pull requests get none.
+async fn oidc_token(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(req): Json<OidcRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let forbidden = |m: &str| ApiError(StatusCode::FORBIDDEN, anyhow::anyhow!("{m}"));
+    let run_id = match lease(&headers) {
+        Some(l) => app.db.lease_run(l)?,
+        None => None,
+    }
+    .ok_or_else(|| forbidden("OIDC tokens are only issued to a running job"))?;
+    let run = app.db.run(&run_id)?;
+    if run.no_secrets {
+        return Err(forbidden("pull requests from forks get no OIDC token"));
+    }
+    if req.audience.is_empty() {
+        return Err(anyhow::anyhow!("audience is required").into());
+    }
+    let repo = app.db.repo(&run.repo_id)?.name;
+    let now = crate::model::now_ms() / 1000;
+    let claims = serde_json::json!({
+        "iss": app.public_url,
+        "aud": req.audience,
+        "sub": super::oidc::subject(&repo, &run.trigger, run.git_ref.as_deref(), run.trusted),
+        "iat": now,
+        "nbf": now - 5,
+        "exp": now + super::oidc::TOKEN_SECS,
+        "jti": crate::model::new_id("jwt"),
+        "repo": repo,
+        "ref": run.git_ref,
+        "sha": run.sha,
+        "run_id": run_id,
+        "trigger": run.trigger,
+        "trusted": run.trusted,
+    });
+    Ok(Json(
+        serde_json::json!({ "token": app.oidc.sign(&claims)? }),
+    ))
 }
 
 #[derive(Deserialize)]

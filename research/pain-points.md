@@ -2038,3 +2038,57 @@ Unit test `a_moved_image_tag_changes_the_key`.
   results apart, but tests can still behave differently per worker.
 - **One-time cache miss.** Existing cached results of `docker` tasks miss once after upgrading,
   because the key now includes the image.
+
+## P38. Long-lived cloud keys stored as CI secrets
+
+**Pain.** CI that deploys needs cloud credentials. Stored access keys (`AKIA…` in CI secrets)
+never expire and leak (P13, P31, tj-actions). GitHub Actions replaced them with OIDC: each job
+gets a short-lived token signed by GitHub, and AWS, GCP and Azure trade it for temporary
+credentials after checking `aud` and `sub` (`repo:org/repo:ref:refs/heads/main`) against a trust
+policy. Policies that skip `sub`, or wildcard it, let other repositories assume the role
+([OneUptime](https://oneuptime.com/blog/post/2026-02-02-github-actions-oidc-aws/view),
+[aloknecessary](https://aloknecessary.in/blogs/github-actions-oidc/),
+[haitmg](https://haitmg.pl/blog/github-actions-oidc-aws-backdoor/),
+[cloudupload](https://cloudupload.tech/blog/hardening-github-actions-oidc),
+[classmethod](https://dev.classmethod.jp/en/articles/aws-sts-oidc-github-google-circleci-oci/),
+[Skyscanner sample](https://github.com/Skyscanner/gha-aws-oidc-sample)). A self-hosted CI
+without an issuer is back to stored keys.
+
+**Before** (research/pain-hunt at P37): Pit had no token issuer. The only way to the cloud
+was a stored key in `--secrets-file` (P31). **NOT SOLVED.**
+
+**Fix** (research/pain-hunt): the server is an OIDC issuer.
+- **Key and discovery.** An ES256 (P-256) key is generated on first start with `ring` and kept
+  in the data dir with mode 0600. It is published at `/.well-known/openid-configuration` and
+  `/.well-known/jwks.json`, which bypass API auth because clouds fetch them.
+- **Token endpoint.** `POST /api/oidc/token` signs a 10-minute token only for the holder of a
+  live job lease, with claims taken from the run as the server recorded it: `sub` in GitHub's
+  shape for trusted branch runs and distinct shapes for queue, PR and local runs, plus
+  `trusted`, `trigger`, `repo`, `ref`, `sha` and `run_id`.
+- **Forks.** Fork pull requests (P31) get 403.
+- **Tasks.** A task opts in with `oidc: "<audience>"` and gets `PIT_OIDC_TOKEN`, masked in logs.
+
+**Live** (`/tmp/painhunt/p38`):
+
+```
+GET /.well-known/jwks.json → {"keys":[{"alg":"ES256","crv":"P-256","kid":"e117ab36561b9515","kty":"EC",…}]}
+key file: -rw------- oidc-es256.p8
+deploy │ raw: ***                                   (the token itself is masked)
+deploy │ {"aud":"sts.amazonaws.com","exp":…,"iss":"http://127.0.0.1:7070","ref":"main","repo":"app-bb135f",
+          "sub":"repo:app-bb135f:local:main","trigger":"local","trusted":false,…}
+```
+
+Covered by unit tests (`signs_tokens_that_verify_against_the_published_key`, where another
+audience is rejected and the key survives a restart, and `subjects_keep_main_apart_from_everything_else`)
+and the e2e test `tasks_get_verifiable_oidc_tokens`. That test verifies the token the way a cloud
+does: discovery, then JWKS, then an ES256 signature check with audience and issuer, then the
+claims. It also checks the token is masked in the log and that there is a 403 without a lease.
+
+**Verdict: PARTIAL.** Issuance is complete and standards-shaped, but it was **not tested against
+a real cloud provider** from this machine. A cloud also needs the issuer at a public HTTPS URL
+(`PIT_PUBLIC_URL` behind TLS). Not done:
+- **No token refresh.** Tasks longer than 10 minutes that need fresh credentials get no new
+  token.
+- **One audience per task.**
+- **Short-lived only from issuance.** Anyone with the API token can create a `pit run` and get a
+  `local` token; that is why its `sub` is distinct, so no main-branch policy matches it.

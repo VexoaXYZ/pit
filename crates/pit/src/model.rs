@@ -94,6 +94,11 @@ pub struct TaskDef {
     /// rotating one does not invalidate cached results.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// An audience (`sts.amazonaws.com`): the task gets a short-lived OIDC
+    /// token for it in `PIT_OIDC_TOKEN`, signed by the server, to trade for
+    /// cloud credentials instead of storing keys. See `server::oidc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<String>,
     #[serde(default)]
     pub cache: CacheMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -6,6 +6,7 @@ pub mod db;
 pub mod gc;
 pub mod github;
 pub mod notify;
+pub mod oidc;
 pub mod queue;
 pub mod remote_cache;
 pub mod resolve;
@@ -55,6 +56,8 @@ pub struct App {
     pub inflight: parking_lot::Mutex<HashMap<String, String>>,
     /// The last minute `schedule::tick` evaluated.
     pub schedule_minute: parking_lot::Mutex<Option<i64>>,
+    /// Signs OIDC tokens for tasks.
+    pub oidc: oidc::Issuer,
 }
 
 pub struct ServerOpts {
@@ -105,6 +108,7 @@ impl App {
             notify_url: Default::default(),
             inflight: Default::default(),
             schedule_minute: Default::default(),
+            oidc: oidc::Issuer::load_or_create(data_dir)?,
             gc_grace_ms: AtomicU64::new(2 * 60 * 1000),
             evicted_entries: AtomicU64::new(0),
             freed_bytes: AtomicU64::new(0),

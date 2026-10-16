@@ -870,6 +870,19 @@ impl Worker {
                 )
                 .await;
         }
+        // A short-lived OIDC token for the cloud the task talks to.
+        if let (Some(audience), false) = (&def.oidc, job.no_secrets) {
+            let token: serde_json::Value = client
+                .post(
+                    "/api/oidc/token",
+                    &serde_json::json!({ "audience": audience }),
+                )
+                .await
+                .context("requesting an OIDC token")?;
+            let token = token["token"].as_str().unwrap_or_default().to_string();
+            secret_values.push(token.clone());
+            env.push(("PIT_OIDC_TOKEN".into(), token));
+        }
         let policy = exec::EnvPolicy {
             hide: self.secrets.keys().cloned().collect(),
             minimal: job.no_secrets,

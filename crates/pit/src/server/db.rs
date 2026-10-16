@@ -1193,6 +1193,19 @@ impl Db {
 
     /// Whether the group holding this live lease belongs to a trusted run;
     /// `None` if no running group holds it.
+    /// The run of the group holding this live lease.
+    pub fn lease_run(&self, lease: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT run_id FROM groups_ WHERE lease = ?1 AND status = 'running'",
+                params![lease],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn lease_trust(&self, lease: &str) -> Result<Option<bool>> {
         Ok(self
             .conn
