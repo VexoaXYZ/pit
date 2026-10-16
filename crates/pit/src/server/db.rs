@@ -946,10 +946,24 @@ impl Db {
         Ok(ids)
     }
 
-    /// Cancels a run: it ends `failed` with message `cancelled` at once, and
-    /// its unclaimed groups are skipped. Groups already running finish on
-    /// their workers, but their results no longer change the run. Returns
-    /// whether the run was still active.
+    /// Hands a running group back to the queue at once: its worker is
+    /// shutting down and will not finish it. False if the lease is not live.
+    pub fn requeue_group(&self, id: &str, lease: &str) -> Result<bool> {
+        let c = self.conn.lock();
+        let n = c.execute(
+            "UPDATE groups_ SET status = 'queued', worker = NULL, started_at = NULL, lease = NULL
+             WHERE id = ?1 AND lease = ?2 AND status = 'running'",
+            params![id, lease],
+        )?;
+        if n > 0 {
+            c.execute(
+                "UPDATE tasks SET status = 'queued', started_at = NULL WHERE group_id = ?1 AND status = 'running'",
+                params![id],
+            )?;
+        }
+        Ok(n > 0)
+    }
+
     /// Whether no worker has picked up any part of the run yet.
     pub fn run_untouched(&self, run_id: &str) -> Result<bool> {
         Ok(!self
@@ -959,6 +973,10 @@ impl Db {
             .exists(params![run_id])?)
     }
 
+    /// Cancels a run: it ends `failed` with message `cancelled` at once, and
+    /// its unclaimed groups are skipped. Groups already running finish on
+    /// their workers, but their results no longer change the run. Returns
+    /// whether the run was still active.
     pub fn cancel_run(&self, run_id: &str) -> Result<bool> {
         self.cancel_run_because(run_id, "cancelled")
     }
@@ -1235,6 +1253,31 @@ impl Db {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Queued groups of active runs per OS: count and when the oldest was
+    /// created. What an autoscaler needs.
+    pub fn queue_depth(&self) -> Result<Vec<(String, i64, i64)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT groups_.os, COUNT(*), MIN(groups_.created_at) FROM groups_
+             JOIN runs ON runs.id = groups_.run_id
+             WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
+             GROUP BY groups_.os ORDER BY groups_.os",
+        )?;
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Groups running now.
+    pub fn running_groups(&self) -> Result<i64> {
+        Ok(self.conn.lock().query_row(
+            "SELECT COUNT(*) FROM groups_ WHERE status = 'running'",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// The run of the group holding this live lease.
@@ -1775,6 +1818,37 @@ mod tests {
         assert_eq!(db.notify_state("k").unwrap(), Some(("passed".into(), 200)));
         db.record_notify_state("k", "failed", 300).unwrap();
         assert_eq!(db.notify_state("k").unwrap(), Some(("failed".into(), 300)));
+    }
+
+    #[test]
+    fn a_released_group_is_queued_again_at_once() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = db
+            .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
+            .unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let g = db.insert_group(&run, "g", "linux", &[], &task).unwrap();
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+        };
+        let job = db.claim_group(&worker).unwrap().0.unwrap();
+        assert!(!db.requeue_group(&g, "not-the-lease").unwrap());
+        assert!(db.requeue_group(&g, &job.lease).unwrap());
+        // The old lease is dead; the group can be claimed again right away.
+        assert!(!db.heartbeat_group(&g, Some(&job.lease)).unwrap());
+        assert_eq!(db.claim_group(&worker).unwrap().0.unwrap().group_id, g);
     }
 
     #[test]

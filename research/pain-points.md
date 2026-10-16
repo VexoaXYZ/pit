@@ -2225,3 +2225,57 @@ about 4.5s after one learning run. Not done:
 - **Shard count.** Pit does not choose the number of shards.
 - **Granularity.** Splitting is per file, so one huge file is still indivisible.
 - **One cold run.** The first run of a new task has no data and splits as evenly as it can.
+
+## P41. Autoscaling self-hosted runners: no signal to scale on, and scale-downs kill jobs
+
+**Pain.** Self-hosted fleets either idle (cost) or queue at peak, so teams run Actions Runner
+Controller or custom scalers. Those need tuning (`minRunners`, `maxRunners`) and on-call care,
+and the recommended signal is queue time
+([tenki](https://tenki.cloud/blog/self-hosted-runners-arc-security-guide),
+[devopskit](https://devopskit.in/blog/github-actions-runner-cost-optimization/),
+[resumelens](https://www.resumelens.org/blog/github/github-self-hosted-runners),
+[instadevops](https://instadevops.com/blog/github-actions-self-hosted-runners-guide/),
+[pavanrangani](https://pavanrangani.com/blog/github-actions-self-hosted-runners-kubernetes),
+[openmetal](https://openmetal.io/resources/blog/the-real-cost-math-behind-self-hosted-github-actions-runners/),
+[starsling](https://starsling.dev/self-hosted-github-runners)). Scaling down has its own trap: a
+runner stopped mid-job loses the job.
+
+**Before** (research/pain-hunt at P40):
+- **No signal.** Pit had no queue-depth or wait-time signal; `/api/stats` only had totals.
+- **Lost jobs on scale-down.** Stopping a worker killed it outright (`/tmp/painhunt/p41`, a
+  separate server and worker on port 7272). With SIGTERM 2.5s into a 6-second job, the worker
+  died at once, and the replacement only got the job after the 60s heartbeat timeout:
+
+```
+run finished 70s after the replacement worker started — passed in 73.2s (a 6s job)
+```
+
+**Fix** (research/pain-hunt):
+- **`GET /metrics`** (Prometheus text) with `pit_queued_groups{os}`,
+  `pit_oldest_queued_seconds{os}`, `pit_running_groups`, `pit_workers_online`,
+  `pit_workers_busy`, and counters for cache hits, tasks run and time saved.
+- **Graceful worker shutdown.** The first SIGTERM (or Ctrl-C) stops claims, finishes the running
+  groups and exits. The second hands the groups back with a new `POST /api/groups/{id}/release`,
+  so the server requeues them now and revokes their leases. Then it stops their tasks' process
+  groups and exits.
+
+```
+6 runs of 4s on the 2-slot worker:  pit_queued_groups{os="any"} 4, pit_oldest_queued_seconds 1.85 → 2 / 6.87 → (empty)
+one SIGTERM mid-job:                 job finished (passed in 6.5s); worker exited 4.1s later, when it was done
+two SIGTERMs mid-job, w3 waiting:    "group … released by its worker; requeued"; orphan task processes: 0;
+                                     w3 ran it → passed in 11.7s (was 73.2s)
+```
+
+Getting the hard stop right took two fixes found while testing it:
+- **A lost second signal.** A second listener created after the first signal missed a quick
+  second SIGTERM. Now one listener is read twice.
+- **Wrong order.** Cancelling the tasks before releasing let the process exit, after its job
+  ended, before the release was sent. Now release comes first.
+
+Covered by the e2e test `metrics_show_queue_depth_for_autoscaling` and the unit test
+`a_released_group_is_queued_again_at_once`. The signal handling was verified live as above; it
+has no automated test.
+
+**Verdict: PARTIAL.** Pit now provides the signal and safe scale-downs, but it does not scale
+anything itself; a KEDA, HPA or script still has to start and stop workers. `pit_workers_busy`
+counts workers, not slots, because the server does not know how many slots a worker has.

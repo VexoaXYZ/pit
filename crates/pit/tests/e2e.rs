@@ -2238,3 +2238,36 @@ async fn shard_files_are_dealt_once_each() {
         .count();
     assert_eq!(empty, 2, "{view:?}");
 }
+
+/// `/metrics` reports what an autoscaler needs: work waiting per OS and how
+/// long the oldest has waited, plus workers online and busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_show_queue_depth_for_autoscaling() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    // No macOS worker exists, so this group waits.
+    let config = serde_json::json!({ "groups": { "mac": { "os": ["macos"], "tasks": { "t": { "run": "true" } } } } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    pit::cli::submit(&pit.client, dir, vec![], Default::default())
+        .await
+        .unwrap();
+    let metrics = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let m = pit.client.get_text("/metrics").await.unwrap();
+            if m.contains("pit_queued_groups{os=\"macos\"} 1") {
+                return m;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("queued group never showed up in /metrics");
+    assert!(metrics.contains("# TYPE pit_oldest_queued_seconds gauge"));
+    assert!(metrics.contains("pit_oldest_queued_seconds{os=\"macos\"}"));
+    assert!(metrics.contains("pit_workers_online 1"), "{metrics}");
+}

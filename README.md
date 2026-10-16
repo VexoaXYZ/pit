@@ -281,6 +281,21 @@ the signing key in the data dir (`oidc-es256.p8`, mode 0600) or the worker's env
 echo "$PIT_OIDC_TOKEN" > /tmp/oidc && AWS_ROLE_ARN=arn:aws:iam::123456789012:role/deploy AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/oidc aws sts get-caller-identity
 ```
 
+## Scaling workers
+
+Workers are plain processes that dial out to the server, so scaling means starting and
+stopping `pit worker`. `GET /metrics` (Prometheus text) has what an autoscaler needs: queued
+work and how long the oldest has waited, by OS (`pit_queued_groups{os}`,
+`pit_oldest_queued_seconds{os}`), plus running groups, online and busy workers, and cache
+counters. The queue series disappear when nothing is waiting; use
+`sum(pit_queued_groups) or vector(0)` in KEDA or a Prometheus rule.
+
+Stop a worker with SIGTERM. It stops claiming, finishes the groups it is running, and exits.
+A second SIGTERM hands those groups back to the server, which requeues them at once, then stops
+their tasks and exits, so a scale-down never waits for the 60s heartbeat timeout. Give the
+first signal as long as your longest group takes, for example Kubernetes'
+`terminationGracePeriodSeconds`.
+
 ## Notifications
 
 `pit server --notify-url https://hooks.slack.com/services/…` (or `PIT_NOTIFY_URL`) posts

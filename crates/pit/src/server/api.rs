@@ -60,6 +60,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/tasks/{id}/start", post(start_task))
         .route("/api/tasks/{id}/finish", post(finish_task))
         .route("/api/groups/{id}/heartbeat", post(heartbeat))
+        .route("/api/groups/{id}/release", post(release_group))
         .route("/api/groups/{id}/finish", post(finish_group))
         .route("/api/workers", get(workers))
         .route("/api/workers/claim", post(claim))
@@ -68,6 +69,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/cache/failed/{key}", get(cache_failed))
         .route("/api/cache/{key}/claim", post(cache_claim))
         .route("/api/flaky", get(flaky))
+        .route("/metrics", get(metrics))
         .route("/api/timings", post(record_timings))
         .route("/api/oidc/token", post(oidc_token))
         .route("/.well-known/openid-configuration", get(oidc_discovery))
@@ -137,6 +139,94 @@ async fn stats(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>
     s["evictedEntries"] = load(&app.evicted_entries).into();
     s["evictedBytes"] = load(&app.freed_bytes).into();
     Ok(Json(s))
+}
+
+/// `POST /api/groups/{id}/release`: a worker that is being stopped hands its
+/// group back, so another worker can start it now rather than after the
+/// heartbeat timeout.
+async fn release_group(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let lease = lease(&headers).ok_or_else(|| stale(&id))?;
+    if !app.db.requeue_group(&id, lease)? {
+        return Err(stale(&id));
+    }
+    tracing::info!("group {id} released by its worker; requeued");
+    app.work.notify_waiters();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /metrics`: Prometheus text format. The queue gauges are what to
+/// scale workers on (KEDA, an HPA, or a script that starts `pit worker`):
+/// work waiting, and for how long.
+async fn metrics(
+    State(app): State<Arc<App>>,
+) -> ApiResult<([(header::HeaderName, &'static str); 1], String)> {
+    use std::fmt::Write;
+    let now = crate::model::now_ms();
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, rows: &[(String, f64)]| {
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge");
+        for (labels, v) in rows {
+            let _ = writeln!(out, "{name}{labels} {v}");
+        }
+    };
+    let depth = app.db.queue_depth()?;
+    let queued: Vec<(String, f64)> = depth
+        .iter()
+        .map(|(os, n, _)| (format!("{{os=\"{os}\"}}"), *n as f64))
+        .collect();
+    let oldest: Vec<(String, f64)> = depth
+        .iter()
+        .map(|(os, _, at)| {
+            (
+                format!("{{os=\"{os}\"}}"),
+                ((now - at).max(0) as f64) / 1000.0,
+            )
+        })
+        .collect();
+    gauge(
+        "pit_queued_groups",
+        "Groups waiting for a worker, by OS.",
+        &queued,
+    );
+    gauge(
+        "pit_oldest_queued_seconds",
+        "How long the oldest waiting group has waited, by OS.",
+        &oldest,
+    );
+    gauge(
+        "pit_running_groups",
+        "Groups running on workers.",
+        &[(String::new(), app.db.running_groups()? as f64)],
+    );
+    let workers = app.db.workers()?;
+    let online = workers
+        .iter()
+        .filter(|(_, seen, _)| now - seen < 30_000)
+        .count();
+    let busy = workers
+        .iter()
+        .filter(|(_, seen, run)| now - seen < 30_000 && run.is_some())
+        .count();
+    gauge(
+        "pit_workers_online",
+        "Workers seen in the last 30s.",
+        &[(String::new(), online as f64)],
+    );
+    gauge(
+        "pit_workers_busy",
+        "Online workers running a group.",
+        &[(String::new(), busy as f64)],
+    );
+    let s = app.db.stats()?;
+    let counter = |k: &str| s[k].as_f64().unwrap_or(0.0);
+    let _ = writeln!(out, "# HELP pit_cache_hits_total Task results served from the cache.\n# TYPE pit_cache_hits_total counter\npit_cache_hits_total {}", counter("cacheHits"));
+    let _ = writeln!(out, "# HELP pit_tasks_run_total Tasks executed.\n# TYPE pit_tasks_run_total counter\npit_tasks_run_total {}", counter("tasksRun"));
+    let _ = writeln!(out, "# HELP pit_time_saved_seconds_total Task time saved by cache hits.\n# TYPE pit_time_saved_seconds_total counter\npit_time_saved_seconds_total {}", counter("timeSavedMs") / 1000.0);
+    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out))
 }
 
 async fn repos(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>> {

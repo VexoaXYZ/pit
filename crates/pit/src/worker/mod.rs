@@ -57,9 +57,17 @@ pub struct Worker {
     workspace_max_bytes: u64,
     /// See `WorkerOpts::secrets_file`.
     secrets: HashMap<String, String>,
+    /// Set by SIGTERM or Ctrl-C: claim nothing new, finish what is running.
+    draining: std::sync::atomic::AtomicBool,
+    /// Groups running now, by id: their lease, to hand back on a hard stop,
+    /// and the switch that stops their tasks.
+    running: Mutex<HashMap<String, Running>>,
     /// `runtime` command outputs, per job (`group id \0 command`).
     runtime_memo: Mutex<HashMap<String, String>>,
 }
+
+/// A group in progress: its lease and the switch that stops its tasks.
+type Running = (String, Arc<tokio::sync::watch::Sender<bool>>);
 
 /// A persistent workspace. Jobs get the warmest free one for their repo.
 struct WorkspaceSlot {
@@ -127,6 +135,40 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
         opts.server,
         opts.slots,
     );
+    // Autoscalers stop workers with SIGTERM. The first signal drains: no new
+    // claims, running groups finish, then the process exits. A second
+    // signal hands the running groups back to the server and exits at once.
+    {
+        let w = worker.clone();
+        tokio::spawn(async move {
+            // One listener for both signals: a second SIGTERM that arrives
+            // before a new listener would exist must not be lost.
+            let mut signals = Shutdown::new();
+            signals.next().await;
+            w.draining.store(true, std::sync::atomic::Ordering::SeqCst);
+            let n = w.running.lock().len();
+            tracing::info!("draining: finishing {n} running group(s), claiming nothing new");
+            signals.next().await;
+            let running: Vec<(String, Running)> = w.running.lock().drain().collect();
+            // Hand the groups back first: the server requeues them and
+            // revokes their leases, so the dying jobs cannot report a result.
+            for (gid, (lease, _)) in &running {
+                let _ = w
+                    .client
+                    .with_lease(lease)
+                    .post_empty(&format!("/api/groups/{gid}/release"), &())
+                    .await;
+            }
+            // Then stop their tasks (whole process groups), so nothing keeps
+            // running in a workspace nobody owns, and give them a moment.
+            for (_, (_, cancel)) in &running {
+                let _ = cancel.send(true);
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            tracing::info!("stopped: running groups handed back to the server");
+            std::process::exit(130);
+        });
+    }
     let mut loops = JoinSet::new();
     {
         let w = worker.clone();
@@ -136,8 +178,55 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
         let w = worker.clone();
         loops.spawn(async move { w.claim_loop(slot).await });
     }
-    while loops.join_next().await.is_some() {}
+    // Claim loops end only when draining; the workspace cleanup loop never
+    // does, so wait for the claim loops alone.
+    let slots = opts.slots.max(1);
+    let mut done = 0;
+    while let Some(_r) = loops.join_next().await {
+        done += 1;
+        if done == slots {
+            break;
+        }
+    }
+    tracing::info!("drained; exiting");
     Ok(())
+}
+
+/// SIGTERM or Ctrl-C, as a stream: each call waits for the next one.
+struct Shutdown {
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+}
+
+impl Shutdown {
+    fn new() -> Shutdown {
+        Shutdown {
+            #[cfg(unix)]
+            term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok(),
+        }
+    }
+
+    async fn next(&mut self) {
+        #[cfg(unix)]
+        {
+            let term = async {
+                match self.term.as_mut() {
+                    Some(t) => {
+                        t.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = term => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
 }
 
 fn safe_name(s: &str) -> String {
@@ -183,6 +272,8 @@ impl Worker {
             workspaces: Default::default(),
             workspace_max_bytes: 0,
             secrets: Default::default(),
+            draining: Default::default(),
+            running: Default::default(),
             runtime_memo: Default::default(),
         })
     }
@@ -358,6 +449,9 @@ impl Worker {
     async fn claim_loop(self: Arc<Self>, slot: usize) {
         let mut backoff = Duration::from_millis(500);
         loop {
+            if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             match self.client.claim(&self.info).await {
                 Ok(ClaimResponse::Job(job)) => {
                     backoff = Duration::from_millis(500);
@@ -379,13 +473,29 @@ impl Worker {
     }
 
     pub async fn execute(self: Arc<Self>, job: Job) -> Result<Status> {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let cancel_tx = Arc::new(cancel_tx);
+        self.running
+            .lock()
+            .insert(job.group_id.clone(), (job.lease.clone(), cancel_tx.clone()));
+        let result = self.clone().execute_job(&job, cancel_tx, cancel_rx).await;
+        self.running.lock().remove(&job.group_id);
+        result
+    }
+
+    async fn execute_job(
+        self: Arc<Self>,
+        job: &Job,
+        cancel_tx: Arc<tokio::sync::watch::Sender<bool>>,
+        cancel_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Status> {
+        let job = job.clone();
         // Every update for this job carries its lease, so a worker that lost
         // the group (reaped, then re-claimed elsewhere) cannot overwrite it.
         let client = self.client.with_lease(&job.lease);
         // A heartbeat refused with 409 means the group is no longer ours: the
         // run was cancelled or superseded (or we were presumed dead). Then the
         // running tasks are stopped.
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let hb = {
             let client = client.clone();
             let gid = job.group_id.clone();
