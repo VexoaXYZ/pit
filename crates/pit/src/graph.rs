@@ -313,6 +313,9 @@ struct ConfigMaterial<'a> {
     env: Vec<(&'a str, String)>,
     /// Names only: secret values never enter the key.
     secrets: &'a [String],
+    /// The files a shard was dealt: a different split is a different job.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    shard_assigned: &'a [String],
 }
 
 /// What an action key is made of, kept so a cache miss can say what changed.
@@ -411,6 +414,7 @@ pub fn key_inputs(
         shard: task.shard.map(|k| (k, task.shards.unwrap_or(1))),
         env,
         secrets: &task.secrets,
+        shard_assigned: &task.shard_assigned,
     };
     Ok(KeyInputs {
         v: 3,

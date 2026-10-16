@@ -11,6 +11,7 @@ pub mod queue;
 pub mod remote_cache;
 pub mod resolve;
 pub mod schedule;
+pub mod shards;
 pub mod web;
 
 use std::collections::HashMap;
@@ -354,7 +355,7 @@ impl App {
             .load_config(&mirror, &req.sha, overlay.as_ref())
             .await?;
         let t_config = t0.elapsed();
-        let groups = crate::graph::plan(&config, &req.tasks)?;
+        let mut groups = crate::graph::plan(&config, &req.tasks)?;
         let run = self.db.run(run_id)?;
         if run.status.is_done() {
             return Ok(()); // Cancelled while planning.
@@ -366,14 +367,21 @@ impl App {
             self.run_finished(run_id).await;
             return Ok(());
         }
-        // Groups the cache answers completely never need a worker.
-        let files = if req.no_cache {
-            None
-        } else {
+        let sharded = groups
+            .iter()
+            .any(|g| g.tasks.iter().any(|(_, t)| !t.shard_files.is_empty()));
+        let index = if sharded || !req.no_cache {
             resolve::file_index(&mirror, &req.sha, overlay.as_ref())
                 .await
                 .ok()
+        } else {
+            None
         };
+        if let (true, Some(index)) = (sharded, &index) {
+            shards::plan(self, &repo.id, &mut groups, index)?;
+        }
+        // Groups the cache answers completely never need a worker.
+        let files = if req.no_cache { None } else { index };
         let mut resolved = 0;
         for g in &groups {
             if let Some(results) = files

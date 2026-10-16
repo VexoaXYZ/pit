@@ -1,5 +1,6 @@
 //! HTTP routes for the CLI, workers and dashboard.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,6 +68,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/cache/failed/{key}", get(cache_failed))
         .route("/api/cache/{key}/claim", post(cache_claim))
         .route("/api/flaky", get(flaky))
+        .route("/api/timings", post(record_timings))
         .route("/api/oidc/token", post(oidc_token))
         .route("/.well-known/openid-configuration", get(oidc_discovery))
         .route("/.well-known/jwks.json", get(oidc_jwks))
@@ -655,6 +657,61 @@ async fn oidc_token(
         "trusted": run.trusted,
     });
     Ok(Json(serde_json::json!({ "token": issuer.sign(&claims)? })))
+}
+
+#[derive(Deserialize)]
+struct TimingsBody {
+    task: String,
+    /// Per-file seconds, when the task's reports name files.
+    #[serde(default)]
+    times: HashMap<String, f64>,
+    /// Otherwise the shard's total and its files: the total is split in
+    /// proportion to what is known of each file, so a slow file sharing a
+    /// shard with fast ones does not make them look slow.
+    #[serde(default)]
+    total: Option<f64>,
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+/// `POST /api/timings`: per-file durations from a sharded task, for the
+/// next split. Only from a running job, for its own repo.
+async fn record_timings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<TimingsBody>,
+) -> ApiResult<StatusCode> {
+    let run_id = lease(&headers)
+        .map(|l| app.db.lease_run(l))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| ApiError(StatusCode::CONFLICT, anyhow::anyhow!("no live job")))?;
+    let run = app.db.run(&run_id)?;
+    let mut times = body.times;
+    if let (Some(total), false) = (
+        body.total.filter(|t| t.is_finite() && *t >= 0.0),
+        body.files.is_empty(),
+    ) {
+        let known = app.db.shard_timings(&run.repo_id, &body.task)?;
+        let average = if known.is_empty() {
+            1.0
+        } else {
+            known.values().sum::<f64>() / known.len() as f64
+        };
+        let weight = |f: &String| known.get(f).copied().unwrap_or(average).max(0.001);
+        let sum: f64 = body.files.iter().map(weight).sum();
+        for f in body.files.iter().take(10_000) {
+            times.insert(f.clone(), total * weight(f) / sum);
+        }
+    }
+    let times: HashMap<String, f64> = times
+        .into_iter()
+        .filter(|(_, s)| s.is_finite() && *s >= 0.0)
+        .take(10_000)
+        .collect();
+    app.db
+        .record_shard_timings(&run.repo_id, &body.task, &times)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

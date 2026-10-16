@@ -17,6 +17,9 @@ pub struct Summary {
     pub skipped: u64,
     /// `suite.test` and the first line of its failure message.
     pub failures: Vec<(String, String)>,
+    /// Seconds per `<testsuite name>` (Vitest, Playwright and most others
+    /// name suites after the test file) or `<testcase file>`.
+    pub file_times: std::collections::HashMap<String, f64>,
 }
 
 impl Summary {
@@ -59,6 +62,9 @@ impl Summary {
         self.tests += other.tests;
         self.skipped += other.skipped;
         self.failures.extend(other.failures);
+        for (f, t) in other.file_times {
+            *self.file_times.entry(f).or_default() += t;
+        }
     }
 }
 
@@ -94,6 +100,22 @@ pub fn parse(xml: &str) -> Summary {
             Ok(e) => e,
         };
         let open = matches!(event, Event::Start(_));
+        if let Event::Start(e) | Event::Empty(e) = &event {
+            let time = || attr(e, b"time").and_then(|t| t.parse::<f64>().ok());
+            match e.name().as_ref() {
+                b"testsuite" => {
+                    if let (Some(name), Some(t)) = (attr(e, b"name"), time()) {
+                        *summary.file_times.entry(name).or_default() += t;
+                    }
+                }
+                b"testcase" => {
+                    if let (Some(file), Some(t)) = (attr(e, b"file"), time()) {
+                        *summary.file_times.entry(file).or_default() += t;
+                    }
+                }
+                _ => {}
+            }
+        }
         match event {
             Event::Start(e) | Event::Empty(e) if e.name().as_ref() == b"testcase" => {
                 summary.tests += 1;

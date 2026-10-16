@@ -2170,3 +2170,58 @@ with no change to the CI config.
 
 **Verdict: SOLVED** for the cost. The leftover is cosmetic: two runs appear in Pit's run list,
 and the waiting run holds a worker slot while it waits (P30's open point).
+
+## P40. Shards split by file count, so one shard gets all the slow tests
+
+**Pain.** Jest, Vitest and Playwright split shards by count, not duration. One shard collects the
+slow files and sets the wall time while the rest idle. In workadventure's e2e suite one shard ran
+1249s against 362s for its sibling, out of a 26-minute pipeline. Teams write duration files and
+greedy longest-first packers, or tune `PWTEST_SHARD_WEIGHTS`. Vitest and Playwright have open
+requests for timing-based sharding
+([workadventure#6543](https://github.com/workadventure/workadventure/pull/6543),
+[zvid#743](https://github.com/lsegal/zvid/pull/743),
+[playwright#17969](https://github.com/microsoft/playwright/issues/17969),
+[vitest#9184](https://github.com/vitest-dev/vitest/issues/9184),
+[murlan#441](https://github.com/metasito/murlan/issues/441),
+[purosur#1190](https://github.com/ljguardiola/purosur.online/issues/1190),
+[Currents](https://currents.dev/posts/optimizing-test-runtime-playwright-sharding-vs-workers),
+[traceloom](https://traceloom.io/blog/playwright-test-sharding/)).
+
+**Before** (research/pain-hunt at P39): `shards: N` only set `PIT_SHARD`/`PIT_SHARD_COUNT`, and
+splitting was the runner's job, by count (P14's open point).
+
+**Fix** (research/pain-hunt): `shardFiles` globs on a sharded task.
+- **Planning.** The server matches them against the commit's files and deals them longest
+  first, each to the least-loaded shard. Durations are recorded per repo and task; files with
+  no recorded time count as the average. The split is made once, so every shard agrees, and it
+  is part of each shard's cache key.
+- **Running.** Each shard gets its files in `PIT_SHARD_FILES`. A shard dealt nothing passes
+  without running its command, because `runner $PIT_SHARD_FILES` with an empty list would run
+  every test.
+- **Learning.** Durations come from JUnit `reports` (P34) when suites or cases name files.
+  Otherwise the worker reports the shard's total, and the server splits it in proportion to what
+  it knows of each file. An earlier even split oscillated: a run regressed from 4.8s back to
+  7.0s.
+
+**Reproduction** (`/tmp/painhunt/p40`): 9 files, 3 of them 3s (`a1`, `b1`, `c1`) and 6 of them
+0.3s, 3 shards on the 2-slot worker. The tests run serially inside a shard
+(`--test-concurrency=1`), like Playwright with one worker or most browser e2e suites.
+
+```
+node --test-shard (count):     slowest shard 9.7s, 9.8s     (a1, b1, c1 all in shard 1)
+shardFiles (duration):         run 1 9.6s (no data yet) → run 2 4.9s → 5.3s → 4.3s → 4.3s → 4.9s
+ideal: ≈ 3.6s of tests per shard + ≈ 0.9s startup ≈ 4.5s
+```
+
+**Honest negative:** with Node's default (files run in parallel inside a shard) the count split
+already cost little, because three 3-second files in one shard took 3.7s. The duration split
+evened the shards (3.4–3.7s each) without lowering the slowest. The gain is for serial suites.
+
+Covered by the unit test `deals_longest_first_to_the_least_loaded_shard` and the e2e test
+`shard_files_are_dealt_once_each` (every file exactly once; empty shards skipped).
+
+**Verdict: SOLVED** for serial or worker-limited suites: the slowest shard went from 9.7s to
+about 4.5s after one learning run. Not done:
+- **Shard count.** Pit does not choose the number of shards.
+- **Granularity.** Splitting is per file, so one huge file is still indivisible.
+- **One cold run.** The first run of a new task has no data and splits as evenly as it can.

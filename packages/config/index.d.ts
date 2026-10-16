@@ -80,6 +80,13 @@ export interface TaskDef {
    */
   oidc?: string;
   /**
+   * With `shards`: globs of the files to split, e.g. `["e2e/**\/*.spec.ts"]`.
+   * Pit deals them out longest first by recorded duration (from JUnit
+   * `reports` when they name files, otherwise estimated from each shard's
+   * time) and gives each shard its list in `PIT_SHARD_FILES`.
+   */
+  shardFiles?: string[];
+  /**
    * Split the task into this many shards, each in its own group so they spread
    * across workers. Each gets `PIT_SHARD` (1-based) and `PIT_SHARD_COUNT`:
    * `vitest --shard=$PIT_SHARD/$PIT_SHARD_COUNT`. The task's deps run in every

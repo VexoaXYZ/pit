@@ -132,6 +132,14 @@ pub struct TaskDef {
     /// Which shard this is; set by Pit when it plans a sharded task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<u32>,
+    /// Globs of the files a sharded task splits (`test/**/*.test.ts`). Pit
+    /// deals them out by recorded duration, longest first, so no shard gets
+    /// all the slow ones; each shard gets its list in `PIT_SHARD_FILES`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shard_files: Vec<String>,
+    /// This shard's files; set by Pit when it plans the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shard_assigned: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]

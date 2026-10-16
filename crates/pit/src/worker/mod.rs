@@ -793,6 +793,21 @@ impl Worker {
             files::clear_outputs(ws, &def.outputs)?;
         }
 
+        // A shard dealt no files must not run its command with an empty
+        // list: most test runners would then run every test.
+        if !def.shard_files.is_empty() && def.shard_assigned.is_empty() {
+            let r = finish(
+                Status::Passed,
+                Some(0),
+                0,
+                None,
+                Some("no files were dealt to this shard".into()),
+            );
+            client
+                .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
+                .await?;
+            return Ok((Status::Passed, Some(key)));
+        }
         // Fork code on the host or in the sandbox would share the worker's
         // filesystem, and with it the secrets file, other workspaces and the
         // worker's own /proc. It runs in a container that sees only its
@@ -826,6 +841,7 @@ impl Worker {
             ("PIT_RUN_ID".into(), job.run_id.clone()),
             ("PIT_SHA".into(), job.sha.clone()),
             ("PIT_SHARD".into(), def.shard.unwrap_or(1).to_string()),
+            ("PIT_SHARD_FILES".into(), def.shard_assigned.join(" ")),
             (
                 "PIT_SHARD_COUNT".into(),
                 def.shards.unwrap_or(1).to_string(),
@@ -1016,7 +1032,36 @@ impl Worker {
         // Name the failed tests, from the task's JUnit reports.
         let reports = files::collect_outputs(ws, &def.reports)?;
         let paths: Vec<&std::path::PathBuf> = reports.iter().map(|(_, abs)| abs).collect();
-        if let Some(summary) = junit::summarize(&paths) {
+        let summary = junit::summarize(&paths);
+        // Per-file durations for the next split: from the reports when they
+        // name files, otherwise this shard's time spread over its files.
+        if ok && !def.shard_assigned.is_empty() {
+            let reported: HashMap<String, f64> = summary
+                .iter()
+                .flat_map(|s| s.file_times.iter())
+                .filter_map(|(name, t)| {
+                    def.shard_assigned
+                        .iter()
+                        .find(|f| {
+                            *f == name
+                                || f.ends_with(&format!("/{name}"))
+                                || name.ends_with(f.as_str())
+                        })
+                        .map(|f| (f.clone(), *t))
+                })
+                .collect();
+            let body = if reported.is_empty() {
+                serde_json::json!({
+                    "task": task.name,
+                    "total": duration_ms as f64 / 1000.0,
+                    "files": def.shard_assigned,
+                })
+            } else {
+                serde_json::json!({ "task": task.name, "times": reported })
+            };
+            let _ = client.post_empty("/api/timings", &body).await;
+        }
+        if let Some(summary) = summary {
             let text = summary.message();
             let _ = client
                 .post_empty(

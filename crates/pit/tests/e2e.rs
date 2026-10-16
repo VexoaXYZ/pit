@@ -2194,3 +2194,47 @@ async fn oidc_tokens_only_for_trusted_github_runs() {
         "a forged run got a token: {forged:?}"
     );
 }
+
+/// `shardFiles`: every matching file is dealt to exactly one shard, each
+/// shard gets its list in `PIT_SHARD_FILES`, and a shard dealt nothing passes
+/// without running its command (which would otherwise run every test).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_files_are_dealt_once_each() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let log = dir
+        .join("..")
+        .join(format!("shards-{}.log", std::process::id()));
+    for f in ["a", "b", "c"] {
+        write(dir, &format!("t/{f}.test"), "x\n");
+    }
+    write(dir, "t/notes.md", "not a test\n");
+    let config = serde_json::json!({ "tasks": { "test": {
+        "run": format!("test -n \"$PIT_SHARD_FILES\" && echo \"$PIT_SHARD_FILES\" >> {}", log.display()),
+        "shards": 5,
+        "shardFiles": ["t/*.test"],
+        "cache": false,
+    } } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run(&pit, dir).await;
+    assert_eq!(view.status, Status::Passed, "{view:?}");
+    let mut dealt: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    dealt.sort();
+    assert_eq!(dealt, ["t/a.test", "t/b.test", "t/c.test"]);
+    let empty = view
+        .groups
+        .iter()
+        .flat_map(|g| &g.tasks)
+        .filter(|t| t.message.as_deref() == Some("no files were dealt to this shard"))
+        .count();
+    assert_eq!(empty, 2, "{view:?}");
+}

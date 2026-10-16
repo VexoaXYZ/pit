@@ -112,6 +112,15 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 
 -- Running totals for /api/stats that must survive cache eviction.
+-- Smoothed per-file durations of sharded tasks (see server::shards).
+CREATE TABLE IF NOT EXISTS shard_timings (
+  repo_id TEXT NOT NULL,
+  task TEXT NOT NULL,
+  path TEXT NOT NULL,
+  secs REAL NOT NULL,
+  PRIMARY KEY (repo_id, task, path)
+);
+
 -- The last result of each notified line (see server::notify).
 CREATE TABLE IF NOT EXISTS notify_state (
   key TEXT PRIMARY KEY,
@@ -1193,6 +1202,41 @@ impl Db {
 
     /// Whether the group holding this live lease belongs to a trusted run;
     /// `None` if no running group holds it.
+    pub fn shard_timings(
+        &self,
+        repo_id: &str,
+        task: &str,
+    ) -> Result<std::collections::HashMap<String, f64>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT path, secs FROM shard_timings WHERE repo_id = ?1 AND task = ?2",
+        )?;
+        let rows = st
+            .query_map(params![repo_id, task], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<std::collections::HashMap<String, f64>>>()?;
+        Ok(rows)
+    }
+
+    /// Folds new durations into the smoothed ones (half old, half new).
+    pub fn record_shard_timings(
+        &self,
+        repo_id: &str,
+        task: &str,
+        times: &std::collections::HashMap<String, f64>,
+    ) -> Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        for (path, secs) in times {
+            tx.execute(
+                "INSERT INTO shard_timings (repo_id, task, path, secs) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(repo_id, task, path) DO UPDATE SET secs = (secs + ?4) / 2",
+                params![repo_id, task, path, secs],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The run of the group holding this live lease.
     pub fn lease_run(&self, lease: &str) -> Result<Option<String>> {
         Ok(self
