@@ -15,9 +15,25 @@ use std::time::{Duration, SystemTime};
 /// Idle workspaces unused this long are removed whatever their size.
 pub const STALE_AFTER: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
+/// A file Pit keeps about a workspace. It sits next to the workspace, not
+/// in it: tasks (a fork's, in a container) can write anything inside the
+/// workspace, `.git` included, and a symlink planted there would make the
+/// worker write through it to any file its user can.
+pub fn meta_file(ws: &Path, what: &str) -> PathBuf {
+    let name = ws.file_name().unwrap_or_default().to_string_lossy();
+    ws.with_file_name(format!(".{name}.{what}"))
+}
+
+/// Every file `meta_file` may have made for this workspace.
+pub fn remove_meta(ws: &Path) {
+    for what in ["used", "warm.json"] {
+        let _ = std::fs::remove_file(meta_file(ws, what));
+    }
+}
+
 /// Marks when a workspace was last used; its mtime survives restarts.
 pub fn used_file(ws: &Path) -> PathBuf {
-    ws.join(".git").join("pit-used")
+    meta_file(ws, "used")
 }
 
 pub fn touch_used(ws: &Path) {
@@ -65,14 +81,10 @@ fn find(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 }
 
 fn last_used(ws: &Path) -> SystemTime {
-    [
-        used_file(ws),
-        ws.join(".git").join("pit-warm.json"),
-        ws.to_path_buf(),
-    ]
-    .iter()
-    .find_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
-    .unwrap_or(SystemTime::UNIX_EPOCH)
+    [used_file(ws), meta_file(ws, "warm.json"), ws.to_path_buf()]
+        .iter()
+        .find_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// Space used on disk, without following symlinks.

@@ -73,10 +73,11 @@ pub async fn up(opts: UpOpts) -> Result<()> {
         worker_token: Some(worker_token),
         secrets_file,
     }));
+    // Ctrl-C or SIGTERM drains the worker (running groups finish; a second
+    // one hands them back), and then `pit up` exits.
     tokio::select! {
         r = server => r??,
         r = worker => r??,
-        _ = tokio::signal::ctrl_c() => {}
     }
     Ok(())
 }

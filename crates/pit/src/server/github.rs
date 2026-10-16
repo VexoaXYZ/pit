@@ -556,6 +556,11 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 .to_string();
             let repo = register(app, &r)?;
             let fork = pr["head"]["repo"]["full_name"].as_str() != Some(r.full_name.as_str());
+            // Remembered so a fork queued through the API is pinned too.
+            if fork {
+                app.db
+                    .kv_put("fork-pr", &format!("{}/{number}", repo.id), &sha)?;
+            }
             if action == "labeled" && payload["label"]["name"].as_str() == Some(MERGE_LABEL) {
                 let entry = super::queue::add(
                     app,

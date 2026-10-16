@@ -25,8 +25,9 @@ pub struct Outcome {
     pub cancelled: bool,
     /// The signal that ended it, if one did (Unix).
     pub signal: Option<i32>,
-    /// The kernel's OOM killer ran while it did.
-    pub oom: bool,
+    /// The kernel's OOM killer ran while it did; `None` where that cannot be
+    /// known.
+    pub oom: Option<bool>,
     /// The most memory its process group was seen to use, in bytes, sampled
     /// (Linux; a docker task's container is not in the group).
     pub peak_memory: u64,
@@ -355,10 +356,10 @@ pub async fn run(
         _ = cancelled => Ended::Cancelled,
     };
     sampler.abort();
-    let oom = matches!(
-        (oom_before, super::memory::oom_kills()),
-        (Some(a), Some(b)) if b > a
-    );
+    let oom = match (oom_before, super::memory::oom_kills()) {
+        (Some(a), Some(b)) => Some(b > a),
+        _ => None,
+    };
     let went_idle = matches!(ended, Ended::Idle);
     let (status, timed_out, was_cancelled) = match ended {
         Ended::Exited(s) => (Some(s), false, false),

@@ -111,6 +111,9 @@ impl Worker {
 }
 
 pub async fn run(opts: WorkerOpts) -> Result<()> {
+    // Debug scripts from an earlier process point at workspaces it no longer
+    // holds; the next job may check out over them.
+    let _ = std::fs::remove_dir_all(opts.data_dir.join("debug"));
     let mut worker = Worker::new(
         opts.server.as_str(),
         opts.token.clone(),
@@ -425,6 +428,7 @@ impl Worker {
                 for slots in pools.values_mut() {
                     slots.retain(|s| s.path != path);
                 }
+                disk::remove_meta(&path);
                 doomed.push((path, dest));
             }
         }
@@ -462,6 +466,19 @@ impl Worker {
                 return;
             }
             match self.client.claim(&self.info).await {
+                // A claim long-polls for up to 20s: one that was in flight
+                // when draining began goes straight back to the queue.
+                Ok(ClaimResponse::Job(job))
+                    if self.draining.load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    let _ = self
+                        .client
+                        .with_lease(&job.lease)
+                        .post_empty(&format!("/api/groups/{}/release", job.group_id), &())
+                        .await;
+                    tracing::info!("draining: handed back {} without starting it", job.group);
+                    return;
+                }
                 Ok(ClaimResponse::Job(job)) => {
                     backoff = Duration::from_millis(500);
                     let label = format!("{} {} [{}]", job.run_id, job.group, job.repo);
@@ -562,6 +579,7 @@ impl Worker {
                 debug::hold(&debug_dir, debug::HOLD).await;
                 w.release_workspace(&pool, &ws, fresh);
                 if fresh {
+                    disk::remove_meta(&ws);
                     let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws)).await;
                 }
             });
@@ -569,6 +587,7 @@ impl Worker {
             drop(lease);
             if job.fresh {
                 let ws = ws.clone();
+                disk::remove_meta(&ws);
                 tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws));
             }
         }
@@ -710,6 +729,11 @@ impl Worker {
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default(),
         ));
+        // A fork's tasks run one at a time. Between them no fork code is
+        // running (a task's container goes with it), so nothing can swap a
+        // checked directory for a symlink while the worker clears outputs,
+        // collects them or reads reports.
+        let parallelism = if job.no_secrets { 1 } else { self.parallelism };
         let mut state: HashMap<String, (Status, Option<String>)> = HashMap::new();
         let mut started: std::collections::HashSet<String> = Default::default();
         let mut running: JoinSet<(String, Status, Option<String>)> = JoinSet::new();
@@ -737,7 +761,7 @@ impl Worker {
                         .await;
                     continue;
                 }
-                if deps.iter().all(|d| d.is_some()) && running.len() < self.parallelism {
+                if deps.iter().all(|d| d.is_some()) && running.len() < parallelism {
                     started.insert(t.name.clone());
                     let dep_keys: Vec<String> = deps
                         .iter()
@@ -1024,9 +1048,10 @@ impl Worker {
         // more than the OS lets a process environment hold.
         if !def.shard_files.is_empty() {
             let list = def.shard_assigned.join("\n");
-            let at = files::safe_join(ws, SHARD_LIST)?;
+            let rel = shard_list(&task.name);
+            let at = files::safe_join(ws, &rel)?;
             files::write_file(&at, format!("{list}\n").as_bytes(), false)?;
-            env.push(("PIT_SHARD_FILES_LIST".into(), SHARD_LIST.into()));
+            env.push(("PIT_SHARD_FILES_LIST".into(), rel));
             if list.len() <= SHARD_ENV_BYTES {
                 env.push(("PIT_SHARD_FILES".into(), list));
             }
@@ -1365,7 +1390,7 @@ impl Worker {
 }
 
 fn warm_file(ws: &Path) -> PathBuf {
-    ws.join(".git").join("pit-warm.json")
+    disk::meta_file(ws, "warm.json")
 }
 
 /// Which workspace-cached tasks this workspace has run, by action key.
@@ -1523,9 +1548,23 @@ impl Worker {
 
 /// The local ID of a container image, pulling it first if this worker does
 /// not have it (the run would pull it anyway).
-/// Where a shard's dealt files are listed, relative to the workspace.
-const SHARD_LIST: &str = ".pit/shard-files";
-/// Lists longer than this go only in `SHARD_LIST`, not the environment.
+/// Where a shard's dealt files are listed, relative to the workspace: one
+/// file per task, since two sharded tasks of a group run side by side.
+fn shard_list(task: &str) -> String {
+    let safe: String = task
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!(".pit/shards/{safe}")
+}
+/// Lists longer than this go only in the `shard_list` file, not the
+/// environment.
 const SHARD_ENV_BYTES: usize = 64 << 10;
 
 async fn image_id(image: &str) -> String {

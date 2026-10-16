@@ -117,6 +117,17 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
             ),
             None => format!("{source} not found in {}", repo.url),
         })?;
+    // A fork's pull request is queued at this commit only: a later push
+    // drops it rather than testing new code with the queue's trust. Forks
+    // are known from the label's webhook (`sha`) or any earlier webhook.
+    let fork = req.pr.is_some_and(|n| {
+        app.db
+            .kv_get("fork-pr", &format!("{}/{n}", repo.id))
+            .ok()
+            .flatten()
+            .is_some()
+    });
+    let pinned = req.sha.is_some() || fork;
     if let Some(approved) = &req.sha {
         if *approved != head {
             bail!("{source} moved to {head} after {approved} was approved; add the label again");
@@ -139,7 +150,7 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     }
     let id = app
         .db
-        .queue_insert(&repo.id, &source, req.pr, &head, &target, req.sha.is_some())?;
+        .queue_insert(&repo.id, &source, req.pr, &head, &target, pinned)?;
     app.emit(
         "queue.updated",
         None,

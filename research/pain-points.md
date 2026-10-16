@@ -2385,7 +2385,9 @@ bounded by the repo's history. The OIDC/queue code outside this review's scope i
 beyond #18.
 
 P31's verdict stays **PARTIAL**, now for the right reasons. A fork's code, config included, runs
-only in containers with no secrets. What remains: P31's existing limits, and the config sandbox
+only in containers with no secrets. *(Correction from the next review: the worker could still write
+through a symlink a container planted in `.git`, and the symlink checks could be raced. Both are
+fixed in "Review of P41–P45".)* What remains: P31's existing limits, and the config sandbox
 needs Docker on the server.
 
 ## P42. Git LFS: every CI checkout downloads every large file again
@@ -2495,7 +2497,9 @@ When a task fails:
   task's command.
 - Arguments replace the shell: `sh test.sh 'ls dist'`. That form works for coding agents, which
   cannot drive a TTY.
-- Secret values are left out; the script names them.
+- Values of the task's `secrets` are left out; the script names them. Values the task takes from
+  the worker's environment through `env` are written in, so the script and its directory are
+  readable by the worker's user only (mode 0700 from creation).
 - The workspace stays busy (no job checks out over it) for 30 minutes, or until the script is
   deleted.
 
@@ -2726,3 +2730,88 @@ of 10 or 50, and there are no duplicates. Limits:
 - With a plain token (commit statuses), there are no annotations.
 - Not tried against real GitHub, only a mock of its API.
 - If a follow-up PATCH fails after the claim, the remaining annotations are not retried.
+
+## Review of P41–P45
+
+A second independent reviewer read P41 to P45 and the fixes from the previous review. It found 2
+high, 6 medium and 8 low findings. All are fixed except L4, L5 and L7, which are recorded as
+limits below. Tests: `cargo test` 71 unit and 37 e2e, clippy clean.
+
+High:
+
+1. **H1. Pit's bookkeeping files inside `.git` could be turned against the worker.** A fork's
+   container mounts the whole workspace read-write, `.git` included. After the job, the host wrote
+   `.git/pit-warm.json` and `.git/pit-used`, following symlinks. A task running `ln -s
+   ~/.local/share/pit/server/pit.db .git/pit-warm.json` made the worker overwrite the server's
+   database (under `pit up`), or `authorized_keys`, or the secrets file.
+   - Both files now sit next to the workspace in its pool directory (`.<n>.warm.json`,
+     `.<n>.used`), where containers can't reach.
+   - They are removed with the workspace.
+   - The new e2e `the_worker_never_writes_through_a_task_planted_symlink` plants both links at a
+     file outside. On the old code that file was truncated to empty; now it is untouched.
+2. **H2. The symlink checks could be raced.** `safe_join` and the report reads checked paths
+   while a sibling task ran in the same workspace. A fork task could swap a directory for a symlink
+   between the check and the delete or write, or replace a report with a link to `/dev/zero` to
+   exhaust the worker's memory.
+   - A fork's tasks now run one at a time. No fork code is running while the worker clears,
+     collects or reads files (a task's container goes with it).
+   - Reports are opened with `O_NOFOLLOW`, must be regular files, and are read through a size
+     cap. A unit test checks that a report swapped for a `/dev/zero` link is not read.
+
+Medium:
+
+3. **M1.** Two sharded tasks in one group overwrote each other's `.pit/shard-files`. Each task now
+   has its own `.pit/shards/<task>`.
+4. **M2.** A claim in flight (it long-polls 20s) could hand a draining worker a new job. Such a job
+   is now handed back at once (`/release`).
+5. **M3.** `pit_workers_online` and `pit_workers_busy` dropped to 0 when every slot was busy, since
+   only claims refreshed `last_seen`. Heartbeats now refresh it.
+6. **M4.** A fork PR queued through the API instead of the label was not pinned, so a later push
+   was retested as a trusted run with secrets. Pit now records which PRs are forks from any
+   webhook it sees, and `queue::add` pins those too. A fork Pit never got a webhook for is still
+   unknown.
+   - Fixing this exposed another bug: the cache's LRU evicted every `kv` row except `last`, so it
+     would also have evicted the fork record and the annotation claims (P46). Pit's own
+     namespaces are now excluded from eviction and from the artifact count.
+7. **M5.** Slow notes flagged runs that weren't slow:
+   - flaky passes (their time is every attempt's);
+   - `--fresh` and fork runs, which are cold and were compared with warm history.
+
+   They are now skipped, and those runs no longer enter the history.
+8. **M6.** The slow-note history lookup ran on the async handler and, for a common name, could
+   scan its whole history. It is now bounded to 30 days and runs on a blocking thread. It still
+   takes the one DB lock (as `pit flaky` does).
+
+Low:
+
+- **L1. Out-of-memory messages:**
+  - Where `/proc/vmstat` can't be read (macOS, Docker Desktop's VM), a SIGKILL now says "out of
+    memory, or something else sent it" instead of claiming nothing was recorded.
+  - A parent that exits 1 or 2 while the OOM killer ran now gets a note (`make` or `cargo` after a
+    child was killed).
+  - The page size comes from `sysconf`, not a fixed 4 KiB.
+- **L2. Config sandbox:**
+  - Config results are memoized per trust level, so a fork's result is never reused for a trusted
+    run or the other way round.
+  - The sandbox container is limited to 1 CPU.
+- **L3. Debug scripts:**
+  - They are created 0700 in a 0700 directory, never briefly readable.
+  - Task names in their comments cannot start a new shell line.
+  - Scripts left by an earlier worker process are removed at start.
+- **L6.** The `timing_key` docs now say splits are kept per OS for multi-OS groups.
+- **L8.** `pit up` exited at once on Ctrl-C, skipping the drain. It now drains like `pit worker`.
+
+Not fixed (limits):
+
+- **L4. LFS:**
+  - `mirror/lfs` is never pruned and doesn't count toward `--workspace-max-gb`.
+  - Every job runs `git lfs fetch` under the mirror lock.
+  - A fork whose objects the base repo lacks fails its prepare step.
+- **L5.** `pit_oldest_queued_seconds` counts a requeued group from creation, and queued groups
+  waiting on a lock are counted although more workers can't help them.
+- **L7.** On a hard stop the group is released before its tasks are killed (so the server requeues
+  it before the process dies). For a few milliseconds the old tasks and a new claim can overlap;
+  the new worker still has to prepare its workspace first.
+
+Claims corrected: P31's fork isolation (above), P41's gauges and drain, P43's secrets wording,
+P44's flaky and cold-run handling, P45's message on machines without `/proc`.

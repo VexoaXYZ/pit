@@ -9,6 +9,16 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::model::*;
 
+/// `kv` namespaces that are Pit's own records, not cache entries: never
+/// evicted or counted as artifacts. `last` (a task's last result), `fork-pr`
+/// (pull requests known to come from forks), `annotated` (checks whose
+/// annotations were sent).
+macro_rules! internal_kv {
+    () => {
+        "('last', 'fork-pr', 'annotated')"
+    };
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -960,10 +970,20 @@ impl Db {
     }
     /// Records a heartbeat if `lease` is still the group's current claim.
     pub fn heartbeat_group(&self, id: &str, lease: Option<&str>) -> Result<bool> {
-        Ok(self.conn.lock().execute(
+        let c = self.conn.lock();
+        let live = c.execute(
             "UPDATE groups_ SET heartbeat_at = ?1 WHERE id = ?2 AND status = 'running' AND lease = ?3",
             params![now_ms(), id, lease],
-        )? > 0)
+        )? > 0;
+        // A worker busy in every slot claims nothing for a long while; its
+        // heartbeats keep it online (`/metrics`, waiting reasons).
+        if live {
+            c.execute(
+                "UPDATE workers SET last_seen = ?1 WHERE name = (SELECT worker FROM groups_ WHERE id = ?2)",
+                params![now_ms(), id],
+            )?;
+        }
+        Ok(live)
     }
 
     /// Requeues running groups whose worker stopped heartbeating.
@@ -1427,12 +1447,13 @@ impl Db {
     pub fn evict_lru(&self, n: usize) -> Result<usize> {
         let c = self.conn.lock();
         let victims: Vec<(String, String, String)> = {
-            let mut st = c.prepare(
+            let mut st = c.prepare(concat!(
                 "SELECT 'cache', '', action_key, COALESCE(last_hit_at, created_at) AS used FROM cache
                  UNION ALL
-                 SELECT 'kv', ns, key, COALESCE(last_used_at, created_at) AS used FROM kv WHERE ns != 'last'
-                 ORDER BY used LIMIT ?1",
-            )?;
+                 SELECT 'kv', ns, key, COALESCE(last_used_at, created_at) AS used FROM kv WHERE ns NOT IN ",
+                internal_kv!(),
+                " ORDER BY used LIMIT ?1"
+            ))?;
             let rows = st
                 .query_map(params![n as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1454,7 +1475,11 @@ impl Db {
     pub fn evictable_entries(&self) -> Result<usize> {
         let c = self.conn.lock();
         let n: i64 = c.query_row(
-            "SELECT (SELECT COUNT(*) FROM cache) + (SELECT COUNT(*) FROM kv WHERE ns != 'last')",
+            concat!(
+                "SELECT (SELECT COUNT(*) FROM cache) + (SELECT COUNT(*) FROM kv WHERE ns NOT IN ",
+                internal_kv!(),
+                ")"
+            ),
             [],
             |r| r.get(0),
         )?;
@@ -1482,7 +1507,11 @@ impl Db {
             }
         }
         {
-            let mut st = c.prepare("SELECT digest FROM kv WHERE ns != 'last'")?;
+            let mut st = c.prepare(concat!(
+                "SELECT digest FROM kv WHERE ns NOT IN ",
+                internal_kv!(),
+                ""
+            ))?;
             for d in st.query_map([], |r| r.get::<_, String>(0))? {
                 // Turborepo entries are `<digest>:<duration>`.
                 keep.insert(d?.split(':').next().unwrap_or_default().to_string());
@@ -1542,7 +1571,7 @@ impl Db {
             "timeSavedMs": count("SELECT COALESCE((SELECT value FROM counters WHERE name = 'timeSavedMs'), 0)")?,
             "workerTimeMs": count("SELECT COALESCE(SUM(duration_ms), 0) FROM tasks WHERE status IN ('passed', 'failed')")?,
             "supersededRuns": count("SELECT COUNT(*) FROM runs WHERE message LIKE 'superseded by %'")?,
-            "remoteCacheArtifacts": count("SELECT COUNT(*) FROM kv")?,
+            "remoteCacheArtifacts": count(concat!("SELECT COUNT(*) FROM kv WHERE ns NOT IN ", internal_kv!()))?,
         }))
     }
 
@@ -1626,12 +1655,17 @@ impl Db {
              JOIN tasks t2 ON t2.name = t.name
              JOIN groups_ g2 ON g2.id = t2.group_id AND g2.name = g.name AND g2.os = g.os
              JOIN runs r2 ON r2.id = t2.run_id AND r2.repo_id = r.repo_id
+               AND r2.fresh = 0 AND r2.no_secrets = 0
              WHERE t.id = ?1 AND t2.id != t.id AND t2.status = 'passed'
+               AND t2.finished_at > ?3
                AND t2.duration_ms IS NOT NULL AND COALESCE(t2.message, '') NOT LIKE 'flaky:%'
              ORDER BY t2.finished_at DESC LIMIT ?2",
         )?;
+        // A month back at most: a common task name (`test`) in a new group
+        // would otherwise scan that name's whole history.
+        let since = now_ms() - 30 * 86_400_000;
         let rows = st
-            .query_map(params![task_id, limit as i64], |r| r.get(0))?
+            .query_map(params![task_id, limit as i64, since], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -1646,6 +1680,7 @@ impl Db {
                  JOIN groups_ g ON g.id = t.group_id JOIN runs r ON r.id = t.run_id
                  JOIN repos ON repos.id = r.repo_id
                  WHERE t.finished_at > ?1 AND t.status = 'passed' AND t.duration_ms IS NOT NULL
+                   AND r.fresh = 0 AND r.no_secrets = 0
                    AND COALESCE(t.message, '') NOT LIKE 'flaky:%'
                  ORDER BY t.finished_at",
             )?;

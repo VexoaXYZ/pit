@@ -25,7 +25,11 @@ pub fn oom_kills() -> Option<u64> {
 /// Resident memory of every process in the process group, in bytes.
 #[cfg(target_os = "linux")]
 fn group_rss(pgid: u32) -> u64 {
-    let page = 4096u64;
+    // SAFETY: plain sysconf query, no memory involved.
+    let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        n if n > 0 => n as u64,
+        _ => 4096,
+    };
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return 0;
     };
@@ -115,25 +119,18 @@ pub fn human_bytes(b: u64) -> String {
 }
 
 /// Explains a task that ended by a signal: directly (`signal`), or as a
-/// shell or the docker client reports one (exit code 128 + n).
+/// shell or the docker client reports one (exit code 128 + n). `oom` is
+/// whether the kernel's OOM killer ran meanwhile, `None` where that cannot
+/// be known (no `/proc/vmstat`). A task that failed otherwise while the OOM
+/// killer ran (`make` or `cargo` exiting 2 after a child was killed) gets a
+/// note too.
 pub fn explain(
     exit_code: Option<i32>,
     signal: Option<i32>,
-    oom: bool,
+    oom: Option<bool>,
     peak: u64,
 ) -> Option<String> {
-    let (n, how) = match (signal, exit_code) {
-        (Some(n), _) => (
-            n,
-            format!("killed by {}", signal_name(n).unwrap_or("a signal")),
-        ),
-        (None, Some(c)) if (129..=159).contains(&c) => {
-            let name = signal_name(c - 128)?;
-            (c - 128, format!("exit {c}: killed by {name}"))
-        }
-        _ => return None,
-    };
-    let peak = if peak > 0 {
+    let peak_note = if peak > 0 {
         format!(
             "; its processes were seen using up to {}",
             human_bytes(peak)
@@ -141,15 +138,37 @@ pub fn explain(
     } else {
         String::new()
     };
-    Some(if n == 9 && oom {
-        format!(
+    let signalled = match (signal, exit_code) {
+        (Some(n), _) => Some((
+            n,
+            format!("killed by {}", signal_name(n).unwrap_or("a signal")),
+        )),
+        (None, Some(c)) if (129..=159).contains(&c) => {
+            signal_name(c - 128).map(|name| (c - 128, format!("exit {c}: killed by {name}")))
+        }
+        _ => None,
+    };
+    let Some((n, how)) = signalled else {
+        // `make` or `cargo` exiting 2 after a child was killed for memory.
+        return match (exit_code, oom) {
+            (Some(c), Some(true)) if c != 0 => Some(format!(
+                "exited with {c}, and the kernel's OOM killer ran while it did: one of its \
+                 processes may have been killed for memory{peak_note}"
+            )),
+            _ => None,
+        };
+    };
+    let peak = peak_note;
+    Some(match (n, oom) {
+        (9, Some(true)) => format!(
             "out of memory: {how}, and the kernel's OOM killer ran while it did{peak}. \
              Give it more memory or less parallelism (`memory` sets a limit for docker tasks)"
-        )
-    } else if n == 9 {
-        format!("{how}; the kernel recorded no OOM kill, so something else sent it{peak}")
-    } else {
-        format!("{how}{peak}")
+        ),
+        (9, Some(false)) => {
+            format!("{how}; the kernel recorded no OOM kill, so something else sent it{peak}")
+        }
+        (9, None) => format!("{how} (out of memory, or something else sent it){peak}"),
+        _ => format!("{how}{peak}"),
     })
 }
 
@@ -159,22 +178,31 @@ mod tests {
 
     #[test]
     fn names_the_kill() {
-        let oom = explain(Some(137), None, true, 3 << 30).unwrap();
+        let oom = explain(Some(137), None, Some(true), 3 << 30).unwrap();
         assert!(
             oom.starts_with("out of memory: exit 137: killed by SIGKILL"),
             "{oom}"
         );
         assert!(oom.contains("seen using up to 3.0 GB"), "{oom}");
         assert_eq!(
-            explain(None, Some(9), false, 0).unwrap(),
+            explain(None, Some(9), Some(false), 0).unwrap(),
             "killed by SIGKILL; the kernel recorded no OOM kill, so something else sent it"
         );
         assert_eq!(
-            explain(Some(139), None, false, 200 << 20).unwrap(),
+            explain(Some(139), None, Some(false), 200 << 20).unwrap(),
             "exit 139: killed by SIGSEGV; its processes were seen using up to 200 MB"
         );
-        assert_eq!(explain(Some(1), None, true, 0), None);
-        assert_eq!(explain(Some(200), None, false, 0), None);
+        // Where the kernel's count cannot be read, it does not guess.
+        assert_eq!(
+            explain(Some(137), None, None, 0).unwrap(),
+            "exit 137: killed by SIGKILL (out of memory, or something else sent it)"
+        );
+        // A child killed for memory under a parent that exits 2.
+        assert!(explain(Some(2), None, Some(true), 0)
+            .unwrap()
+            .contains("may have been killed for memory"));
+        assert_eq!(explain(Some(1), None, Some(false), 0), None);
+        assert_eq!(explain(Some(200), None, Some(false), 0), None);
     }
 
     #[cfg(target_os = "linux")]

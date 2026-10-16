@@ -65,8 +65,10 @@ pub async fn parse(
     sandboxed: bool,
 ) -> Result<PitConfig> {
     let ctx = serde_json::to_vec(ctx)?;
+    // Per trust level: a fork's result is never reused for a trusted run,
+    // nor the other way round.
     let key = format!(
-        "{name}:{}:{}",
+        "{name}:{}:{}:{sandboxed}",
         crate::cas::digest(source),
         crate::cas::digest(&ctx)
     );
@@ -163,6 +165,8 @@ async fn eval_sandboxed(file: &Path, ctx: &Path) -> Result<PitConfig> {
             "512m",
             "--pids-limit",
             "64",
+            "--cpus",
+            "1",
         ])
         .arg("--mount")
         .arg(mount(file, "/pit/config.mts"))

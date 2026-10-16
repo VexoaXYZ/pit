@@ -15,9 +15,9 @@ use anyhow::{bail, Result};
 use super::App;
 use crate::graph::PlannedGroup;
 
-/// What durations and splits are kept under: the task within its group, not
-/// counting the shard (`ci#2`) or OS, so every shard reads and feeds the same
-/// numbers.
+/// What durations and splits are kept under: the task within its group,
+/// without the shard (`ci#2`), so every shard reads and feeds the same
+/// numbers. A group on several OSes (`ci@linux#2`) keeps one set per OS.
 pub fn timing_key(group: &str, task: &str) -> String {
     let base = match group.rsplit_once('#') {
         Some((base, k)) if !k.is_empty() && k.chars().all(|c| c.is_ascii_digit()) => base,

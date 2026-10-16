@@ -2803,3 +2803,33 @@ async fn failed_tests_are_annotated_on_the_check() {
     assert_eq!(first["annotation_level"], "failure");
     assert_eq!(first["message"], "expected 1");
 }
+
+/// Pit's own bookkeeping about a workspace lives outside it: a task that
+/// plants a symlink where it used to be (`.git/pit-warm.json`) cannot make
+/// the worker write through it to a file outside the workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_worker_never_writes_through_a_task_planted_symlink() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let precious = dir
+        .join("..")
+        .join(format!("precious-{}", std::process::id()));
+    std::fs::write(&precious, "precious").unwrap();
+    let plant = format!(
+        "for f in .git/pit-warm.json .git/pit-used; do rm -f $f; ln -s {} $f; done",
+        precious.display()
+    );
+    let config = serde_json::json!({ "tasks": {
+        "plant": { "run": plant, "cache": false },
+        "warm": { "run": "true", "cache": "workspace", "deps": ["plant"] },
+    } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run(&pit, dir).await;
+    assert_eq!(view.status, Status::Passed, "{view:?}");
+    assert_eq!(std::fs::read_to_string(&precious).unwrap(), "precious");
+}

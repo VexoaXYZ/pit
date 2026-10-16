@@ -318,14 +318,32 @@ fn record(
     }
 }
 
+/// A report's text: a regular file, not followed through a symlink (a task
+/// can swap one in for `/dev/zero`), and at most `MAX_REPORT_BYTES`.
+fn read_report(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = open.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_REPORT_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_REPORT_BYTES).read_to_end(&mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 /// The combined summary of every report file, or `None` if there were none.
 pub fn summarize(files: &[impl AsRef<Path>]) -> Option<Summary> {
     let mut total: Option<Summary> = None;
     for f in files {
-        if std::fs::metadata(f).map_or(true, |m| m.len() > MAX_REPORT_BYTES) {
-            continue;
-        }
-        let Ok(xml) = std::fs::read_to_string(f) else {
+        let Some(xml) = read_report(f.as_ref()) else {
             continue;
         };
         total
@@ -469,5 +487,21 @@ mod tests {
             r#"<testsuite><testcase classname="c" name="t"><failure message="no"/></testcase></testsuite>"#,
         );
         assert_eq!(s.failures, [("c.t".to_string(), "no".to_string())]);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod report_files {
+    use super::*;
+
+    #[test]
+    fn a_report_swapped_for_a_symlink_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.xml");
+        std::fs::write(&real, r#"<testsuite><testcase name="a"/></testsuite>"#).unwrap();
+        let link = dir.path().join("link.xml");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        assert_eq!(summarize(&[&real]).map(|s| s.tests), Some(1));
+        assert!(summarize(&[&link]).is_none());
     }
 }

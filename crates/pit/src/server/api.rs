@@ -479,8 +479,20 @@ async fn finish_task(
     let (group_id, run_id, name) = app.db.task_group(&id)?;
     // A pass that took far longer than this task usually does says so: CI
     // that gets slower otherwise goes unnoticed until everything is slow.
-    if r.status == Status::Passed {
-        let history = app.db.recent_durations(&id, crate::slow::HISTORY)?;
+    // Not for a pass that needed a retry (its time is every attempt's) or a
+    // cold workspace (`--fresh`, forks), which warm history would always
+    // call slow.
+    let flaky = r
+        .message
+        .as_deref()
+        .is_some_and(|m| m.starts_with("flaky:"));
+    let run = app.db.run(&run_id)?;
+    if r.status == Status::Passed && !flaky && !run.fresh && !run.no_secrets {
+        let (a, task) = (app.clone(), id.clone());
+        let history =
+            tokio::task::spawn_blocking(move || a.db.recent_durations(&task, crate::slow::HISTORY))
+                .await
+                .map_err(anyhow::Error::from)??;
         if let Some(note) = crate::slow::note(r.duration_ms as i64, &history) {
             r.message = Some(match r.message.take() {
                 Some(m) => format!("{m} · {note}"),

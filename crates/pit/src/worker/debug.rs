@@ -76,8 +76,12 @@ pub fn write_script(
         }
     }
     let mut s = String::from("#!/bin/sh\n");
+    // Names and messages go into comments: a newline in them must not
+    // start a line the shell runs.
+    let one_line = |t: &str| t.replace(['\n', '\r'], " ");
     s.push_str(&format!(
-        "# Pit debug shell for task {task}, in the workspace where it failed.\n"
+        "# Pit debug shell for task {}, in the workspace where it failed.\n",
+        one_line(task)
     ));
     if let Some(f) = failure {
         s.push_str("# It failed with:\n");
@@ -92,7 +96,7 @@ pub fn write_script(
     if !withheld.is_empty() {
         s.push_str(&format!(
             "# Not included (secrets): {}. Export them first if you need them.\n",
-            withheld.join(", ")
+            one_line(&withheld.join(", "))
         ));
     }
     if policy.minimal {
@@ -111,14 +115,22 @@ pub fn write_script(
         s.push_str("tty=; [ -t 0 ] && tty=-t\n");
     }
     s.push_str(&format!("exec {}\n", words.join(" ")));
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{}.sh", safe_file(task)));
-    std::fs::write(&path, s)?;
+    // The worker's user only, from the start: the script holds the task's
+    // variables, `env` values from the worker included.
+    let mut dirs = std::fs::DirBuilder::new();
+    dirs.recursive(true);
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        dirs.mode(0o700);
+        file.mode(0o700);
     }
+    dirs.create(dir)?;
+    let path = dir.join(format!("{}.sh", safe_file(task)));
+    let _ = std::fs::remove_file(&path);
+    std::io::Write::write_all(&mut file.open(&path)?, s.as_bytes())?;
     Ok(path)
 }
 
