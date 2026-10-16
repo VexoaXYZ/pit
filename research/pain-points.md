@@ -1716,3 +1716,56 @@ secret its config asks for, as both `secrets` and `env`.
 - **Same-user reads.** On the `host` backend a same-repo task runs as the worker's user and can
   read the secrets file directly. That is the same exposure as GitHub's same-repo PRs, which
   get secrets.
+
+## P32. A new branch starts with a cold cache
+
+**Pain.** GitHub Actions caches are scoped by branch. A run can restore only caches made on its
+own branch, its pull request's base branch, or the default branch, so `feature-b` cannot use
+what `feature-a` just built. If no workflow saves a cache on `main`, every new pull request
+starts cold. The official workaround is to run the workflow on `main` (on push or on a schedule)
+just to fill a cache there
+([GitHub docs](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching),
+[actions/cache tips](https://github.com/actions/cache/blob/main/tips-and-workarounds.md),
+[saveriomiroddi](https://saveriomiroddi.github.io/Improving-the-Github-Actions-caching-effectiveness/),
+[Earthly](https://earthly.dev/blog/caching-dependencies-github-actions/),
+[medium](https://medium.com/@everton.spader/how-to-cache-package-dependencies-between-branches-with-github-actions-e6a19f33783a),
+[community#194493](https://github.com/orgs/community/discussions/194493)).
+
+**Reproduction**: T3 Code on a branch Pit had never seen (`brand-new-branch-…`), running
+`install`, `electron` and `typecheck:apps/web` (per-package config, P21).
+
+```
+◆ install  cached   ◆ electron  cached   ◆ typecheck:apps/web  cached
+passed in 23.2s · 0 ran, 3 cached          (first measurement, load ~1.5)
+```
+
+Nothing ran. The cache keys on file contents, not branches, and warm workspaces are per repo and
+group, so a new branch starts as warm as any other. Untrusted branches still never feed trusted
+runs (P20).
+
+**But 23.2s for a run with nothing to do was a regression.** The same cached run took 1.0s in
+the first benchmark. Repeats took about 8s, and the monolithic config took 19.9s under load.
+Tracing showed planning at 4.4s, almost all of it reading the config: P21's workspace context
+read every tracked `package.json`, all 356 of them, mostly vendored code under `.repos/`, one
+`git show` process at a time, before checking which ones the workspace globs select.
+
+**Fix** (research/pain-hunt): read `package.json` and `pnpm-workspace.yaml` first, then only the
+manifests the globs select (about 30 here), all through one `git cat-file --batch`
+(`git::read_blobs`, unit test `reads_many_files_in_one_batch`). Planning now logs its phases at
+debug level.
+
+```
+planning   4.4s → 0.74–0.99s   (config 4.1s → 0.37–0.43s)
+fully cached T3 Code run (new branch): ~8s → 2.2–2.4s, measured at load average 11
+```
+
+**Verdict: SOLVED** for new branches: no per-branch cache, and no cold start for a branch Pit
+has not seen. The regression is fixed, but a fully cached run is still about 2.2s here, against
+1.0s on an idle box with the original 7 tasks. The remainder is planning (indexing 28k files)
+and the CLI's snapshot.
+
+During this iteration the full e2e suite failed once with two timing-sensitive tests
+(`fully_cached_runs_do_not_wait_for_busy_workers` and
+`merge_queue_lands_disjoint_lanes_in_parallel_and_ejects_failures`) while the box was at load
+average 7–11. Three reruns, two of them full suites, passed. Those tests may be flaky under
+heavy load.

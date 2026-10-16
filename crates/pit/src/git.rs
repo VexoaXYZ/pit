@@ -43,6 +43,60 @@ pub async fn git_raw(dir: &Path, args: &[&str]) -> Result<std::process::Output> 
         .with_context(|| format!("running git {}", args.join(" ")))
 }
 
+/// Reads many files at one commit with a single `git cat-file --batch`,
+/// rather than a process per file. Missing paths are left out.
+pub async fn read_blobs(
+    dir: &Path,
+    sha: &str,
+    paths: &[String],
+) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+    use tokio::io::AsyncWriteExt;
+    let mut out = std::collections::HashMap::new();
+    if paths.is_empty() {
+        return Ok(out);
+    }
+    let mut child = Command::new("git")
+        .args(["cat-file", "--batch"])
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("running git cat-file --batch")?;
+    let mut stdin = child.stdin.take().context("cat-file stdin")?;
+    let input: String = paths.iter().map(|p| format!("{sha}:{p}\n")).collect();
+    // Write while reading, or a large batch fills the pipes and deadlocks.
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(input.as_bytes()).await;
+    });
+    let output = child.wait_with_output().await?;
+    let _ = writer.await;
+    let data = output.stdout;
+    let mut pos = 0;
+    for path in paths {
+        let Some(nl) = data[pos..].iter().position(|b| *b == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&data[pos..pos + nl]).to_string();
+        pos += nl + 1;
+        // "<oid> <type> <size>", or "<input> missing".
+        let mut parts = header.split(' ');
+        let (Some(_), Some(_), Some(size)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(size) = size.parse::<usize>() else {
+            continue;
+        };
+        if pos + size > data.len() {
+            break;
+        }
+        out.insert(path.clone(), data[pos..pos + size].to_vec());
+        pos += size + 1;
+    }
+    Ok(out)
+}
+
 pub async fn git_ok(dir: &Path, args: &[&str]) -> bool {
     git_raw(dir, args)
         .await
@@ -277,6 +331,40 @@ pub async fn toplevel(dir: &Path) -> Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn reads_many_files_in_one_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::write(d.join("a/package.json"), "{\"name\":\"a\"}\n").unwrap();
+        std::fs::write(d.join("b.txt"), "line 1\nline 2\n").unwrap();
+        std::fs::write(d.join("empty"), "").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"],
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "x",
+            ],
+        ] {
+            git(d, args).await.unwrap();
+        }
+        let paths: Vec<String> = ["a/package.json", "missing.txt", "b.txt", "empty"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = read_blobs(d, "HEAD", &paths).await.unwrap();
+        assert_eq!(got["a/package.json"], b"{\"name\":\"a\"}\n");
+        assert_eq!(got["b.txt"], b"line 1\nline 2\n");
+        assert_eq!(got["empty"], b"");
+        assert!(!got.contains_key("missing.txt"));
+    }
+
     use super::*;
 
     #[tokio::test(start_paused = true)]

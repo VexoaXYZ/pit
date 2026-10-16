@@ -202,28 +202,44 @@ impl App {
             .into_iter()
             .map(|(p, _)| p)
             .collect();
-        // Only the workspace manifests are read, so fetch just those.
-        let wanted: Vec<&String> = files
-            .iter()
-            .filter(|p| {
-                !p.contains("node_modules/")
-                    && (p.ends_with("package.json") || *p == "pnpm-workspace.yaml")
-            })
-            .collect();
-        let mut contents = HashMap::new();
-        for path in wanted {
-            let from_overlay = overlay.and_then(|o| o.entries.iter().find(|e| &e.path == path));
-            let bytes = match from_overlay.and_then(|e| e.digest.as_ref()) {
-                Some(d) => self.cas.get(d)?,
-                None => crate::git::show_file(mirror, sha, path).await?,
-            };
-            if let Some(b) = bytes {
-                contents.insert(path.clone(), b);
+        // Root manifests first, then only the packages they name: a repo
+        // can have hundreds of unrelated package.json files (fixtures,
+        // vendored code), and reading them all made planning slow.
+        let roots = [
+            "package.json".to_string(),
+            "pnpm-workspace.yaml".to_string(),
+        ];
+        let root = self.read_files(mirror, sha, overlay, &roots).await?;
+        let manifests = crate::workspace::manifest_paths(&files, |p| root.get(p).cloned());
+        let contents = self.read_files(mirror, sha, overlay, &manifests).await?;
+        Ok(crate::workspace::Context {
+            packages: crate::workspace::package_list(&manifests, |p| contents.get(p).cloned()),
+        })
+    }
+
+    /// Files at a commit, with the overlay's versions where it has them.
+    async fn read_files(
+        &self,
+        mirror: &Path,
+        sha: &str,
+        overlay: Option<&Overlay>,
+        paths: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        let mut from_git = Vec::new();
+        let mut out = HashMap::new();
+        for path in paths {
+            match overlay.and_then(|o| o.entries.iter().find(|e| &e.path == path)) {
+                Some(e) => {
+                    let bytes = e.digest.as_ref().map(|d| self.cas.get(d)).transpose()?;
+                    if let Some(b) = bytes.flatten() {
+                        out.insert(path.clone(), b);
+                    }
+                }
+                None => from_git.push(path.clone()),
             }
         }
-        Ok(crate::workspace::Context {
-            packages: crate::workspace::packages(&files, |p| contents.get(p).cloned()),
-        })
+        out.extend(crate::git::read_blobs(mirror, sha, &from_git).await?);
+        Ok(out)
     }
 
     pub fn load_overlay(&self, digest: &str) -> Result<Overlay> {
@@ -307,7 +323,9 @@ impl App {
         repo: &db::Repo,
         req: &CreateRun,
     ) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let mirror = self.ensure_commit(repo, &req.sha).await?;
+        let t_commit = t0.elapsed();
         let overlay = req
             .overlay
             .as_deref()
@@ -316,6 +334,7 @@ impl App {
         let config = self
             .load_config(&mirror, &req.sha, overlay.as_ref())
             .await?;
+        let t_config = t0.elapsed();
         let groups = crate::graph::plan(&config, &req.tasks)?;
         let run = self.db.run(run_id)?;
         if run.status.is_done() {
@@ -370,6 +389,13 @@ impl App {
                 lock.as_deref(),
             )?;
         }
+        tracing::debug!(
+            "planned {run_id} in {:?} (commit {:?}, config {:?}, rest {:?})",
+            t0.elapsed(),
+            t_commit,
+            t_config - t_commit,
+            t0.elapsed() - t_config
+        );
         self.emit(
             "run.planned",
             Some(run_id),

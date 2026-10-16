@@ -40,6 +40,13 @@ pub struct Context {
 /// Finds the workspace packages among `files` (every path in the tree),
 /// reading files through `read`.
 pub fn packages(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) -> Vec<Package> {
+    let manifests = manifest_paths(files, &read);
+    package_list(&manifests, read)
+}
+
+/// The `package.json` paths of the workspace packages, from the root
+/// manifests alone, so a caller can fetch just these.
+pub fn manifest_paths(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) -> Vec<String> {
     let patterns = workspace_globs(&read);
     if patterns.is_empty() {
         return vec![];
@@ -58,11 +65,17 @@ pub fn packages(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) -> Vec
     let (Ok(include), Ok(exclude)) = (include.build(), exclude.build()) else {
         return vec![];
     };
+    files
+        .iter()
+        .filter(|p| !p.contains("node_modules/") && include.is_match(p) && !exclude.is_match(p))
+        .cloned()
+        .collect()
+}
+
+/// Packages from their manifests (see `manifest_paths`).
+pub fn package_list(manifests: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) -> Vec<Package> {
     let mut found: BTreeMap<String, (String, Vec<String>, Vec<String>)> = BTreeMap::new();
-    for path in files {
-        if path.contains("node_modules/") || !include.is_match(path) || exclude.is_match(path) {
-            continue;
-        }
+    for path in manifests {
         let Some(json) =
             read(path).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         else {
