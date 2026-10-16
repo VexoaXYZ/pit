@@ -2998,3 +2998,54 @@ logs its error and falls through to the merge-base.
 can't interfere, because superseded runs never count as green. Caveat: the base comes from Pit's
 own trusted runs. A repo whose main runs elsewhere (or not on Pit yet) gets the merge-base
 fallback until its first green trusted run on Pit.
+
+## P50. Many coding agents in parallel: CI becomes the bottleneck
+
+**The pain.** Coding agents push faster than CI runners build and test. One developer runs
+several agents, each in its own worktree, each opening pull requests and pushing every small fix
+attempt as another pipeline run. Reruns join the same queue, and results arrive after the agent
+has moved on ([SpecStory](https://specstory.com/learning/ci-cd/ci-for-coding-agents), which
+cites a 25-fold growth in CI jobs in six months at one company;
+[Megaport](https://www.megaport.com/blog/are-ai-coding-agents-the-new-ci-bottleneck/);
+[Qovery](https://www.qovery.com/blog/ai-devops-2026-cicd-pipeline-bottleneck)).
+
+The proposed answer is to move CI's checks into the agent's own loop, without losing CI's
+hermeticity:
+- [daily.dev / DevOps.com](https://daily.dev/posts/ai-coding-agents-are-pulling-ci-feedback-into-the-inner-loop-ivtxzjfos),
+  [cicd.deployment.to](http://cicd.deployment.to/agents-pull-ci-feedback-inner-loop/);
+- [DEV](https://dev.to/david_moores_cbc0233b7447/the-agentic-bottleneck-why-we-need-to-rethink-ci-4kih);
+- [agentic-patterns](https://www.agentic-patterns.com/patterns/coding-agent-ci-feedback-loop/),
+  which warns that flaky failures mislead agents into unneeded patches;
+- [CallMissed](https://www.callmissed.com/blog/ai-coding-ci-bottlenecks-practical-playbook),
+  which notes more runners alone may not fix it.
+
+**Reproduction.**
+- A monorepo with `build-core` (5s, every test depends on it) and eight packages with a 2s test
+  each.
+- Eight git worktrees ("agents"), each with an uncommitted change to a different package.
+- All eight run `pit run` at the same moment against one `pit up` (2 slots, parallelism 4).
+  That is Pit's inner loop: each run checks the agent's working tree on the same workers and
+  backends as CI, with no push.
+
+| Round (8 agents at once) | Wall time | Task executions |
+| --- | --- | --- |
+| First, empty cache | 16.4s | 17 |
+| Next edit, warm cache | 8.7s | 8 |
+| `--no-cache` (what eight independent full pipelines cost) | 37.3s | 72 |
+
+- **First round.** One agent built `core` once; the other seven took it from the cache or waited
+  for that build (single flight, P30). That agent ran all eight tests, since nothing was cached
+  yet. Each other agent ran only its own package's test, plus, for one agent, the base version of
+  a package the first had changed.
+- **Next round.** Each agent re-ran exactly one test, its own package's.
+- The remaining time is capacity: eight one-group runs on two slots, about 2s per wave.
+
+**Verdict: SOLVED** for the duplicated work: agents share one cache and one in-flight build, and
+check uncommitted trees without pushing (P6). The parts that make an agent loop trustworthy were
+already in place:
+- the same isolation as CI;
+- flaky tests named rather than retried silently (P33);
+- failures summarised for an agent's context (P16, P34, MCP).
+
+What stays: capacity is the workers'. Pit doesn't add machines, and P41's `/metrics` is what an
+autoscaler would use. Runs are first come, first served, with no fairness between agents.
