@@ -3231,7 +3231,8 @@ statuses, which have no Re-run button, so the only rerun was a new push. Pit ign
   jobs".
 - Pit adds a 🚀 reaction to the comment.
 
-Unlike Actions' rerun, which keeps a stale merge ref, this reruns the PR head commit, which is
+Unlike Actions' rerun, which keeps a stale merge ref
+([konadu](https://konadu.dev/github-actions-re-run-stale-merge-ref)), this reruns the PR head commit, which is
 what Pit tested in the first place.
 
 **Measured.** e2e `retest_comments_rerun_the_failures`, with signed webhooks and a mock GitHub:
