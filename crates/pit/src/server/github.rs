@@ -249,14 +249,20 @@ impl GitHub {
         }
         for g in &view.groups {
             let summary = summarize(g);
-            // Not part of this kind of run (`on`): reported "skipped", which
+            // Left out of this kind of run (`on`): reported "skipped", which
             // GitHub counts as passing for a required check, as for a job an
-            // `if:` skips.
-            let status = if g.worker.as_deref() == Some("on") {
-                Status::Skipped
-            } else {
-                g.status
+            // `if:` skips. Unless another run of this commit really runs that
+            // group: its check is the one that counts, and must not be
+            // overwritten.
+            let left_out = app.db.group(&g.id).map(|r| r.left_out).unwrap_or(false);
+            let real_elsewhere = |app: &Arc<App>| {
+                app.db
+                    .real_group_on_commit(&run.repo_id, &run.sha, &g.name, run_id)
             };
+            if left_out && real_elsewhere(app)? {
+                continue;
+            }
+            let status = if left_out { Status::Skipped } else { g.status };
             let annotations = if g.status.is_done() {
                 app.db.group_annotations(&g.id)?
             } else {
@@ -274,6 +280,14 @@ impl GitHub {
                 &annotations,
             )
             .await?;
+            // A run that really runs the group may have appeared while this
+            // left-out copy was being posted: report it again, so its check
+            // is the newest (it posts a new check run over this one).
+            if left_out && real_elsewhere(app)? {
+                for other in app.db.real_group_runs(&run.repo_id, &run.sha, &g.name)? {
+                    Box::pin(self.try_report_run(app, &other)).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -292,12 +306,10 @@ impl GitHub {
         annotations: &[Annotation],
     ) -> Result<()> {
         let check_name = format!("pit / {name}");
-        // A group this kind of run leaves out (`on`) is recorded as passed
-        // with skipped tasks.
         let not_in_run = status == Status::Skipped
             && group_id
                 .and_then(|g| app.db.group(g).ok())
-                .is_some_and(|g| g.status == Status::Passed);
+                .is_some_and(|g| g.left_out);
         match &self.auth {
             Auth::Token(_) => {
                 let state = match status {
@@ -365,9 +377,21 @@ impl GitHub {
                 if annotate {
                     body["output"]["annotations"] = chunks.next().unwrap_or_default().into();
                 }
-                let existing = group_id
-                    .and_then(|g| app.db.group(g).ok())
-                    .and_then(|g| g.check_run_id);
+                let row = group_id.and_then(|g| app.db.group(g).ok());
+                // GitHub takes the newest check run of a name as the check. If
+                // a left-out copy of this group (another run of the commit,
+                // `on`) posted one after ours, ours must be posted anew to
+                // count again.
+                let newer_left_out = match &row {
+                    Some(r) if !r.left_out => {
+                        let run = app.db.run(&r.run_id)?;
+                        app.db
+                            .newest_left_out_check(&run.repo_id, sha, &r.name)?
+                            .is_some_and(|l| r.check_run_id.is_none_or(|own| l > own))
+                    }
+                    _ => false,
+                };
+                let existing = row.and_then(|g| g.check_run_id).filter(|_| !newer_left_out);
                 let sent = match existing {
                     Some(id) => self
                         .call(
@@ -560,6 +584,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         no_cache: false,
                         fresh: false,
                         debug: false,
+                        counts_as: None,
                         no_secrets: false,
                     },
                     None,
@@ -620,6 +645,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                             // Fork code gets a throwaway workspace and no secrets.
                             fresh: fork,
                             debug: false,
+                            counts_as: None,
                             no_secrets: fork,
                             trusted: false,
                         },
@@ -665,6 +691,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         no_cache: false,
                         fresh: false,
                         debug: false,
+                        counts_as: None,
                         no_secrets: false,
                         trusted: false,
                     },
@@ -686,6 +713,28 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
             let Some(prior) = app.db.prior_run(&repo.id, &sha)? else {
                 return Ok(serde_json::json!({ "ignored": "Pit has not run this commit" }));
             };
+            // The run whose check was re-run (Pit puts the group in the
+            // check's `external_id`): the rerun repeats it, ref and kind
+            // included. Restrictions still come from `prior`.
+            let owner = payload["check_run"]["external_id"]
+                .as_str()
+                .and_then(|g| app.db.group(g).ok())
+                .and_then(|g| app.db.run(&g.run_id).ok())
+                .filter(|r| r.repo_id == repo.id && r.sha == sha);
+            // "Re-run all checks" (a check suite) names no check: it counts as
+            // every kind this commit ran as, so no group it showed is left out.
+            let suite = owner.is_none();
+            let shape = owner.unwrap_or_else(|| prior.clone());
+            let counts_as = Some(if suite {
+                app.db.commit_kinds(&repo.id, &sha)?
+            } else {
+                shape.kinds.clone().unwrap_or_else(|| {
+                    super::run_kinds(&shape.trigger, shape.trusted, shape.git_ref.as_deref())
+                        .into_iter()
+                        .map(String::from)
+                        .collect()
+                })
+            });
             let id = app
                 .create_run(
                     CreateRun {
@@ -695,14 +744,15 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         overlay: None,
                         tasks: vec![],
                         trigger: Some("rerun".into()),
-                        git_ref: prior.git_ref,
+                        git_ref: shape.git_ref,
                         no_cache: false,
                         fresh: prior.fresh || prior.no_secrets,
                         debug: false,
+                        counts_as,
                         no_secrets: prior.no_secrets,
                         trusted: false,
                     },
-                    prior.github_pr,
+                    shape.github_pr,
                 )
                 .await?;
             Ok(serde_json::json!({ "run": id }))
@@ -738,8 +788,10 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
             let Some(prior) = app.db.latest_pr_run(&repo.id, number)? else {
                 return Ok(serde_json::json!({ "ignored": "Pit has not run this pull request" }));
             };
-            // The same commit, with the restrictions it ran under (a fork's
-            // commit stays a fork's; its next push still needs the label).
+            // The same commit, counted as a pull request run, with the
+            // restrictions it ran under (a fork's commit stays a fork's; its
+            // next push still needs the label).
+            let counts_as = Some(vec!["pr".to_string()]);
             let prior = app.db.prior_run(&repo.id, &prior.sha)?.unwrap_or(prior);
             let id = app
                 .create_run(
@@ -754,6 +806,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         no_cache: false,
                         fresh: prior.fresh || prior.no_secrets,
                         debug: false,
+                        counts_as,
                         no_secrets: prior.no_secrets,
                         trusted: false,
                     },

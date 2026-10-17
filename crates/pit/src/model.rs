@@ -282,6 +282,11 @@ pub struct CreateRun {
     /// shell in the task's environment there (`pit run --debug`).
     #[serde(default)]
     pub debug: bool,
+    /// What the run counts as for groups' `on`, instead of what its trigger
+    /// says: a rerun counts as the run it repeats, an API run as `local`.
+    /// Only the server sets it.
+    #[serde(skip)]
+    pub counts_as: Option<Vec<String>>,
     /// Code from outside the repo (a fork PR): no secrets, no `env` values
     /// from the worker, and only a minimal inherited environment. Only the
     /// server sets it.

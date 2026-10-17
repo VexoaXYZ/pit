@@ -136,6 +136,7 @@ async fn start(
                 no_cache: s.no_cache,
                 fresh: s.fresh,
                 debug: false,
+                counts_as: None,
                 no_secrets: false,
                 trusted: true,
             },

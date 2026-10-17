@@ -641,6 +641,7 @@ impl Queue<'_> {
                     no_cache: false,
                     fresh: false,
                     debug: false,
+                    counts_as: None,
                     no_secrets: false,
                     trusted: super::trusted_branch(
                         self.target,
@@ -839,6 +840,7 @@ impl Queue<'_> {
                     no_cache: false,
                     fresh: false,
                     debug: false,
+                    counts_as: None,
                     no_secrets: false,
                     // Queueing is the decision to land it on the target.
                     trusted: super::trusted_branch(

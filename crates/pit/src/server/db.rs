@@ -212,6 +212,8 @@ pub struct RunRow {
     pub no_secrets: bool,
     pub debug: bool,
     pub base_sha: Option<String>,
+    /// What the run counts as for `on` (`pr`, `main`…), set when planned.
+    pub kinds: Option<Vec<String>>,
 }
 
 pub struct WaitingGroup {
@@ -234,6 +236,8 @@ pub struct GroupRow {
     pub os: String,
     pub status: Status,
     pub check_run_id: Option<u64>,
+    /// Recorded but not run: this kind of run leaves the group out (`on`).
+    pub left_out: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +309,18 @@ fn migrate(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has_fresh {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let has_left_out: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'left_out'")?
+        .exists([])?;
+    if !has_left_out {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN left_out INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let has_kinds: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'kinds'")?
+        .exists([])?;
+    if !has_kinds {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN kinds TEXT")?;
     }
     let has_base: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'base_sha'")?
@@ -401,6 +417,9 @@ fn run_row(r: &Row) -> rusqlite::Result<RunRow> {
         fresh: r.get::<_, i64>("fresh")? != 0,
         debug: r.get::<_, i64>("debug")? != 0,
         base_sha: r.get("base_sha")?,
+        kinds: r
+            .get::<_, Option<String>>("kinds")?
+            .and_then(|k| serde_json::from_str(&k).ok()),
         no_secrets: r.get::<_, i64>("no_secrets")? != 0,
     })
 }
@@ -762,13 +781,14 @@ impl Db {
             os,
             tasks,
             results,
-            "cache",
+            Some("cache"),
             "every task came from the cache; no worker needed",
         )
     }
 
     /// A group that is done without a worker: answered by the cache
-    /// (`worker` "cache"), or not part of this kind of run ("on").
+    /// (`worker` "cache"), or left out of this kind of run (no worker,
+    /// `left_out`).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_finished_group(
         &self,
@@ -777,7 +797,7 @@ impl Db {
         os: &str,
         tasks: &[(String, TaskDef)],
         results: &[TaskResult],
-        worker: &str,
+        worker: Option<&str>,
         message: &str,
     ) -> Result<String> {
         let mut c = self.conn.lock();
@@ -785,9 +805,9 @@ impl Db {
         let gid = new_id("grp");
         let now = now_ms();
         tx.execute(
-            "INSERT INTO groups_ (id, run_id, name, os, backends, status, worker, prepare_ms, message, created_at, started_at, finished_at)
-             VALUES (?1, ?2, ?3, ?4, '[]', 'passed', ?6, 0, ?7, ?5, ?5, ?5)",
-            params![gid, run_id, name, os, now, worker, message],
+            "INSERT INTO groups_ (id, run_id, name, os, backends, status, worker, prepare_ms, message, created_at, started_at, finished_at, left_out)
+             VALUES (?1, ?2, ?3, ?4, '[]', 'passed', ?6, 0, ?7, ?5, ?5, ?5, ?8)",
+            params![gid, run_id, name, os, now, worker, message, worker.is_none()],
         )?;
         for (pos, ((tname, def), r)) in tasks.iter().zip(results).enumerate() {
             tx.execute(
@@ -840,12 +860,12 @@ impl Db {
                 "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends, groups_.created_at,
                    (SELECT prev.worker FROM groups_ prev JOIN runs pr ON pr.id = prev.run_id
                      WHERE pr.repo_id = runs.repo_id AND prev.name = groups_.name
-                       AND prev.worker IS NOT NULL AND prev.status IN ('passed', 'failed')
+                       AND prev.worker IS NOT NULL AND prev.worker != 'cache' AND prev.status IN ('passed', 'failed')
                      ORDER BY prev.finished_at DESC LIMIT 1) AS preferred,
                    (SELECT w.last_seen FROM workers w WHERE w.name = (
                      SELECT prev.worker FROM groups_ prev JOIN runs pr ON pr.id = prev.run_id
                      WHERE pr.repo_id = runs.repo_id AND prev.name = groups_.name
-                       AND prev.worker IS NOT NULL AND prev.status IN ('passed', 'failed')
+                       AND prev.worker IS NOT NULL AND prev.worker != 'cache' AND prev.status IN ('passed', 'failed')
                      ORDER BY prev.finished_at DESC LIMIT 1)) AS preferred_seen
                  FROM groups_
                  JOIN runs ON runs.id = groups_.run_id
@@ -945,7 +965,7 @@ impl Db {
     pub fn group(&self, id: &str) -> Result<GroupRow> {
         let c = self.conn.lock();
         c.query_row(
-            "SELECT id, run_id, name, os, status, check_run_id FROM groups_ WHERE id = ?1",
+            "SELECT id, run_id, name, os, status, check_run_id, left_out FROM groups_ WHERE id = ?1",
             params![id],
             |r| {
                 Ok(GroupRow {
@@ -955,6 +975,7 @@ impl Db {
                     os: r.get(3)?,
                     status: Status::parse(&r.get::<_, String>(4)?),
                     check_run_id: opt_u64(r.get(5)?),
+                    left_out: r.get::<_, i64>(6)? != 0,
                 })
             },
         )
@@ -965,7 +986,7 @@ impl Db {
     pub fn groups_for_run(&self, run_id: &str) -> Result<Vec<GroupRow>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
-            "SELECT id, run_id, name, os, status, check_run_id FROM groups_ WHERE run_id = ?1",
+            "SELECT id, run_id, name, os, status, check_run_id, left_out FROM groups_ WHERE run_id = ?1",
         )?;
         let rows = st
             .query_map(params![run_id], |r| {
@@ -976,6 +997,7 @@ impl Db {
                     os: r.get(3)?,
                     status: Status::parse(&r.get::<_, String>(4)?),
                     check_run_id: opt_u64(r.get(5)?),
+                    left_out: r.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1467,6 +1489,82 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_run_kinds(&self, id: &str, kinds: &[&str]) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE runs SET kinds = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(kinds)?],
+        )?;
+        Ok(())
+    }
+
+    /// Whether another run of this commit has a group of this name that is
+    /// really run (not left out): its check is the one that counts.
+    pub fn real_group_on_commit(
+        &self,
+        repo_id: &str,
+        sha: &str,
+        name: &str,
+        run_id: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .prepare_cached(
+                "SELECT 1 FROM groups_ g JOIN runs r ON r.id = g.run_id
+                 WHERE r.repo_id = ?1 AND r.sha = ?2 AND g.name = ?3 AND r.id != ?4 AND g.left_out = 0
+                   AND r.overlay IS NULL",
+            )?
+            .exists(params![repo_id, sha, name, run_id])?)
+    }
+
+    /// Runs of this commit that really run a group of this name.
+    pub fn real_group_runs(&self, repo_id: &str, sha: &str, name: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT DISTINCT r.id FROM groups_ g JOIN runs r ON r.id = g.run_id
+             WHERE r.repo_id = ?1 AND r.sha = ?2 AND g.name = ?3 AND g.left_out = 0 AND r.overlay IS NULL",
+        )?;
+        let rows = st
+            .query_map(params![repo_id, sha, name], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The newest check run a left-out copy of this group posted on this
+    /// commit (`GroupDef::on`).
+    pub fn newest_left_out_check(
+        &self,
+        repo_id: &str,
+        sha: &str,
+        name: &str,
+    ) -> Result<Option<u64>> {
+        let c = self.conn.lock();
+        let id: Option<i64> = c.query_row(
+            "SELECT MAX(g.check_run_id) FROM groups_ g JOIN runs r ON r.id = g.run_id
+             WHERE r.repo_id = ?1 AND r.sha = ?2 AND g.name = ?3 AND g.left_out = 1",
+            params![repo_id, sha, name],
+            |r| r.get(0),
+        )?;
+        Ok(id.map(|v| v as u64))
+    }
+
+    /// Every kind (`GroupDef::on`) the runs of this commit counted as.
+    pub fn commit_kinds(&self, repo_id: &str, sha: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT kinds FROM runs WHERE repo_id = ?1 AND sha = ?2 AND overlay IS NULL AND kinds IS NOT NULL",
+        )?;
+        let mut out: Vec<String> = Vec::new();
+        for k in st.query_map(params![repo_id, sha], |r| r.get::<_, String>(0))? {
+            for kind in serde_json::from_str::<Vec<String>>(&k?).unwrap_or_default() {
+                if !out.contains(&kind) {
+                    out.push(kind);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn set_run_base(&self, id: &str, base: &str) -> Result<()> {
         self.conn.lock().execute(
             "UPDATE runs SET base_sha = ?2 WHERE id = ?1",
@@ -1475,9 +1573,10 @@ impl Db {
         Ok(())
     }
 
-    /// Commits of `branch` whose trusted run passed, newest first. Only full
-    /// runs count (pushes and post-merge backstops): a scheduled run of one
-    /// task passing says nothing about the rest.
+    /// Commits of `branch` whose trusted run passed, newest first. Only
+    /// pushes and post-merge backstops count: a scheduled run of one task
+    /// passing says nothing about the rest. (Groups their kind leaves out,
+    /// `on`, did not run there either.)
     pub fn green_commits(&self, repo_id: &str, branch: &str, limit: usize) -> Result<Vec<String>> {
         let c = self.conn.lock();
         let mut st = c.prepare_cached(
@@ -2261,6 +2360,83 @@ mod tests {
         assert_eq!(db.notify_state("k").unwrap(), Some(("passed".into(), 200)));
         db.record_notify_state("k", "failed", 300).unwrap();
         assert_eq!(db.notify_state("k").unwrap(), Some(("failed".into(), 300)));
+    }
+
+    #[test]
+    fn left_out_copies_defer_to_reported_real_groups_only() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let results = vec![TaskResult {
+            status: Status::Passed,
+            exit_code: Some(0),
+            action_key: None,
+            duration_ms: 0,
+            log_digest: None,
+            message: None,
+        }];
+        let left = db
+            .insert_run(
+                &repo.id,
+                "x",
+                Some("feature"),
+                None,
+                0,
+                "push",
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        db.set_run_kinds(&left, &["push"]).unwrap();
+        // A local run with uncommitted changes is never reported: it does not count.
+        let local = db
+            .insert_run(
+                &repo.id,
+                "x",
+                None,
+                Some("ov"),
+                1,
+                "local",
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        db.insert_finished_group(&local, "lint", "any", &task, &results, Some("w"), "")
+            .unwrap();
+        assert!(!db
+            .real_group_on_commit(&repo.id, "x", "lint", &left)
+            .unwrap());
+        let pr = db
+            .insert_run(
+                &repo.id,
+                "x",
+                Some("pull/1"),
+                None,
+                0,
+                "pr",
+                false,
+                Some(1),
+                false,
+            )
+            .unwrap();
+        db.set_run_kinds(&pr, &["pr"]).unwrap();
+        db.insert_finished_group(&pr, "lint", "any", &task, &results, Some("w"), "")
+            .unwrap();
+        assert!(db
+            .real_group_on_commit(&repo.id, "x", "lint", &left)
+            .unwrap());
+        // "Re-run all checks" counts as every kind the commit ran as.
+        let mut kinds = db.commit_kinds(&repo.id, "x").unwrap();
+        kinds.sort();
+        assert_eq!(kinds, ["pr", "push"]);
     }
 
     #[test]

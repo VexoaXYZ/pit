@@ -67,7 +67,7 @@ pub fn plan(
     files: &[(String, String)],
 ) -> Result<()> {
     let mut splits: HashMap<String, Vec<Vec<String>>> = HashMap::new();
-    for g in groups.iter_mut() {
+    for g in groups.iter_mut().filter(|g| g.not_in.is_none()) {
         for (name, def) in g.tasks.iter_mut() {
             let (Some(k), Some(n)) = (def.shard, def.shards) else {
                 continue;

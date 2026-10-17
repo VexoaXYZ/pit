@@ -2769,6 +2769,7 @@ async fn failed_tests_are_annotated_on_the_check() {
                 no_cache: false,
                 fresh: false,
                 debug: false,
+                counts_as: None,
                 no_secrets: false,
                 trusted: false,
             },
@@ -3041,6 +3042,7 @@ async fn run_ref(pit: &Pit, url: &str, sha: String, git_ref: &str, trusted: bool
                 no_cache: false,
                 fresh: false,
                 debug: false,
+                counts_as: None,
                 no_secrets: false,
                 trusted,
             },
@@ -3433,7 +3435,7 @@ async fn groups_run_only_on_the_kinds_of_run_they_name() {
         let mut g: Vec<String> = v
             .groups
             .iter()
-            .filter(|g| g.worker.as_deref() != Some("on"))
+            .filter(|g| g.tasks.iter().any(|t| t.status != Status::Skipped))
             .map(|g| g.name.clone())
             .collect();
         g.sort();
@@ -3469,9 +3471,60 @@ async fn groups_run_only_on_the_kinds_of_run_they_name() {
     assert_eq!(ran(&named), ["e2e"], "{named:?}");
     let sha = sh(&work, "git rev-parse HEAD").trim().to_string();
     let url = tmp.path().join("origin.git").to_string_lossy().to_string();
-    let main = run_ref(&pit, &url, sha, "main", true).await;
+    let main = run_ref(&pit, &url, sha.clone(), "main", true).await;
     assert_eq!(ran(&main), ["deploy", "e2e", "unit"], "{main:?}");
     assert_eq!(main.status, Status::Passed);
+    // Tasks named in a schedule run whatever their group's `on` says, like
+    // tasks named on a local run.
+    let sha = sh(&work, "git rev-parse HEAD").trim().to_string();
+    let scheduled = pit
+        .app
+        .create_run(
+            CreateRun {
+                repo: "affected".into(),
+                url: Some(url.clone()),
+                sha: sha.clone(),
+                overlay: None,
+                tasks: vec!["e2e.test".into()],
+                trigger: Some("schedule:nightly".into()),
+                git_ref: Some("main".into()),
+                no_cache: true,
+                fresh: false,
+                debug: false,
+                counts_as: None,
+                no_secrets: false,
+                trusted: true,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let scheduled = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&pit.client, &scheduled, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ran(&scheduled), ["e2e"], "{scheduled:?}");
+    // A client naming a trigger through the API still counts as local: it
+    // cannot run the `main`-only deploy.
+    let api: serde_json::Value = pit
+        .client
+        .post(
+            "/api/runs",
+            &serde_json::json!({ "repo": "affected", "url": url, "sha": sha, "trigger": "post-merge", "ref": "main" }),
+        )
+        .await
+        .unwrap();
+    let api = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&pit.client, api["id"].as_str().unwrap(), |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ran(&api), ["unit"], "{api:?}");
     // A typo in `on` is a config error.
     let bad = serde_json::json!({ "groups": { "x": { "on": ["pull_request"], "tasks": { "t": { "run": "true" } } } } });
     write(&work, "pit.config.json", &bad.to_string());
@@ -3503,7 +3556,8 @@ async fn groups_left_out_by_on_still_report_their_check() {
     let data = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let github = pit::server::github::GitHub::with_token(&mock_url, "t", None).unwrap();
+    let github =
+        pit::server::github::GitHub::with_token(&mock_url, "t", Some("s3cret".into())).unwrap();
     let app = pit::server::App::with_github(
         &data.path().join("server"),
         None,
@@ -3515,7 +3569,7 @@ async fn groups_left_out_by_on_still_report_their_check() {
     tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
         server: base.clone(),
         token: None,
-        name: Some("on".into()),
+        name: Some("left-out".into()),
         data_dir: data.path().join("worker"),
         slots: 1,
         parallelism: 1,
@@ -3527,6 +3581,7 @@ async fn groups_left_out_by_on_still_report_their_check() {
     let config = serde_json::json!({ "groups": {
         "unit": { "tasks": { "t": { "run": "true" } } },
         "deploy": { "on": ["main"], "tasks": { "ship": { "run": "exit 1" } } },
+        "lint": { "on": ["pr"], "tasks": { "l": { "run": "exit 1", "cache": false } } },
     } });
     write(repo.path(), "pit.config.json", &config.to_string());
     sh(
@@ -3546,7 +3601,7 @@ async fn groups_left_out_by_on_still_report_their_check() {
             CreateRun {
                 repo: "acme/web".into(),
                 url: None,
-                sha,
+                sha: sha.clone(),
                 overlay: None,
                 tasks: vec![],
                 trigger: Some("pr".into()),
@@ -3554,6 +3609,7 @@ async fn groups_left_out_by_on_still_report_their_check() {
                 no_cache: false,
                 fresh: false,
                 debug: false,
+                counts_as: None,
                 no_secrets: false,
                 trusted: false,
             },
@@ -3569,7 +3625,11 @@ async fn groups_left_out_by_on_still_report_their_check() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(view.status, Status::Passed, "{view:?}");
+    assert_eq!(
+        view.status,
+        Status::Failed,
+        "lint fails in the PR run: {view:?}"
+    );
     let last = |ctx: &str| {
         statuses
             .lock()
@@ -3579,11 +3639,254 @@ async fn groups_left_out_by_on_still_report_their_check() {
             .map(|s| s["state"].as_str().unwrap_or_default().to_string())
     };
     tokio::time::timeout(Duration::from_secs(10), async {
-        while last("pit / deploy").is_none() || last("pit / unit").as_deref() != Some("success") {
+        while last("pit / deploy").is_none() || last("pit / lint").is_none() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
     .expect("statuses were not posted");
     assert_eq!(last("pit / deploy").as_deref(), Some("success"));
+    assert_eq!(last("pit / lint").as_deref(), Some("failure"));
+    // A branch push of the same commit leaves lint out, and must not turn
+    // the PR run's failed check green.
+    let push = app
+        .create_run(
+            CreateRun {
+                repo: "acme/web".into(),
+                url: None,
+                sha: sha.clone(),
+                overlay: None,
+                tasks: vec![],
+                trigger: Some("push".into()),
+                git_ref: Some("feature".into()),
+                no_cache: false,
+                fresh: false,
+                debug: false,
+                counts_as: None,
+                no_secrets: false,
+                trusted: false,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let pushed = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&client, &push, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(pushed.status, Status::Passed, "{pushed:?}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        last("pit / lint").as_deref(),
+        Some("failure"),
+        "overwritten by the push run"
+    );
+    // GitHub's Re-run on the PR run's lint check repeats that run, as a PR
+    // run: lint runs again (and fails), it is not left out.
+    use hmac::Mac;
+    let lint_group = view
+        .groups
+        .iter()
+        .find(|g| g.name == "lint")
+        .unwrap()
+        .id
+        .clone();
+    let body = serde_json::json!({ "action": "rerequested",
+        "repository": { "full_name": "acme/web", "clone_url": repo.path().to_string_lossy() },
+        "check_run": { "head_sha": sha, "external_id": lint_group } })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let rerun: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "check_run")
+        .header("x-hub-signature-256", sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rerun = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&client, rerun["run"].as_str().expect("a rerun"), |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let lint = rerun.groups.iter().find(|g| g.name == "lint").unwrap();
+    assert_eq!(lint.tasks[0].status, Status::Failed, "{rerun:?}");
+}
+
+/// GitHub takes the newest check run of a name as the check. When a
+/// left-out copy of a group (another run of the commit, `on`) posted a newer
+/// check run than the real group's, the real group posts a new one rather
+/// than updating its old, now hidden, one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_check_is_reposted_over_a_newer_left_out_one() {
+    use axum::routing::{get, patch, post};
+    type Seen = std::sync::Arc<parking_lot::Mutex<Vec<(String, serde_json::Value)>>>;
+    let seen: Seen = Default::default();
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(100));
+    let (s1, n1, s2) = (seen.clone(), next.clone(), seen.clone());
+    let mock = axum::Router::new()
+        .route(
+            "/repos/acme/web/installation",
+            get(|| async { axum::Json(serde_json::json!({ "id": 1 })) }),
+        )
+        .route(
+            "/app/installations/1/access_tokens",
+            post(|| async { axum::Json(serde_json::json!({ "token": "t" })) }),
+        )
+        .route(
+            "/repos/acme/web/check-runs",
+            post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+                let (s, n) = (s1.clone(), n1.clone());
+                async move {
+                    let id = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    s.lock().push((format!("POST {id}"), b));
+                    axum::Json(serde_json::json!({ "id": id }))
+                }
+            }),
+        )
+        .route(
+            "/repos/acme/web/check-runs/{id}",
+            patch(
+                move |axum::extract::Path(id): axum::extract::Path<u64>,
+                      axum::Json(b): axum::Json<serde_json::Value>| {
+                    let s = s2.clone();
+                    async move {
+                        s.lock().push((format!("PATCH {id}"), b));
+                        axum::Json(serde_json::json!({ "id": id }))
+                    }
+                },
+            ),
+        );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await });
+    let keys = tempfile::tempdir().unwrap();
+    sh(keys.path(), "openssl genrsa -out key.pem 2048 2>/dev/null");
+    let pem = std::fs::read_to_string(keys.path().join("key.pem")).unwrap();
+    let github = pit::server::github::GitHub::with_app(&mock_url, "1", &pem).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("repost".into()),
+        data_dir: data.path().join("worker"),
+        slots: 1,
+        parallelism: 1,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let repo = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({ "groups": {
+        "lint": { "on": ["pr"], "tasks": { "l": { "run": "exit 1", "cache": false } } },
+    } });
+    write(repo.path(), "pit.config.json", &config.to_string());
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    app.db
+        .upsert_repo(
+            "acme/web",
+            Some(&repo.path().to_string_lossy()),
+            Some("acme/web"),
+        )
+        .unwrap();
+    let client = Client::new(&base, None).unwrap();
+    let start = |trigger: &str, git_ref: &str, pr: Option<u64>| {
+        let (app, sha) = (app.clone(), sha.clone());
+        let (trigger, git_ref) = (trigger.to_string(), git_ref.to_string());
+        let client = client.clone();
+        async move {
+            let id = app
+                .create_run(
+                    CreateRun {
+                        repo: "acme/web".into(),
+                        url: None,
+                        sha,
+                        overlay: None,
+                        tasks: vec![],
+                        trigger: Some(trigger),
+                        git_ref: Some(git_ref),
+                        no_cache: false,
+                        fresh: false,
+                        debug: false,
+                        counts_as: None,
+                        no_secrets: false,
+                        trusted: false,
+                    },
+                    pr,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                pit::cli::wait(&client, &id, |_| {}),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+    };
+    // The branch push leaves lint out and posts its "skipped" first.
+    let push = start("push", "feature", None).await;
+    let push_lint = push
+        .groups
+        .iter()
+        .find(|g| g.name == "lint")
+        .unwrap()
+        .id
+        .clone();
+    let pr = start("pr", "pull/1", Some(1)).await;
+    assert_eq!(pr.status, Status::Failed);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The race the reporting must survive: the left-out copy's check run
+    // ends up newer than the real one.
+    // The left-out copy was posted as "skipped" (passing for a required
+    // check), the real one as a failure.
+    let conclusions: Vec<String> = seen
+        .lock()
+        .iter()
+        .filter(|(_, b)| b["name"] == "pit / lint")
+        .filter_map(|(_, b)| b["conclusion"].as_str().map(String::from))
+        .collect();
+    assert!(
+        conclusions.contains(&"skipped".to_string()),
+        "{conclusions:?}"
+    );
+    assert_eq!(
+        conclusions.last().map(String::as_str),
+        Some("failure"),
+        "{conclusions:?}"
+    );
+    app.db.set_check_run(&push_lint, 10_000).unwrap();
+    seen.lock().clear();
+    app.github.as_ref().unwrap().report_run(&app, &pr.id).await;
+    let sent = seen.lock().clone();
+    let reposted = sent
+        .iter()
+        .find(|(how, b)| how.starts_with("POST") && b["name"] == "pit / lint")
+        .unwrap_or_else(|| panic!("the real check was not posted anew: {sent:?}"));
+    assert_eq!(reposted.1["conclusion"], "failure");
 }

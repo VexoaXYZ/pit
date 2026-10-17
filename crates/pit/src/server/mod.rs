@@ -420,18 +420,27 @@ impl App {
             .load_config(&mirror, &req.sha, overlay.as_ref(), req.no_secrets)
             .await?;
         let t_config = t0.elapsed();
-        // `on`: which groups this kind of run includes. Tasks named on a
-        // local run's command line always run.
-        let kinds = if req.trigger.as_deref() == Some("local") && !req.tasks.is_empty() {
-            vec![]
-        } else {
-            run_kinds(
-                req.trigger.as_deref().unwrap_or("api"),
-                req.trusted,
-                req.git_ref.as_deref(),
-            )
+        // `on`: which groups this kind of run includes. Tasks named on the
+        // command line or in a schedule always run; a merge queue lane names
+        // its tasks too, and still follows `on`.
+        let run_row = self.db.run(run_id)?;
+        let trigger = req.trigger.as_deref().unwrap_or("api");
+        let kinds: Vec<String> = match &req.counts_as {
+            Some(k) => k.clone(),
+            None => run_kinds(trigger, run_row.trusted, req.git_ref.as_deref())
+                .into_iter()
+                .map(String::from)
+                .collect(),
         };
-        let mut groups = crate::graph::plan_for(&config, &req.tasks, &kinds)?;
+        let kind_refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
+        self.db.set_run_kinds(run_id, &kind_refs)?;
+        let filter: &[&str] = if !req.tasks.is_empty() && trigger != "queue" {
+            &[]
+        } else {
+            &kind_refs
+        };
+        let kinds = filter;
+        let mut groups = crate::graph::plan_for(&config, &req.tasks, kinds)?;
         let run = self.db.run(run_id)?;
         if run.status.is_done() {
             return Ok(()); // Cancelled while planning.
@@ -445,7 +454,7 @@ impl App {
         }
         let sharded = groups
             .iter()
-            .any(|g| g.tasks.iter().any(|(_, t)| !t.shard_files.is_empty()));
+            .any(|g| g.not_in.is_none() && g.tasks.iter().any(|(_, t)| !t.shard_files.is_empty()));
         let index = if sharded || !req.no_cache {
             match resolve::file_index(&mirror, &req.sha, overlay.as_ref()).await {
                 Ok(index) => Some(index),
@@ -479,7 +488,7 @@ impl App {
                     .collect();
                 let gid = self
                     .db
-                    .insert_finished_group(run_id, &g.name, &g.os, &g.tasks, &skipped, "on", why)?;
+                    .insert_finished_group(run_id, &g.name, &g.os, &g.tasks, &skipped, None, why)?;
                 self.emit_cached_group(run_id, &gid)?;
                 resolved += 1;
                 continue;
@@ -557,7 +566,7 @@ impl App {
             Some(run_id),
             Some(group_id),
             None,
-            serde_json::json!({ "name": g.name, "worker": "cache" }),
+            serde_json::json!({ "name": g.name, "worker": g.worker }),
         );
         for t in &g.tasks {
             self.emit(
@@ -706,8 +715,6 @@ pub async fn serve_app(app: Arc<App>, addr: SocketAddr) -> Result<()> {
     serve_listener(app, listener).await
 }
 
-/// Why no online worker can take a group, if none can: the GitHub "Waiting
-/// for a runner to pick up this job" that never says what is missing.
 /// The kinds of run (`GroupDef::on`) a run counts as.
 pub fn run_kinds(trigger: &str, trusted: bool, git_ref: Option<&str>) -> Vec<&'static str> {
     let pr = git_ref.is_some_and(|r| r.starts_with("pull/"));
@@ -716,7 +723,8 @@ pub fn run_kinds(trigger: &str, trusted: bool, git_ref: Option<&str>) -> Vec<&'s
         "rerun" if pr => vec!["pr"],
         "push" | "rerun" if trusted => vec!["push", "main"],
         "push" | "rerun" => vec!["push"],
-        "post-merge" => vec!["main"],
+        "post-merge" if trusted => vec!["push", "main"],
+        "post-merge" => vec!["push"],
         "queue" => vec!["queue"],
         t if t.starts_with("schedule:") => vec!["schedule"],
         // `pit run`, the API, MCP.
@@ -724,6 +732,8 @@ pub fn run_kinds(trigger: &str, trusted: bool, git_ref: Option<&str>) -> Vec<&'s
     }
 }
 
+/// Why no online worker can take a group, if none can: the GitHub "Waiting
+/// for a runner to pick up this job" that never says what is missing.
 pub fn waiting_reason(os: &str, needs: &[Backend], online: &[WorkerInfo]) -> Option<String> {
     let fits = |w: &WorkerInfo| {
         (os == "any" || w.os == os) && needs.iter().all(|b| w.backends.contains(b))
@@ -926,7 +936,11 @@ mod kind_tests {
         assert_eq!(run_kinds("rerun", false, Some("pull/3")), ["pr"]);
         assert_eq!(run_kinds("push", true, Some("main")), ["push", "main"]);
         assert_eq!(run_kinds("push", false, Some("feature")), ["push"]);
-        assert_eq!(run_kinds("post-merge", true, Some("main")), ["main"]);
+        assert_eq!(
+            run_kinds("post-merge", true, Some("main")),
+            ["push", "main"]
+        );
+        assert_eq!(run_kinds("post-merge", false, Some("release/x")), ["push"]);
         assert_eq!(run_kinds("queue", true, Some("queue/pr/3")), ["queue"]);
         assert_eq!(
             run_kinds("schedule:nightly", true, Some("main")),

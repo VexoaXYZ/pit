@@ -3402,7 +3402,9 @@ Each starts a run of that commit, and both pass.
 
 **Verdict: PARTIAL** (Pit's half proven). Given the webhooks, bot commits and bot PRs get Pit
 checks with no PAT, App token or dispatch step. No loop guard is needed: the only commits Pit itself pushes are merge-queue landings, which
-it tests as post-merge runs, and their push event's identical tasks come from the cache (P39).
+it tests as post-merge runs, and their push event's identical tasks come from the cache (P39). A
+trusted post-merge run and that push run count as the same kinds (`push`, `main`), so `on` doesn't
+split them.
 Not shown here: the GitHub side (real webhook delivery for a `GITHUB_TOKEN` push), which these
 sources describe but this machine can't produce.
 
@@ -3429,14 +3431,18 @@ no trigger or branch, so every group ran in every kind of run. An e2e group ran 
 and a deploy group would have deployed from PRs.
 
 **Fix: `on` on a group.**
-- The kinds are `pr` (PRs, their reruns, `/retest`), `push`, `main` (default-branch pushes and
-  post-merge), `queue`, `schedule` and `local` (`pit run`, API, MCP).
-- Each run's kind comes from its trigger, trust and ref. A queue candidate is `queue`, whatever its
+- The kinds are `pr`, `push`, `main` (trusted default-branch pushes and post-merge), `queue`,
+  `schedule` and `local` (`pit run`, MCP, and any run created through the API, whatever trigger it
+  names).
+- A run's kind comes from its trigger, trust and ref. A rerun or `/retest` counts as the run it
+  repeats (the check's own run, from its `external_id`). A queue candidate is `queue` whatever its
   ref looks like, so the "skips silently in the queue" trap can't happen.
 - A left-out group is still recorded, passed with skipped tasks and a message ("runs only in queue,
   main runs (`on`)"). Its check reports `skipped` as a check run, which GitHub counts as passing
   for a required check, and `success` as a commit status. A required `pit / e2e` never waits.
-- Tasks named on a local run (`pit run e2e.test`) run regardless.
+- If another run of the same commit really runs a group, the left-out copy posts nothing. A
+  branch-push run and a PR run of one commit can't overwrite each other's check.
+- Tasks named on a local run (`pit run e2e.test`) or in a schedule run regardless.
 - Unknown kinds are config errors.
 
 **Measured.**
@@ -3448,9 +3454,40 @@ and a deploy group would have deployed from PRs.
   - `on: ["pull_request"]` is rejected.
 - e2e `groups_left_out_by_on_still_report_their_check`: a PR run against a mock GitHub posts
   `pit / deploy` as `success`. Its task, `exit 1`, never ran.
+- e2e `a_real_check_is_reposted_over_a_newer_left_out_one` (App auth): the left-out copy is posted
+  as `skipped` and the real one as `failure`.
 - A unit test covers the trigger-to-kind mapping, reruns and `/retest` included.
 
+**Review fixes** (an independent review found 2 blockers and 5 shoulds, all fixed):
+- left-out copies overwrote real checks;
+- reruns counted as branch pushes and went green;
+- schedules naming a left-out task passed having run nothing;
+- untrusted post-merge counted as `main`;
+- left-out groups were identified by worker name (now a column);
+- API clients could pick a trigger to reach `main`-only groups;
+- left-out sharded groups could fail planning.
+
+The e2e tests cover the first, second, third and sixth, and the overwrite test fails without its
+fix.
+
+A second round found that GitHub takes the *newest* check run of a name as the check, so in App
+mode a left-out copy that raced in after the real check run could still hide it. Now:
+- a real group posts a new check run whenever a left-out copy's is newer;
+- a left-out copy that finds a real group appeared while it posted re-reports that run.
+
+The App-mode e2e plants the race and sees a fresh `failure` check run; without the fix Pit
+patches the hidden one. Also fixed in round 2:
+- local runs with uncommitted changes no longer count as "the real run" (they are never
+  reported);
+- the migration checks each new column separately;
+- "Re-run all checks" counts as every kind the commit ran as, so no PR-only check gets left
+  out.
+
 **Verdict: SOLVED.** Limits:
+- `on` is read from the commit being run, so a PR can edit its own `on` and leave a required group
+  out of its merge queue candidate. That's no new power: it could already change the group's
+  command to `true`. But a removed group used to fail closed (its check never reported), while a
+  left-out one reports `skipped`. Protect the config with CODEOWNERS.
 - `on` is per group, not per task.
 - There's no branch-name filter beyond `main` (the default branch); the config function still
   can't see the branch.

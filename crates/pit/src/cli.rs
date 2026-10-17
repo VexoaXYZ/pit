@@ -121,6 +121,7 @@ pub async fn submit(
                 no_cache: opts.no_cache,
                 fresh: opts.fresh,
                 debug: opts.debug,
+                counts_as: None,
                 no_secrets: false,
                 trusted: false,
             },

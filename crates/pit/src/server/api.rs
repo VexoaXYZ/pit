@@ -247,8 +247,12 @@ async fn repos(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>
 
 async fn create_run(
     State(app): State<Arc<App>>,
-    Json(req): Json<CreateRun>,
+    Json(mut req): Json<CreateRun>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Whatever trigger it names, a client's run counts as `local` for
+    // groups' `on`, like `pit run`: a `main`-only group is left out unless
+    // the client names its tasks.
+    req.counts_as = Some(vec!["local".into()]);
     if let Some(d) = &req.overlay {
         if !app.cas.contains(d) {
             return Err(anyhow::anyhow!("overlay {d} is not in the CAS; upload it first").into());

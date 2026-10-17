@@ -149,17 +149,20 @@ deploy: { on: ["main"], tasks: { ship: { run: "./deploy.sh" } } },
 ```
 
 The kinds are:
-- `pr`: pull requests, their reruns and `/retest`;
+- `pr`: pull requests;
 - `push`: any branch push;
-- `main`: pushes to the default branch and post-merge runs;
+- `main`: trusted pushes to the default branch and post-merge runs;
 - `queue`: merge queue candidates;
 - `schedule`;
-- `local`: `pit run`, the API, MCP.
+- `local`: `pit run`, MCP, and any run created through the API.
+
+A rerun or `/retest` counts as the run it repeats.
 
 The default is all. A left-out group is still recorded, passed with its tasks skipped, so its check
 reports (`skipped` on a check run, `success` as a commit status) and a required `pit / e2e` never
-sits at "Expected". A task named on a local run (`pit run e2e.test`) runs whatever its group's `on`
-says.
+sits at "Expected". A task named on a local run (`pit run e2e.test`) or in a schedule runs
+whatever its group's `on` says. When another run of the same commit really runs a group, the left-out copy
+posts no check.
 
 ### Shared resources
 
