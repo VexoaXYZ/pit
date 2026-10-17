@@ -3491,3 +3491,53 @@ patches the hidden one. Also fixed in round 2:
 - `on` is per group, not per task.
 - There's no branch-name filter beyond `main` (the default branch); the config function still
   can't see the branch.
+
+## P57. Job summaries: tools write `$GITHUB_STEP_SUMMARY`, and self-hosted CI shows nothing
+
+**The pain.** Job summaries are how CI output gets read without opening logs: coverage tables,
+test counts, links. A whole ecosystem writes them:
+- [test-summary-action](https://github.com/marketplace/actions/test-summary-action),
+  [code-coverage-summary-action](https://github.com/marketplace/actions/code-coverage-summary-action),
+  [Clover coverage summary](https://github.com/marketplace/actions/clover-code-coverage-summary),
+  [markdown coverage report](https://github.com/marketplace/actions/markdown-coverage-report),
+  [Vitest coverage reporter](https://github.com/marketplace/actions/hyperse-vitest-coverage-reporter);
+- [josh-ops](https://josh-ops.com/posts/github-code-coverage/) and
+  [OneUptime](https://oneuptime.com/blog/post/2026-01-30-github-actions-step-summary/view) show
+  the pattern;
+- projects add `GITHUB_STEP_SUMMARY` output to their own scripts
+  ([Riftcaster#81](https://github.com/JasonDiBabbo/Riftcaster/issues/81),
+  [Eventuous#613](https://github.com/Eventuous/eventuous/issues/613)).
+
+Moving off Actions loses all of it.
+
+**Reproduction.** A task appending a coverage table with `>> $GITHUB_STEP_SUMMARY`. Before, the
+variable was unset in Pit tasks, so the shell wrote to a file named by an empty string: the
+redirect fails, or lands in a stray file. Nothing reached the check or the CLI.
+
+**Fix.**
+- **Every task gets a summary file.** `$PIT_SUMMARY` and the same path as `$GITHUB_STEP_SUMMARY`
+  point at `.pit/summary/<task>.md` in the workspace: an absolute host path for host and sandbox
+  tasks, `/workspace/…` in containers. So a task that `cd`s elsewhere still finds it.
+- **It's emptied before each attempt**, so the last attempt's summary counts.
+- **The worker reads it after the task**, without following symlinks, regular files only, up to
+  1 MiB (GitHub's own limit), masked like logs. It posts it (`POST /api/tasks/{id}/summary`,
+  lease-checked).
+- **It's shown in three places:**
+  - the group's GitHub check, under `### <task>` after the task table, within the check summary's
+    size limit (beyond it, a note points at the run);
+  - the end of `pit run`;
+  - the API (`TaskView.summary`).
+
+**Measured.**
+- A host task writing a coverage table through `$GITHUB_STEP_SUMMARY`, and a `node:22-alpine`
+  task writing `**node** v22.23.3` through `$PIT_SUMMARY` after `cd /tmp`: both printed under
+  `summary default.<task>` at the end of `pit run`.
+- e2e `failed_tests_are_annotated_on_the_check`: the failing task also writes a summary, and the
+  check's summary sent to the mock GitHub contains `### test` followed by it.
+- A unit test checks the summary's placement and that a 70 KB summary is left out with a note,
+  keeping the check under 65,535 characters.
+
+**Verdict: SOLVED.** Limits:
+- One summary per task, not per step.
+- A cache hit shows no summary (the task didn't run).
+- No dashboard rendering yet: the API carries the summary.

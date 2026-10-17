@@ -324,32 +324,11 @@ fn record(
     }
 }
 
-/// A report's text: a regular file, not followed through a symlink (a task
-/// can swap one in for `/dev/zero`), and at most `MAX_REPORT_BYTES`.
-fn read_report(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut open = std::fs::OpenOptions::new();
-    open.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = open.open(path).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > MAX_REPORT_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_REPORT_BYTES).read_to_end(&mut bytes).ok()?;
-    String::from_utf8(bytes).ok()
-}
-
 /// The combined summary of every report file, or `None` if there were none.
 pub fn summarize(files: &[impl AsRef<Path>]) -> Option<Summary> {
     let mut total: Option<Summary> = None;
     for f in files {
-        let Some(xml) = read_report(f.as_ref()) else {
+        let Some(xml) = super::files::read_task_file(f.as_ref(), MAX_REPORT_BYTES) else {
             continue;
         };
         total

@@ -1217,6 +1217,19 @@ impl Worker {
                 }
             }
         }
+        // `$PIT_SUMMARY`, also as `$GITHUB_STEP_SUMMARY`: markdown the task
+        // appends to (tools that write Actions job summaries work as is),
+        // shown on its check. A path the task can open, host or container.
+        let summary_rel = format!(".pit/summary/{}.md", safe_task_file(&task.name));
+        let summary_path = files::safe_join(ws, &summary_rel)?;
+        let summary_env = if backend == Backend::Docker {
+            format!("/workspace/{summary_rel}")
+        } else {
+            summary_path.to_string_lossy().into_owned()
+        };
+        for k in ["PIT_SUMMARY", "GITHUB_STEP_SUMMARY"] {
+            env.push((k.into(), summary_env.clone()));
+        }
         // One file per line, so names with spaces survive `xargs -d '\n'`.
         // The whole list is always in a file too: a big suite's list can be
         // more than the OS lets a process environment hold.
@@ -1307,6 +1320,8 @@ impl Worker {
         let outcome = loop {
             attempt += 1;
             files::clear_outputs(ws, &def.reports)?;
+            // Each attempt starts a summary of its own.
+            files::write_file(&summary_path, b"", false)?;
             let (tx, rx) = mpsc::unbounded_channel::<String>();
             let forwarder = tokio::spawn(forward_logs(
                 client.clone(),
@@ -1598,6 +1613,17 @@ impl Worker {
                 Some(m) => format!("{m} · {how}"),
                 None => how,
             });
+        }
+        if let Some(md) =
+            files::read_task_file(&summary_path, crate::server::api::MAX_SUMMARY_BYTES as u64)
+                .filter(|m| !m.trim().is_empty())
+        {
+            let _ = client
+                .post_empty(
+                    &format!("/api/tasks/{}/summary", task.id),
+                    &serde_json::json!({ "markdown": masker.mask(&md) }),
+                )
+                .await;
         }
         let message = message.map(|m| masker.mask(&m));
         let status = if ok { Status::Passed } else { Status::Failed };
@@ -1900,9 +1926,9 @@ impl Worker {
 /// not have it (the run would pull it anyway).
 /// Where a shard's dealt files are listed, relative to the workspace: one
 /// file per task, since two sharded tasks of a group run side by side.
-fn shard_list(task: &str) -> String {
-    let safe: String = task
-        .chars()
+/// A task name as one safe file name.
+fn safe_task_file(task: &str) -> String {
+    task.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || "._-".contains(c) {
                 c
@@ -1910,7 +1936,11 @@ fn shard_list(task: &str) -> String {
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+fn shard_list(task: &str) -> String {
+    let safe = safe_task_file(task);
     format!(".pit/shards/{safe}")
 }
 /// Lists longer than this go only in the `shard_list` file, not the

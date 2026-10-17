@@ -328,6 +328,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_base {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN base_sha TEXT")?;
     }
+    let has_summary: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'summary'")?
+        .exists([])?;
+    if !has_summary {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN summary TEXT")?;
+    }
     let has_annotations: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'annotations'")?
         .exists([])?;
@@ -715,6 +721,7 @@ impl Db {
                         message: r.get("message")?,
                         started_at: r.get("started_at")?,
                         finished_at: r.get("finished_at")?,
+                        summary: r.get("summary")?,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -1247,6 +1254,16 @@ impl Db {
              WHERE EXISTS (SELECT 1 FROM tasks JOIN groups_ ON groups_.id = tasks.group_id
                            WHERE tasks.id = ?1 AND groups_.status = 'running' AND groups_.lease = ?3)",
             params![task_id, text, lease],
+        )? > 0)
+    }
+
+    /// Stores a running task's summary (see `TaskView::summary`).
+    pub fn set_summary(&self, task_id: &str, lease: Option<&str>, markdown: &str) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE tasks SET summary = ?2 WHERE id = ?1 AND EXISTS (
+               SELECT 1 FROM groups_ WHERE groups_.id = tasks.group_id
+                 AND groups_.status = 'running' AND groups_.lease = ?3)",
+            params![task_id, markdown, lease],
         )? > 0)
     }
 

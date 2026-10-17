@@ -60,6 +60,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/tasks/{id}/start", post(start_task))
         .route("/api/tasks/{id}/annotations", post(set_annotations))
         .route("/api/tasks/{id}/tests", post(set_test_outcomes))
+        .route("/api/tasks/{id}/summary", post(set_summary))
         .route("/api/tasks/{id}/finish", post(finish_task))
         .route("/api/groups/{id}/heartbeat", post(heartbeat))
         .route("/api/groups/{id}/release", post(release_group))
@@ -427,6 +428,35 @@ async fn append_log(
         Some(&id),
         serde_json::json!({ "text": chunk.text }),
     );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The most of a task summary kept: GitHub's own limit for one.
+pub const MAX_SUMMARY_BYTES: usize = 1 << 20;
+
+#[derive(Deserialize)]
+struct SummaryBody {
+    markdown: String,
+}
+
+/// `POST /api/tasks/{id}/summary`: the markdown the running task wrote.
+async fn set_summary(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(mut b): Json<SummaryBody>,
+) -> ApiResult<StatusCode> {
+    let (group_id, _, _) = app.db.task_group(&id)?;
+    if b.markdown.len() > MAX_SUMMARY_BYTES {
+        let mut cut = MAX_SUMMARY_BYTES;
+        while !b.markdown.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        b.markdown.truncate(cut);
+    }
+    if !app.db.set_summary(&id, lease(&headers), &b.markdown)? {
+        return Err(stale(&group_id));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

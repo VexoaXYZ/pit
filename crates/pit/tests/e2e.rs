@@ -2743,7 +2743,7 @@ async fn failed_tests_are_annotated_on_the_check() {
     write(dir, "src/cart.test.ts", "test()\n");
     write(dir, ".gitignore", "out/\n");
     let config = serde_json::json!({ "tasks": { "test": {
-        "run": "mkdir -p out && cp fixtures/report.xml out/junit.xml && exit 1",
+        "run": "mkdir -p out && cp fixtures/report.xml out/junit.xml && echo '**60 failed**, see annotations' >> $GITHUB_STEP_SUMMARY && exit 1",
         "reports": ["out/*.xml"],
         "cache": false,
     } } });
@@ -2811,6 +2811,18 @@ async fn failed_tests_are_annotated_on_the_check() {
     assert!(seen.lock().iter().all(|b| b["output"]["annotations"]
         .as_array()
         .is_none_or(|a| a.len() <= 50)));
+    // What the task wrote to $GITHUB_STEP_SUMMARY is on the check too.
+    let summaries: Vec<String> = seen
+        .lock()
+        .iter()
+        .filter_map(|b| b["output"]["summary"].as_str().map(String::from))
+        .collect();
+    assert!(
+        summaries
+            .iter()
+            .any(|s| s.contains("### test\n\n**60 failed**, see annotations")),
+        "{summaries:?}"
+    );
     let first = all.iter().find(|a| a["title"] == "cart.case 1").unwrap();
     assert_eq!(first["path"], "src/cart.test.ts");
     assert_eq!(first["start_line"], 1);

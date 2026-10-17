@@ -486,8 +486,28 @@ fn summarize(g: &GroupView) -> String {
             note(t)
         ));
     }
+    // What tasks wrote to `$PIT_SUMMARY` / `$GITHUB_STEP_SUMMARY`.
+    for t in &g.tasks {
+        let Some(md) = t.summary.as_deref().filter(|m| !m.trim().is_empty()) else {
+            continue;
+        };
+        let room = CHECK_SUMMARY_ROOM.saturating_sub(s.len());
+        let block = format!("\n### {}\n\n{}\n", t.name, md.trim_end());
+        if block.len() <= room {
+            s.push_str(&block);
+        } else {
+            s.push_str(&format!(
+                "\n### {}\n\n_(summary left out: the check's summary is full; see the run)_\n",
+                t.name
+            ));
+            break;
+        }
+    }
     s
 }
+
+/// Room for task summaries in a check's summary (GitHub's limit is 65535).
+const CHECK_SUMMARY_ROOM: usize = 60_000;
 
 /// What a check's table says about a task: why it failed, or that a pass was
 /// flaky or much slower than usual.
@@ -864,6 +884,7 @@ mod tests {
             message: message.map(String::from),
             started_at: None,
             finished_at: None,
+            summary: None,
         };
         let g: GroupView = serde_json::from_value(serde_json::json!({
             "id": "g", "name": "ci", "os": "linux", "status": "failed", "worker": null,
@@ -892,6 +913,18 @@ mod tests {
             "{table}"
         );
         assert!(table.contains("| build | passed | 4.0s |  |"), "{table}");
+        // Task summaries follow the table, within GitHub's size limit.
+        let mut g = g;
+        g.tasks[0].summary = Some("## Coverage\n91%".into());
+        g.tasks[1].summary = Some("x".repeat(70_000));
+        let text = summarize(&g);
+        assert!(text.contains("### lint\n\n## Coverage\n91%"), "{text}");
+        assert!(
+            text.contains("### test\n\n_(summary left out"),
+            "{}",
+            &text[..200]
+        );
+        assert!(text.len() < 65_535);
     }
 
     #[test]

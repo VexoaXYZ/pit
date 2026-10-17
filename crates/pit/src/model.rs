@@ -608,6 +608,9 @@ pub struct TaskView {
     pub message: Option<String>,
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// Markdown the task wrote to `$PIT_SUMMARY` (`$GITHUB_STEP_SUMMARY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

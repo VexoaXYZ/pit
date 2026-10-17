@@ -385,6 +385,17 @@ pub async fn run(
                 }
             }
         }
+        // What tasks wrote to `$PIT_SUMMARY`, as they wrote it.
+        for g in &view.groups {
+            for t in &g.tasks {
+                if let Some(md) = t.summary.as_deref().filter(|m| !m.trim().is_empty()) {
+                    eprintln!("\n  {} {}.{}", style.dim("summary"), g.name, t.name);
+                    for line in md.lines().take(200) {
+                        eprintln!("    {} {line}", style.dim("│"));
+                    }
+                }
+            }
+        }
         // A pass that took far longer than usual is easy to miss in a green
         // run; name it once more next to the verdict.
         for g in &view.groups {
