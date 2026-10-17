@@ -3511,8 +3511,8 @@ test counts, links. A whole ecosystem writes them:
 Moving off Actions loses all of it.
 
 **Reproduction.** A task appending a coverage table with `>> $GITHUB_STEP_SUMMARY`. Before, the
-variable was unset in Pit tasks, so the shell wrote to a file named by an empty string: the
-redirect fails, or lands in a stray file. Nothing reached the check or the CLI.
+variable was unset in Pit tasks, so the redirect targets an empty name: `sh` says `cannot create :
+Directory nonexistent` and exits 2, failing the task. Nothing reached the check or the CLI.
 
 **Fix.**
 - **Every task gets a summary file.** `$PIT_SUMMARY` and the same path as `$GITHUB_STEP_SUMMARY`
