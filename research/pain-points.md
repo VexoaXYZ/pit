@@ -3244,3 +3244,72 @@ what Pit tested in the first place.
 
 **Verdict: SOLVED** for reruns. Not done: `/test <task>` to run one task, and `ok-to-test`-style
 approval for non-members (forks use the `pit:run` label instead).
+
+## P54. Submodules: missing in the workspace, slow to clone, and painful to authenticate
+
+**The pain.** `actions/checkout` needs `submodules: recursive`, and private submodules fail with
+"Repository not found" because the job's token covers only its own repo. The fixes are a PAT or a
+deploy key per submodule:
+- [actions/checkout#116](https://github.com/actions/checkout/issues/116),
+  [community #26936](https://github.com/orgs/community/discussions/26936),
+  [#28672](https://github.com/orgs/community/discussions/28672),
+  [codestudy](https://www.codestudy.net/blog/how-to-checkout-submodule-in-github-action/);
+- SSH-URL submodules from GHES fail with "Host key verification failed"
+  ([actions/checkout#934](https://github.com/actions/checkout/issues/934));
+- builders hit the same wall
+  ([docker/build-push-action#737](https://github.com/docker/build-push-action/issues/737));
+- GitLab runners have their own versions ("transport 'file' not allowed",
+  [gitlab-runner#38908](https://gitlab.com/gitlab-org/gitlab-runner/-/issues/38908);
+  [#28783](https://gitlab.com/gitlab-org/gitlab-runner/-/issues/28783));
+- so does Gitea ([forum](https://forum.gitea.com/t/gitea-runner-recursive-checkout/10812)).
+
+Each job clones every submodule again.
+
+**Reproduction.** An app repo with `vendor/lib` as a submodule. The task reads
+`vendor/lib/index.js`. Before:
+
+```
+check │ grep: vendor/lib/index.js: No such file or directory
+✗ default.check: exited with 2
+```
+
+Pit's workspace never initialised submodules, so any repo using them failed outright. **NOT
+SOLVED.**
+
+**Fix.** After checkout, when `.gitmodules` exists, the worker handles each submodule:
+- it reads the pinned commit from the gitlink (`ls-tree`);
+- it resolves relative URLs against the superproject URL like git does (`../lib.git`, SSH
+  `host:path` too);
+- it fetches the commit into a per-URL mirror on the worker (`mirrors/sub-<hash>.git`, under a
+  lock);
+- it points the workspace's `submodule.<name>.url` at that mirror, runs `submodule update --init
+  --force`, and cleans untracked files inside;
+- it recurses, up to 3 levels.
+
+So a submodule is fetched once per worker, warm workspaces keep their checkouts, and private ones
+use whatever git credentials or SSH keys the worker has.
+
+Safety:
+- A `.gitmodules` URL is repository code. Fork PRs get no submodules (the group says so); a fork
+  could otherwise point one at another repo's mirror on the worker, or fetch with the worker's
+  credentials.
+- A local-path URL (`/…`, `file:`, `C:\`) is refused unless the superproject itself is local, so a
+  hosted repo can't read the worker's other mirrors.
+
+**Measured.**
+- The repro passes and prints the submodule's file.
+- After the library's pointer moves to a new commit, the next run reads the new version
+  (`42` → `43`).
+- One `sub-…` mirror was created.
+- e2e `submodules_are_checked_out_at_their_pinned_commit`: the task reads `one`, then `two` after
+  the pointer bump.
+- A unit test checks URL resolution (HTTPS, `./`, `../../` on a path, SSH, absolute) and local-path
+  detection.
+- Not tested: the fork and local-path refusals (code paths only).
+
+**Verdict: PARTIAL.** Submodules work, fetched once per worker. Limits:
+- Fork PRs get none.
+- Task `inputs` see a submodule as one entry (its pinned commit), so a glob like `vendor/lib/**`
+  doesn't match its files. The default (all files) does include the pointer, so keys change when
+  it moves.
+- `pit run` with an uncommitted submodule change isn't carried in the overlay.

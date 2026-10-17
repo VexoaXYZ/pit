@@ -251,6 +251,12 @@ move them to a new image, or pin a digest (`node:22@sha256:…`).
    workspace, fresh ones included, reads them from there, so CI no longer downloads each LFS
    file on every checkout. This needs `git-lfs` on the worker; without it, or with
    `GIT_LFS_SKIP_SMUDGE=1`, LFS files stay pointer files and the group says so.
+   Submodules are checked out at the commit the superproject pins, recursively, each from a mirror
+   of its own on the worker, fetched once and shared like the main one. Relative URLs (`../lib.git`)
+   resolve against the repo's URL, and private ones use the worker's git credentials or SSH keys.
+   Fork pull requests get no submodules, and a submodule URL that is a path on the worker is
+   refused unless the repo itself is local: either would let `.gitmodules` read other repos the
+   worker can reach.
 4. **Execute.** For each task in the DAG, the worker computes the action key from git blob
    ids (free, from the index) and overlay digests of the matching inputs, plus dependency
    keys. Cache hit: restore outputs, replay the log. Miss: run, stream logs live, upload

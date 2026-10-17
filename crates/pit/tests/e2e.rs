@@ -3263,3 +3263,52 @@ async fn retest_comments_rerun_the_failures() {
     assert_eq!(status("flake"), Status::Passed);
     assert_eq!(reactions.lock().as_slice(), ["2"]);
 }
+
+/// Submodules are checked out at the commit the superproject pins, from a
+/// mirror on the worker, and follow the pointer when it moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submodules_are_checked_out_at_their_pinned_commit() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    sh(
+        &root,
+        "git init -q --bare -b main lib.git && git init -q --bare -b main app.git",
+    );
+    let lib = root.join("libwork");
+    std::fs::create_dir_all(&lib).unwrap();
+    write(&lib, "v.txt", "one\n");
+    sh(&lib, "git init -q -b main && git add -A && git commit -qm one && git remote add origin ../lib.git && git push -q origin main");
+    let app = root.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    let config = serde_json::json!({ "tasks": { "check": {
+        "run": "cat vendor/lib/v.txt > ../seen-$PIT_RUN_ID", "cache": false,
+    } } });
+    write(&app, "pit.config.json", &config.to_string());
+    sh(&app, &format!(
+        "git init -q -b main && git -c protocol.file.allow=always submodule add -q {} vendor/lib && git add -A && git commit -qm app && git remote add origin ../app.git && git push -q origin main",
+        root.join("lib.git").display()
+    ));
+    let seen = |view: &RunView| {
+        // The task wrote next to the workspace; find it by run id.
+        let mut found = None;
+        for e in walkdir(&pit._data.path().join("worker")) {
+            if e.file_name().and_then(|n| n.to_str()) == Some(&format!("seen-{}", view.id)) {
+                found = Some(std::fs::read_to_string(e).unwrap());
+            }
+        }
+        found.unwrap_or_default()
+    };
+    let first = run(&pit, &app).await;
+    assert_eq!(first.status, Status::Passed, "{first:?}");
+    assert_eq!(seen(&first), "one\n");
+    // Move the pointer.
+    sh(
+        &lib,
+        "echo two > v.txt && git commit -qam two && git push -q origin main",
+    );
+    sh(&app, "git -c protocol.file.allow=always submodule update -q --remote vendor/lib && git commit -qam bump && git push -q origin main");
+    let second = run(&pit, &app).await;
+    assert_eq!(second.status, Status::Passed, "{second:?}");
+    assert_eq!(seen(&second), "two\n");
+}

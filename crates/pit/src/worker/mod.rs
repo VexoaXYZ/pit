@@ -715,6 +715,15 @@ impl Worker {
         git::git(ws, &["checkout", "-q", "--force", "--detach", &job.sha]).await?;
         // Untracked files go, ignored ones (dependencies, build dirs) stay warm.
         git::git(ws, &["clean", "-q", "-ffd"]).await?;
+        if ws.join(".gitmodules").exists() {
+            if job.no_secrets {
+                // A fork's `.gitmodules` could point at another repo's mirror
+                // on this worker, or use its credentials.
+                note = Some("submodules are not fetched for pull requests from forks".into());
+            } else {
+                self.prepare_submodules(ws, &job.url, 0).await?;
+            }
+        }
 
         let mut index: HashMap<String, String> = git::ls_files(ws)
             .await?
@@ -740,6 +749,105 @@ impl Worker {
         let mut files: Vec<(String, String)> = index.into_iter().collect();
         files.sort();
         Ok((files, note))
+    }
+
+    /// Checks out a workspace's submodules at the commits it pins, each from
+    /// a mirror of its own on this worker: fetched once, then shared by every
+    /// workspace and kept warm, instead of cloned per job.
+    fn prepare_submodules<'a>(
+        &'a self,
+        ws: &'a Path,
+        url: &'a str,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if depth > 3 || !ws.join(".gitmodules").exists() {
+                return Ok(());
+            }
+            let listed = git::git(
+                ws,
+                &[
+                    "config",
+                    "-f",
+                    ".gitmodules",
+                    "--get-regexp",
+                    r"^submodule\..*\.(path|url)$",
+                ],
+            )
+            .await
+            .unwrap_or_default();
+            let mut subs: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
+                Default::default();
+            for line in listed.lines() {
+                let Some((key, value)) = line.split_once(' ') else {
+                    continue;
+                };
+                let key = key.trim_start_matches("submodule.");
+                if let Some(name) = key.strip_suffix(".path") {
+                    subs.entry(name.to_string()).or_default().0 = Some(value.to_string());
+                } else if let Some(name) = key.strip_suffix(".url") {
+                    subs.entry(name.to_string()).or_default().1 = Some(value.to_string());
+                }
+            }
+            for (name, (path, sub_url)) in subs {
+                let (Some(path), Some(sub_url)) = (path, sub_url) else {
+                    continue;
+                };
+                // The commit the superproject pins (a gitlink, mode 160000).
+                let entry = git::git(ws, &["ls-tree", "HEAD", "--", &path]).await?;
+                let mut fields = entry.split_whitespace();
+                let (Some("160000"), Some(_), Some(commit)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
+                };
+                let resolved = git::resolve_submodule_url(url, &sub_url);
+                // A path on this machine only for a superproject that is one
+                // too (a local setup): a repo hosted elsewhere must not read
+                // other repos' mirrors through its `.gitmodules`.
+                if git::is_local_url(&resolved) && !git::is_local_url(url) {
+                    anyhow::bail!(
+                        "submodule {name}: {resolved} is a path on the worker; use a URL"
+                    );
+                }
+                let mirror = self.data_dir.join("mirrors").join(format!(
+                    "sub-{}.git",
+                    &crate::cas::digest(resolved.as_bytes())[..16]
+                ));
+                {
+                    let lock = self.mirror_lock(&resolved);
+                    let _g = lock.lock().await;
+                    git::ensure_commit(&mirror, &resolved, commit)
+                        .await
+                        .with_context(|| format!("fetching submodule {name} ({resolved})"))?;
+                }
+                let mirror_url = mirror.to_string_lossy().to_string();
+                git::git(
+                    ws,
+                    &["config", &format!("submodule.{name}.url"), &mirror_url],
+                )
+                .await?;
+                git::git(
+                    ws,
+                    &[
+                        "-c",
+                        "protocol.file.allow=always",
+                        "submodule",
+                        "update",
+                        "--init",
+                        "--force",
+                        "--checkout",
+                        "--",
+                        &path,
+                    ],
+                )
+                .await?;
+                let sub = ws.join(&path);
+                git::git(&sub, &["clean", "-q", "-ffd"]).await?;
+                self.prepare_submodules(&sub, &resolved, depth + 1).await?;
+            }
+            Ok(())
+        })
     }
 
     /// A blob from the node-local cache, fetched from the server on a miss.

@@ -192,6 +192,40 @@ pub async fn ensure_commit(dir: &Path, url: &str, sha: &str) -> Result<()> {
     Ok(())
 }
 
+/// A submodule URL as git resolves it: `./x` and `../x` are relative to the
+/// superproject's own URL.
+pub fn resolve_submodule_url(superproject: &str, url: &str) -> String {
+    if !(url.starts_with("./") || url.starts_with("../")) {
+        return url.to_string();
+    }
+    let mut base = superproject.trim_end_matches('/').to_string();
+    let mut rest = url;
+    loop {
+        if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("../") {
+            rest = r;
+            match base.rfind(['/', ':']) {
+                Some(i) => base.truncate(i),
+                None => base.clear(),
+            }
+        } else {
+            break;
+        }
+    }
+    let sep = if base.ends_with(':') { "" } else { "/" };
+    format!("{base}{sep}{rest}")
+}
+
+/// Whether a URL is a path on this machine rather than a remote.
+pub fn is_local_url(url: &str) -> bool {
+    url.starts_with("file:") || url.starts_with('/') || url.starts_with('.') || {
+        // `C:\x` or `C:/x`, not `git@host:repo`.
+        let b = url.as_bytes();
+        b.len() > 2 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    }
+}
+
 /// Whether the commit's `.gitattributes` send any path through Git LFS.
 pub async fn uses_lfs(dir: &Path, sha: &str) -> bool {
     git_ok(
@@ -408,6 +442,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn submodule_urls_resolve_like_git() {
+        let r = resolve_submodule_url;
+        assert_eq!(
+            r("https://github.com/acme/app.git", "../lib.git"),
+            "https://github.com/acme/lib.git"
+        );
+        assert_eq!(
+            r("https://github.com/acme/app", "./sub"),
+            "https://github.com/acme/app/sub"
+        );
+        assert_eq!(
+            r("git@github.com:acme/app.git", "../lib.git"),
+            "git@github.com:acme/lib.git"
+        );
+        assert_eq!(
+            r("/srv/git/app.git", "../../other/lib.git"),
+            "/srv/other/lib.git"
+        );
+        assert_eq!(r("https://x/a.git", "https://y/b.git"), "https://y/b.git");
+        assert!(is_local_url("/tmp/x.git") && is_local_url("file:///x") && is_local_url("C:\\x"));
+        assert!(!is_local_url("git@github.com:a/b") && !is_local_url("https://github.com/a/b"));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn retry_survives_a_blip_and_gives_up_eventually() {
