@@ -3122,3 +3122,144 @@ async fn count_trigger(pit: &Pit, schedule: &str) -> usize {
         .filter(|r| r.trigger == format!("schedule:{schedule}"))
         .count()
 }
+
+/// `/retest` in a pull request comment, from a collaborator, reruns the pull
+/// request's last commit: what passed comes from the cache, what failed runs
+/// again. Anyone else's `/retest` is ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retest_comments_rerun_the_failures() {
+    use axum::routing::post;
+    use hmac::Mac;
+    let reactions: std::sync::Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
+    let seen = reactions.clone();
+    let mock = axum::Router::new()
+        .route(
+            "/repos/acme/shop/issues/comments/{id}/reactions",
+            post(
+                move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().push(id);
+                        axum::Json(serde_json::json!({}))
+                    }
+                },
+            ),
+        )
+        .fallback(|| async { axum::Json(serde_json::json!({})) });
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await });
+
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github =
+        pit::server::github::GitHub::with_token(&mock_url, "t", Some("s3cret".into())).unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("retest".into()),
+        data_dir: data.path().join("worker"),
+        slots: 1,
+        parallelism: 2,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+
+    let repo = tempfile::tempdir().unwrap();
+    let marker = repo
+        .path()
+        .join("..")
+        .join(format!("retest-{}", std::process::id()));
+    let config = serde_json::json!({ "tasks": {
+        "steady": { "run": "true" },
+        "flake": { "run": format!("test -f {m} || {{ touch {m}; exit 1; }}", m = marker.display()), "cache": false },
+    } });
+    write(repo.path(), "pit.config.json", &config.to_string());
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    let repository = serde_json::json!({ "full_name": "acme/shop", "clone_url": repo.path().to_string_lossy(), "default_branch": "main" });
+    let post_event = |event: &'static str, payload: serde_json::Value| {
+        let body = payload.to_string();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+        mac.update(body.as_bytes());
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let base = base.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{base}/webhooks/github"))
+                .header("x-github-event", event)
+                .header("x-hub-signature-256", sig)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let client = Client::new(&base, None).unwrap();
+    let wait = |id: String| {
+        let client = client.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                pit::cli::wait(&client, &id, |_| {}),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+    };
+    let opened = post_event(
+        "pull_request",
+        serde_json::json!({ "action": "opened", "repository": repository, "pull_request": {
+            "number": 9, "head": { "sha": sha, "repo": { "full_name": "acme/shop" } }, "base": { "ref": "main" },
+        } }),
+    )
+    .await;
+    let first = wait(opened["run"].as_str().unwrap().to_string()).await;
+    assert_eq!(first.status, Status::Failed, "{first:?}");
+    let comment = |who: &str, id: u64| {
+        serde_json::json!({ "action": "created", "repository": repository,
+            "issue": { "number": 9, "pull_request": { "url": "x" } },
+            "comment": { "id": id, "body": "/retest\nplease", "author_association": who } })
+    };
+    let ignored = post_event("issue_comment", comment("NONE", 1)).await;
+    assert!(
+        ignored["ignored"]
+            .as_str()
+            .unwrap()
+            .contains("collaborator"),
+        "{ignored}"
+    );
+    let retest = post_event("issue_comment", comment("MEMBER", 2)).await;
+    let again = wait(retest["run"].as_str().expect("a rerun").to_string()).await;
+    assert_eq!(again.status, Status::Passed, "{again:?}");
+    assert_eq!(again.sha, sha);
+    assert_eq!(again.trigger, "retest");
+    let status = |name: &str| {
+        again.groups[0]
+            .tasks
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .status
+    };
+    assert_eq!(status("steady"), Status::Cached);
+    assert_eq!(status("flake"), Status::Passed);
+    assert_eq!(reactions.lock().as_slice(), ["2"]);
+}

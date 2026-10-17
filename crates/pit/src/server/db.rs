@@ -584,6 +584,18 @@ impl Db {
 
     /// The run a rerun of this commit copies its restrictions from: one
     /// without secrets if any was (a fork's commit), else the newest.
+    /// The newest run of a pull request.
+    pub fn latest_pr_run(&self, repo_id: &str, pr: u64) -> Result<Option<RunRow>> {
+        let c = self.conn.lock();
+        Ok(c.query_row(
+            "SELECT * FROM runs WHERE repo_id = ?1 AND github_pr = ?2 AND overlay IS NULL
+             ORDER BY created_at DESC LIMIT 1",
+            params![repo_id, pr as i64],
+            run_row,
+        )
+        .optional()?)
+    }
+
     pub fn prior_run(&self, repo_id: &str, sha: &str) -> Result<Option<RunRow>> {
         let c = self.conn.lock();
         Ok(c.query_row(

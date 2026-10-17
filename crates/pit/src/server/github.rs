@@ -692,6 +692,70 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 .await?;
             Ok(serde_json::json!({ "run": id }))
         }
+        // `/retest` in a pull request comment, the Prow convention: reruns the
+        // pull request's last commit Pit ran. Passed tasks come back from the
+        // cache, so only what failed runs again.
+        "issue_comment" if payload["action"].as_str() == Some("created") => {
+            let comment = &payload["comment"];
+            let body = comment["body"].as_str().unwrap_or_default().trim();
+            let first = body.lines().next().unwrap_or_default().trim();
+            if !matches!(first, "/retest" | "/pit retest") {
+                return Ok(serde_json::json!({ "ignored": "not a command" }));
+            }
+            let Some(number) = payload["issue"]["pull_request"]
+                .is_object()
+                .then(|| payload["issue"]["number"].as_u64())
+                .flatten()
+            else {
+                return Ok(serde_json::json!({ "ignored": "not a pull request" }));
+            };
+            // People who could push a commit anyway; not drive-by commenters.
+            let who = comment["author_association"].as_str().unwrap_or_default();
+            if !matches!(who, "OWNER" | "MEMBER" | "COLLABORATOR") {
+                return Ok(serde_json::json!({
+                    "ignored": format!("/retest needs a collaborator, not {who}")
+                }));
+            }
+            let r = repo_payload()?;
+            let repo = register(app, &r)?;
+            let Some(prior) = app.db.latest_pr_run(&repo.id, number)? else {
+                return Ok(serde_json::json!({ "ignored": "Pit has not run this pull request" }));
+            };
+            // The same commit, with the restrictions it ran under (a fork's
+            // commit stays a fork's; its next push still needs the label).
+            let prior = app.db.prior_run(&repo.id, &prior.sha)?.unwrap_or(prior);
+            let id = app
+                .create_run(
+                    CreateRun {
+                        repo: repo.name,
+                        url: None,
+                        sha: prior.sha,
+                        overlay: None,
+                        tasks: vec![],
+                        trigger: Some("retest".into()),
+                        git_ref: prior.git_ref,
+                        no_cache: false,
+                        fresh: prior.fresh || prior.no_secrets,
+                        debug: false,
+                        no_secrets: prior.no_secrets,
+                        trusted: false,
+                    },
+                    Some(number),
+                )
+                .await?;
+            // A reaction says the command was heard; best effort.
+            if let (Some(gh), Some(cid)) = (&app.github, comment["id"].as_u64()) {
+                let _ = gh
+                    .call(
+                        &r.full_name,
+                        reqwest::Method::POST,
+                        &format!("/repos/{}/issues/comments/{cid}/reactions", r.full_name),
+                        serde_json::json!({ "content": "rocket" }),
+                    )
+                    .await;
+            }
+            Ok(serde_json::json!({ "run": id }))
+        }
         other => Ok(serde_json::json!({ "ignored": other })),
     }
 }

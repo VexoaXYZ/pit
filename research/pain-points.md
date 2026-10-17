@@ -3201,3 +3201,45 @@ field`). This put Pit behind GitHub.
   At 03:17 UTC, `17 12` in Tokyo (12:17 JST) starts a run and `17 3` in Tokyo does not.
 
 **Verdict: SOLVED** (parity with GitHub's March 2026 feature).
+
+## P53. Re-running a flaky failure needs write access, or an empty commit
+
+**The pain.**
+- GitHub's "Re-run failed jobs" is limited to people with write access. Contributors and
+  reviewers on big projects ask for a `/retest` comment the way Kubernetes' Prow has one
+  ([argo-workflows#12864](https://github.com/argoproj/argo-workflows/issues/12864)).
+- Teams build it themselves: an `issue_comment` workflow that finds the PR's failed runs and calls
+  the rerun API ([estroz/rerun-actions](https://pkg.go.dev/github.com/estroz/rerun-actions),
+  [pulsar-test-infra#28](https://github.com/apache/pulsar-test-infra/pull/28), which hit a GitHub
+  search bug; [logto on DEV](https://dev.to/logto/automatically-rerun-your-github-workflow-after-failure-26hi)).
+- The alternative, an empty commit or close-and-reopen, reruns everything
+  ([GitHub docs](https://docs.github.com/en/enterprise-server@3.14/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)).
+
+**Reproduction.** Before, Pit reran a commit only through the Checks API's "Re-run" button
+(P28, which reruns only what failed thanks to the cache). In token mode Pit posts commit
+statuses, which have no Re-run button, so the only rerun was a new push. Pit ignored
+`issue_comment` events.
+
+**Fix.** On `issue_comment` `created`, where the comment's first line is `/retest` (or
+`/pit retest`) on a pull request:
+- The commenter must be an owner, member or collaborator. Anyone else gets "needs a collaborator,
+  not NONE", because a drive-by account must not be able to keep re-running a fork's code.
+- Pit reruns the commit it last ran for that pull request, with the restrictions that commit ran
+  under (`prior_run`), so a fork's labeled commit stays fresh and secretless. A fork's newer
+  pushes still need the label.
+- Passed tasks come back from the cache and failed ones run again: in effect "re-run failed
+  jobs".
+- Pit adds a 🚀 reaction to the comment.
+
+Unlike Actions' rerun, which keeps a stale merge ref, this reruns the PR head commit, which is
+what Pit tested in the first place.
+
+**Measured.** e2e `retest_comments_rerun_the_failures`, with signed webhooks and a mock GitHub:
+- PR #9's run fails on `flake`;
+- `/retest` from `NONE` is ignored;
+- `/retest` from `MEMBER` starts a `retest` run of the same SHA: `steady` comes from the cache,
+  `flake` runs and passes, and the run is green;
+- the mock received exactly one reaction, on comment 2.
+
+**Verdict: SOLVED** for reruns. Not done: `/test <task>` to run one task, and `ok-to-test`-style
+approval for non-members (forks use the `pit:run` label instead).

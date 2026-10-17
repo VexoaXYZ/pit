@@ -284,9 +284,12 @@ Point a GitHub App (or a token) and a webhook at the server:
 | `PIT_PUBLIC_URL` | Link target for checks. |
 | `PIT_REPO_<OWNER>_<NAME>` | Optional clone URL override (a local mirror, for example). |
 
-Webhook URL: `<server>/webhooks/github`, events `push`, `pull_request`, `check_run`.
-Pushes and pull requests start runs; "Re-run" on a check reruns; adding the `pit:merge`
-label to a pull request queues it.
+Webhook URL: `<server>/webhooks/github`, events `push`, `pull_request`, `check_run`,
+`issue_comment`. Pushes and pull requests start runs; "Re-run" on a check reruns; adding the
+`pit:merge` label to a pull request queues it. A `/retest` comment on a pull request by an owner,
+member or collaborator reruns the commit Pit last ran for it, with the same restrictions (a fork's
+stays a fork's). Passed tasks come back from the cache, so only what failed runs again. It works
+with a plain token too, where checks have no Re-run button.
 
 **Forks.** A pull request from a fork never runs on its own: its code, `pit.config.ts`
 included, is someone else's. A maintainer who has read it adds the `pit:run` label, which
