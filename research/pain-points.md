@@ -3391,16 +3391,17 @@ The workarounds:
 - deploy keys ([action-push-to-protected](https://github.com/powderlabs/action-push-to-protected));
 - a human pushing an empty commit.
 
-**Reproduction.** The rule is Actions' own: GitHub still sends the webhooks to apps, whoever
-pushed. Pit started runs from those webhooks without looking at the sender, but nothing proved
-that. e2e `bot_pushes_and_pull_requests_are_tested` sends two signed webhooks for one commit:
+**Reproduction.** The sources describe the rule as one about *workflow runs*: it stops Actions
+from starting workflows, and none of them say webhooks to apps are held back. I did not verify
+that against GitHub. Pit's side is what can be shown here: it starts runs from webhooks without
+looking at the sender, but nothing tested that. e2e `bot_pushes_and_pull_requests_are_tested` sends two signed webhooks for one commit:
 - a `push` to `format` by `github-actions[bot]` (`sender.type: Bot`);
 - a `pull_request` opened by `dependabot[bot]`.
 
 Each starts a run of that commit, and both pass.
 
-**Verdict: SOLVED.** Bot commits and bot PRs get Pit checks with no PAT, App token or dispatch
-step. No loop guard is needed: the only commits Pit itself pushes are merge-queue landings, which
+**Verdict: PARTIAL** (Pit's half proven). Given the webhooks, bot commits and bot PRs get Pit
+checks with no PAT, App token or dispatch step. No loop guard is needed: the only commits Pit itself pushes are merge-queue landings, which
 it tests as post-merge runs, and their push event's identical tasks come from the cache (P39).
 Not shown here: the GitHub side (real webhook delivery for a `GITHUB_TOKEN` push), which these
 sources describe but this machine can't produce.
