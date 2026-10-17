@@ -217,6 +217,20 @@ pub fn resolve_submodule_url(superproject: &str, url: &str) -> String {
     format!("{base}{sep}{rest}")
 }
 
+/// Whether a submodule URL uses a transport Pit fetches: http(s), ssh, git,
+/// scp-style `user@host:path`, or a path. Nothing that git could read as an
+/// option (`-…`) or run as a command (`ext::`).
+pub fn is_fetchable_url(url: &str) -> bool {
+    if url.is_empty() || url.starts_with('-') || url.contains("::") {
+        return false;
+    }
+    if let Some((scheme, rest)) = url.split_once("://") {
+        return matches!(scheme, "https" | "http" | "ssh" | "git" | "file")
+            && !rest.starts_with('-');
+    }
+    true
+}
+
 /// Whether a URL is a path on this machine rather than a remote.
 pub fn is_local_url(url: &str) -> bool {
     url.starts_with("file:") || url.starts_with('/') || url.starts_with('.') || {
@@ -465,6 +479,23 @@ mod tests {
         assert_eq!(r("https://x/a.git", "https://y/b.git"), "https://y/b.git");
         assert!(is_local_url("/tmp/x.git") && is_local_url("file:///x") && is_local_url("C:\\x"));
         assert!(!is_local_url("git@github.com:a/b") && !is_local_url("https://github.com/a/b"));
+        for bad in [
+            "-oProxyCommand=x",
+            "ext::sh -c id",
+            "ssh://-oProxyCommand=x/a",
+            "fd::3",
+            "gopher://x/a",
+        ] {
+            assert!(!is_fetchable_url(bad), "{bad}");
+        }
+        for good in [
+            "https://github.com/a/b.git",
+            "git@github.com:a/b",
+            "ssh://git@h/a",
+            "/srv/a.git",
+        ] {
+            assert!(is_fetchable_url(good), "{good}");
+        }
     }
 
     #[tokio::test(start_paused = true)]

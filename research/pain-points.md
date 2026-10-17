@@ -3295,6 +3295,8 @@ Safety:
   credentials.
 - A local-path URL (`/…`, `file:`, `C:\`) is refused unless the superproject itself is local, so a
   hosted repo can't read the worker's other mirrors.
+- Only http(s), ssh, git, scp-style and path URLs are fetched. A URL git could read as an option
+  (`-oProxyCommand=…`) or run as a command (`ext::sh -c …`) is refused (unit-tested).
 
 **Measured.**
 - The repro passes and prints the submodule's file.

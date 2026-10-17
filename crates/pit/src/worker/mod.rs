@@ -805,6 +805,9 @@ impl Worker {
                 // A path on this machine only for a superproject that is one
                 // too (a local setup): a repo hosted elsewhere must not read
                 // other repos' mirrors through its `.gitmodules`.
+                if !git::is_fetchable_url(&resolved) {
+                    anyhow::bail!("submodule {name}: {resolved:?} is not a URL Pit fetches");
+                }
                 if git::is_local_url(&resolved) && !git::is_local_url(url) {
                     anyhow::bail!(
                         "submodule {name}: {resolved} is a path on the worker; use a URL"
