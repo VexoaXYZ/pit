@@ -3117,10 +3117,10 @@ Claims corrected:
 
 **The pain.** P33 left this open: flakiness tracked per task says that `test` is flaky, but a
 task running 2,000 tests only gets fixed once someone knows which one. The usual answer is a
-separate test-analytics product reading JUnit uploads. P33's sources apply
-([Buildkite](https://buildkite.com/resources/blog/a-guide-to-flaky-tests/),
-[Trunk](https://trunk.io/blog/the-ultimate-guide-to-flaky-tests)), and every flaky-test tool
-works per test.
+separate test-analytics product reading JUnit uploads, and the tools P33 cites all work per test
+([BuildPulse](https://buildpulse.io/products/flaky-tests),
+[Trunk vs BuildPulse](https://trunk.io/compare/trunk-vs-buildpulse),
+[Blacksmith](https://info.blacksmith.sh/task/blog/github-actions-reduce-flaky-test-noise)).
 
 **Reproduction.** One task with `retries: 1` and a JUnit report of 20 tests. `test_checkout_race`
 fails about half the time; the other 19 always pass. After 10 runs, before:
