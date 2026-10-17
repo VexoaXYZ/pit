@@ -3370,3 +3370,37 @@ Checked and fine:
 
 Claims corrected: P54's local-path and safety lines, P53's "the commit it last ran", P51's
 retried-test rule.
+
+## P55. Bot commits and bot pull requests never get CI (`GITHUB_TOKEN`)
+
+**The pain.** Events made with Actions' `GITHUB_TOKEN` don't start workflows, by design, to stop
+recursion:
+- an auto-formatter's commit, a release bot's PR or a changelog commit get no checks;
+- required checks then sit at "Expected — Waiting for status to be reported" forever.
+
+Sources: [community #25702](https://github.com/orgs/community/discussions/25702),
+[#37103](https://github.com/orgs/community/discussions/37103),
+[#65321](https://github.com/orgs/community/discussions/65321),
+[#27028](https://github.com/orgs/community/discussions/27028);
+[awslabs/automated-security-helper#341](https://github.com/awslabs/automated-security-helper/issues/341);
+[DEV, "0 of 11 releases"](https://dev.to/ji_ai/github-actions-githubtoken-wont-trigger-workflows-0-of-11-releases-42em).
+
+The workarounds:
+- a GitHub App token or a PAT for the bot (a secret to manage, and a loop guard to add);
+- `workflow_dispatch` calls;
+- deploy keys ([action-push-to-protected](https://github.com/powderlabs/action-push-to-protected));
+- a human pushing an empty commit.
+
+**Reproduction.** The rule is Actions' own: GitHub still sends the webhooks to apps, whoever
+pushed. Pit started runs from those webhooks without looking at the sender, but nothing proved
+that. e2e `bot_pushes_and_pull_requests_are_tested` sends two signed webhooks for one commit:
+- a `push` to `format` by `github-actions[bot]` (`sender.type: Bot`);
+- a `pull_request` opened by `dependabot[bot]`.
+
+Each starts a run of that commit, and both pass.
+
+**Verdict: SOLVED.** Bot commits and bot PRs get Pit checks with no PAT, App token or dispatch
+step. No loop guard is needed: the only commits Pit itself pushes are merge-queue landings, which
+it tests as post-merge runs, and their push event's identical tasks come from the cache (P39).
+Not shown here: the GitHub side (real webhook delivery for a `GITHUB_TOKEN` push), which these
+sources describe but this machine can't produce.

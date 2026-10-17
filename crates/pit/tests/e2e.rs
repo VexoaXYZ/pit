@@ -3312,3 +3312,95 @@ async fn submodules_are_checked_out_at_their_pinned_commit() {
     assert_eq!(second.status, Status::Passed, "{second:?}");
     assert_eq!(seen(&second), "two\n");
 }
+
+/// Commits pushed by a bot with Actions' `GITHUB_TOKEN`, and pull requests a
+/// bot opens, start runs like anyone's: GitHub delivers their webhooks to
+/// apps, and only Actions itself declines to start workflows for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bot_pushes_and_pull_requests_are_tested() {
+    use hmac::Mac;
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github =
+        pit::server::github::GitHub::with_token("http://127.0.0.1:9", "t", Some("s3cret".into()))
+            .unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("bots".into()),
+        data_dir: data.path().join("worker"),
+        slots: 1,
+        parallelism: 1,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        repo.path(),
+        "pit.config.json",
+        r#"{"tasks":{"check":{"run":"true","cache":false}}}"#,
+    );
+    sh(repo.path(), "git init -q -b main && git add -A && git commit -qm init && git checkout -q -b format && git commit -q --allow-empty -m 'style: format'");
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    let repository = serde_json::json!({ "full_name": "acme/site", "clone_url": repo.path().to_string_lossy(), "default_branch": "main" });
+    let bot = |login: &str| serde_json::json!({ "login": login, "type": "Bot" });
+    let post_event = |event: &'static str, payload: serde_json::Value| {
+        let body = payload.to_string();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+        mac.update(body.as_bytes());
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let base = base.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{base}/webhooks/github"))
+                .header("x-github-event", event)
+                .header("x-hub-signature-256", sig)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let client = Client::new(&base, None).unwrap();
+    let pushed = post_event(
+        "push",
+        serde_json::json!({ "ref": "refs/heads/format", "after": sha, "repository": repository,
+            "pusher": { "name": "github-actions[bot]" }, "sender": bot("github-actions[bot]") }),
+    )
+    .await;
+    let opened = post_event(
+        "pull_request",
+        serde_json::json!({ "action": "opened", "repository": repository, "sender": bot("dependabot[bot]"),
+            "pull_request": { "number": 3, "user": bot("dependabot[bot]"),
+                "head": { "sha": sha, "repo": { "full_name": "acme/site" } }, "base": { "ref": "main" } } }),
+    )
+    .await;
+    for (what, v) in [("bot push", &pushed), ("bot pull request", &opened)] {
+        let id = v["run"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what}: {v}"))
+            .to_string();
+        let view = tokio::time::timeout(
+            Duration::from_secs(60),
+            pit::cli::wait(&client, &id, |_| {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(view.status, Status::Passed, "{what}: {view:?}");
+        assert_eq!(view.sha, sha);
+    }
+}
