@@ -425,7 +425,7 @@ seconds without pushing.
 | `pit up` | Server, worker and dashboard in one process. |
 | `pit server` / `pit worker --server URL` | Run them separately, on as many machines as you like. |
 | `pit run [task…] [-v] [--json] [--no-cache] [--fresh] [--debug]` | Run on the working tree. Exit code reflects the result. `--fresh` uses a new, empty workspace. `--debug`: a failed task's result names a script on its worker; `sh <script>` opens a shell where it failed (its container, its variables; secrets left out), `sh <script> '<command>'` runs one there. The workspace is kept for 30 minutes or until the script is deleted. Unix workers only. |
-| `pit flaky [--days 14]` | Tasks that passed only on a retry, or both passed and failed with the same inputs. |
+| `pit flaky [--days 14] [--tests]` | Tasks that passed only on a retry, or both passed and failed with the same inputs. `--tests` lists the tests inside tasks instead (from their JUnit `reports`): a test that failed and then passed on the task's retry, or failed where the same inputs passed elsewhere. A pass on a retry also names its flaky tests in the result. |
 | `pit slow [--days 14]` | Tasks whose last 5 passing runs take clearly longer (1.3x and 1s more) than the ones before. A single pass at 1.5x and 2s over its usual (median of the last 10) also says `slow: took …, usually …` in its result, on the CLI, the MCP summary and the GitHub check. |
 | `pit verify` | `pit run --no-cache --fresh`: proves results depend neither on the cache nor on files earlier runs left in a warm workspace. |
 | `pit runs`, `pit logs RUN TASK`, `pit stats` | Inspect. |

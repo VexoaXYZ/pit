@@ -169,6 +169,10 @@ enum Command {
         conn: Conn,
         #[arg(long, default_value_t = 14)]
         days: u32,
+        /// The tests inside tasks (from their JUnit `reports`) instead of
+        /// whole tasks.
+        #[arg(long)]
+        tests: bool,
     },
     /// Tasks whose recent passing runs take much longer than earlier ones.
     Slow {
@@ -417,8 +421,13 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Runs { conn, limit } => {
             cli::runs(&cli::client(&conn.server, conn.token)?, limit).await
         }
-        Command::Flaky { conn, days } => {
-            cli::flaky(&cli::client(&conn.server, conn.token)?, days).await
+        Command::Flaky { conn, days, tests } => {
+            let client = cli::client(&conn.server, conn.token)?;
+            if tests {
+                cli::flaky_tests(&client, days).await
+            } else {
+                cli::flaky(&client, days).await
+            }
         }
         Command::Slow { conn, days } => {
             cli::slow(&cli::client(&conn.server, conn.token)?, days).await

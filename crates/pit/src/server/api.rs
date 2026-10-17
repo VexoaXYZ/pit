@@ -59,6 +59,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/tasks/{id}/log", get(task_log).post(append_log))
         .route("/api/tasks/{id}/start", post(start_task))
         .route("/api/tasks/{id}/annotations", post(set_annotations))
+        .route("/api/tasks/{id}/tests", post(set_test_outcomes))
         .route("/api/tasks/{id}/finish", post(finish_task))
         .route("/api/groups/{id}/heartbeat", post(heartbeat))
         .route("/api/groups/{id}/release", post(release_group))
@@ -71,6 +72,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/cache/{key}/claim", post(cache_claim))
         .route("/api/flaky", get(flaky))
         .route("/api/slow", get(slow))
+        .route("/api/flaky/tests", get(flaky_tests))
         .route("/metrics", get(metrics))
         .route("/api/timings", post(record_timings))
         .route("/api/oidc/token", post(oidc_token))
@@ -422,6 +424,43 @@ async fn append_log(
         serde_json::json!({ "text": chunk.text }),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Tests recorded per task execution at most.
+const MAX_TESTS: usize = 500;
+
+/// `POST /api/tasks/{id}/tests`: which tests failed, and which passed only
+/// on a retry, from the running job.
+async fn set_test_outcomes(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(mut t): Json<TestOutcomes>,
+) -> ApiResult<StatusCode> {
+    let (group_id, _, _) = app.db.task_group(&id)?;
+    for list in [&mut t.failed, &mut t.passed_on_retry] {
+        list.truncate(MAX_TESTS);
+        for name in list.iter_mut() {
+            *name = name.chars().take(300).collect();
+        }
+    }
+    if !app.db.set_test_outcomes(&id, lease(&headers), &t)? {
+        return Err(stale(&group_id));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/flaky/tests?days=14`: see `Db::flaky_tests`.
+async fn flaky_tests(
+    State(app): State<Arc<App>>,
+    Query(q): Query<FlakyQuery>,
+) -> ApiResult<Json<Vec<FlakyTest>>> {
+    let days = q.days.unwrap_or(14).clamp(1, 90);
+    let since = crate::model::now_ms() - days * 86_400_000;
+    let rows = tokio::task::spawn_blocking(move || app.db.flaky_tests(since))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(rows))
 }
 
 /// Annotations a task keeps at most.

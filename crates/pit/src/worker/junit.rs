@@ -41,6 +41,11 @@ impl Summary {
         self.failed.len() as u64
     }
 
+    /// Every failed test, by name.
+    pub fn failed_names(&self) -> impl Iterator<Item = &String> {
+        self.failed.iter()
+    }
+
     /// "2 of 120 tests failed: a.b (expected 1); c.d (timeout)".
     pub fn message(&self) -> String {
         if self.failures.is_empty() {

@@ -497,6 +497,35 @@ pub struct SlowTask {
     pub last_run: String,
 }
 
+/// Tests of one task execution: which failed for good, and which failed in
+/// an earlier attempt but passed on the retry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestOutcomes {
+    #[serde(default)]
+    pub failed: Vec<String>,
+    #[serde(default)]
+    pub passed_on_retry: Vec<String>,
+}
+
+/// A test (inside a task's JUnit reports) with signs of flakiness
+/// (`pit flaky --tests`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlakyTest {
+    pub repo: String,
+    pub group: String,
+    pub task: String,
+    pub test: String,
+    /// Executions it failed in for good.
+    pub failures: u64,
+    /// Executions where it failed, then passed on the task's retry.
+    pub flaky_passes: u64,
+    /// Failures in an execution whose inputs (action key) also passed.
+    pub mixed_inputs: u64,
+    pub last_run: String,
+}
+
 /// A task with signs of flakiness over a period (`pit flaky`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

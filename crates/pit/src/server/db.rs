@@ -99,6 +99,13 @@ CREATE INDEX IF NOT EXISTS tasks_key ON tasks(action_key);
 CREATE INDEX IF NOT EXISTS tasks_finished ON tasks(finished_at);
 CREATE INDEX IF NOT EXISTS tasks_name ON tasks(name, finished_at);
 
+CREATE TABLE IF NOT EXISTS test_results (
+  task_id TEXT NOT NULL,
+  test TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  PRIMARY KEY (task_id, test, outcome)
+);
+
 CREATE TABLE IF NOT EXISTS task_logs (
   task_id TEXT NOT NULL,
   seq INTEGER NOT NULL,
@@ -1196,6 +1203,107 @@ impl Db {
                  AND groups_.status = 'running' AND groups_.lease = ?3)",
             params![task_id, serde_json::to_string(annotations)?, lease],
         )? > 0)
+    }
+
+    /// Records a running task's test outcomes (see `TestOutcomes`).
+    pub fn set_test_outcomes(
+        &self,
+        task_id: &str,
+        lease: Option<&str>,
+        outcomes: &TestOutcomes,
+    ) -> Result<bool> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let live: bool = tx
+            .prepare(
+                "SELECT 1 FROM tasks JOIN groups_ ON groups_.id = tasks.group_id
+                 WHERE tasks.id = ?1 AND groups_.status = 'running' AND groups_.lease = ?2",
+            )?
+            .exists(params![task_id, lease])?;
+        if !live {
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM test_results WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        for (tests, outcome) in [
+            (&outcomes.failed, "failed"),
+            (&outcomes.passed_on_retry, "retried"),
+        ] {
+            for t in tests {
+                tx.execute(
+                    "INSERT OR IGNORE INTO test_results (task_id, test, outcome) VALUES (?1, ?2, ?3)",
+                    params![task_id, t, outcome],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Tests that passed on a retry, or failed where the same inputs passed
+    /// elsewhere, over the window since `since`; worst first.
+    pub fn flaky_tests(&self, since: i64) -> Result<Vec<FlakyTest>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "WITH recent AS (
+               SELECT t.id, t.name AS task, g.name AS grp, repos.name AS repo, t.action_key,
+                      t.status, t.run_id, t.finished_at
+               FROM tasks t JOIN groups_ g ON g.id = t.group_id
+               JOIN runs r ON r.id = t.run_id JOIN repos ON repos.id = r.repo_id
+               WHERE t.finished_at > ?1
+             )
+             SELECT recent.repo, recent.grp, recent.task, x.test, x.outcome, recent.run_id,
+                    recent.finished_at,
+                    x.outcome = 'failed' AND recent.action_key IS NOT NULL AND EXISTS (
+                      SELECT 1 FROM recent r2 WHERE r2.action_key = recent.action_key
+                        AND r2.id != recent.id AND r2.status IN ('passed', 'cached'))
+             FROM test_results x JOIN recent ON recent.id = x.task_id
+             ORDER BY recent.finished_at",
+        )?;
+        type Key = (String, String, String, String);
+        let mut by: std::collections::BTreeMap<Key, FlakyTest> = Default::default();
+        let rows = st.query_map(params![since], |r| {
+            Ok((
+                (
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ),
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, bool>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let ((repo, group, task, test), outcome, run, mixed) = row?;
+            let e = by
+                .entry((repo.clone(), group.clone(), task.clone(), test.clone()))
+                .or_insert_with(|| FlakyTest {
+                    repo,
+                    group,
+                    task,
+                    test,
+                    failures: 0,
+                    flaky_passes: 0,
+                    mixed_inputs: 0,
+                    last_run: String::new(),
+                });
+            match outcome.as_str() {
+                "failed" => e.failures += 1,
+                _ => e.flaky_passes += 1,
+            }
+            e.mixed_inputs += u64::from(mixed);
+            e.last_run = run;
+        }
+        let mut out: Vec<FlakyTest> = by
+            .into_values()
+            .filter(|t| t.flaky_passes > 0 || t.mixed_inputs > 0)
+            .collect();
+        out.sort_by_key(|t| std::cmp::Reverse(t.flaky_passes + t.mixed_inputs));
+        Ok(out)
     }
 
     /// Every annotation of a group's failed tasks (an attempt that was

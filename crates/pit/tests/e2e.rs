@@ -3046,3 +3046,61 @@ async fn run_ref(pit: &Pit, url: &str, sha: String, git_ref: &str, trusted: bool
     .unwrap()
     .unwrap()
 }
+
+/// `pit flaky --tests` names the flaky test inside a task, from its JUnit
+/// reports: one that failed and then passed on the task's retry, and one
+/// that failed where the same inputs passed in another run. Steady tests are
+/// not listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flaky_tests_inside_a_task_are_named() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let state = dir
+        .join("..")
+        .join(format!("flaky-tests-{}", std::process::id()));
+    std::fs::create_dir_all(&state).unwrap();
+    // `on_retry` fails on each run's first attempt; `flip` fails in both
+    // attempts of the first run only.
+    let script = format!(
+        r#"import os, sys
+d = {state:?}
+run = os.environ["PIT_RUN_ID"]
+first = not os.path.exists(f"{{d}}/{{run}}")
+open(f"{{d}}/{{run}}", "a").close()
+runs = len([f for f in os.listdir(d) if f.startswith("run_")])
+bad = {{"on_retry": first, "flip": runs == 1, "steady": False}}
+cases = "".join(f'<testcase classname="t" name="{{n}}">' + ('<failure message="x"/>' if b else '') + '</testcase>' for n, b in bad.items())
+os.makedirs("out", exist_ok=True)
+open("out/r.xml", "w").write("<testsuite>" + cases + "</testsuite>")
+sys.exit(1 if any(bad.values()) else 0)
+"#,
+        state = state.display().to_string()
+    );
+    write(dir, "t.py", &script);
+    write(dir, ".gitignore", "out/\n");
+    let config = serde_json::json!({ "tasks": { "test": {
+        "run": "python3 t.py", "reports": ["out/*.xml"], "retries": 1, "cache": false,
+    } } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let first = run(&pit, dir).await;
+    assert_eq!(first.status, Status::Failed, "{first:?}");
+    let second = run(&pit, dir).await;
+    assert_eq!(second.status, Status::Passed, "{second:?}");
+    let msg = second.groups[0].tasks[0]
+        .message
+        .clone()
+        .unwrap_or_default();
+    assert!(msg.contains("(flaky tests: t.on_retry)"), "{msg}");
+    let flaky: Vec<FlakyTest> = pit.client.get("/api/flaky/tests?days=1").await.unwrap();
+    let get = |n: &str| flaky.iter().find(|t| t.test == n).cloned();
+    let on_retry = get("t.on_retry").expect("passed on a retry");
+    assert!(on_retry.flaky_passes >= 1, "{on_retry:?}");
+    let flip = get("t.flip").expect("failed where the same inputs passed");
+    assert_eq!((flip.failures, flip.mixed_inputs), (1, 1), "{flip:?}");
+    assert!(get("t.steady").is_none());
+}

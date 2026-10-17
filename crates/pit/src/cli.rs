@@ -477,6 +477,31 @@ pub async fn slow(client: &Client, days: u32) -> Result<i32> {
     Ok(0)
 }
 
+/// Flaky tests (inside tasks' JUnit reports) over the last `days`.
+pub async fn flaky_tests(client: &Client, days: u32) -> Result<i32> {
+    let tests: Vec<FlakyTest> = client.get(&format!("/api/flaky/tests?days={days}")).await?;
+    if tests.is_empty() {
+        println!("no flaky tests in the last {days} day(s) (tasks need `reports` for this)");
+        return Ok(0);
+    }
+    println!(
+        "{:<56} {:>8} {:>13} {:>12}  last run",
+        "test", "failed", "passed retry", "same inputs"
+    );
+    for t in tests {
+        println!(
+            "{:<56} {:>8} {:>13} {:>12}  {}",
+            format!("{} {}.{}: {}", t.repo, t.group, t.task, t.test),
+            t.failures,
+            t.flaky_passes,
+            t.mixed_inputs,
+            t.last_run
+        );
+    }
+    println!("\n\"passed retry\": failed, then passed when the task was retried. \"same inputs\": failed where the same inputs passed elsewhere.");
+    Ok(0)
+}
+
 /// Flaky tasks over the last `days`, worst first.
 pub async fn flaky(client: &Client, days: u32) -> Result<i32> {
     let tasks: Vec<FlakyTask> = client.get(&format!("/api/flaky?days={days}")).await?;

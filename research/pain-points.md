@@ -3112,3 +3112,55 @@ Claims corrected:
 - P48's "removed however the group ended": hard stops are now covered; a panic or a crash still
   relies on the next start.
 - P49's "never replayed": only for commands that name the base.
+
+## P51. Which test is flaky? (P33's open gap)
+
+**The pain.** P33 left this open: flakiness tracked per task says that `test` is flaky, but a
+task running 2,000 tests only gets fixed once someone knows which one. The usual answer is a
+separate test-analytics product reading JUnit uploads. P33's sources apply
+([Buildkite](https://buildkite.com/resources/blog/a-guide-to-flaky-tests/),
+[Trunk](https://trunk.io/blog/the-ultimate-guide-to-flaky-tests)), and every flaky-test tool
+works per test.
+
+**Reproduction.** One task with `retries: 1` and a JUnit report of 20 tests. `test_checkout_race`
+fails about half the time; the other 19 always pass. After 10 runs, before:
+- `pit flaky` listed `p51 default.test` (4 passes on a retry, 1 input set that both passed and
+  failed);
+- nothing said which of the 20 tests it was. Each failed run's message named that run's failure,
+  but nothing collected across runs or retries.
+
+**Fix.**
+- **The worker reads the reports after every failed attempt** that will be retried, before the
+  next attempt clears them.
+- **It records outcomes at the end.** It posts `POST /api/tasks/{id}/tests` (lease-checked, at
+  most 500 names each, masked):
+  - the tests that failed for good;
+  - the tests that failed in an earlier attempt but not the last.
+- **The server keeps them in `test_results`.** `pit flaky --tests` (`GET /api/flaky/tests`) lists
+  each test that:
+  - passed on a retry, or
+  - failed in an execution whose action key also passed elsewhere (same inputs, different
+    outcome).
+- **A pass on a retry names its flaky tests in the result:** `flaky: attempt 1: exit 1, passed
+  on attempt 2 (flaky tests: cart.test_checkout_race)`.
+
+**Measured.**
+- The same 10 runs after the fix:
+
+  ```
+  test                                       failed  passed retry  same inputs
+  p51 default.test: cart.test_checkout_race       2             2            2
+  ```
+
+  Exactly the one test was listed, and none of the 19 steady ones. The two runs that passed on a
+  retry said `(flaky tests: cart.test_checkout_race)`.
+- e2e `flaky_tests_inside_a_task_are_named`, with three tests:
+  - `on_retry` fails each run's first attempt and is listed as passed on a retry;
+  - `flip` fails only in the first run and is listed as 1 failure on inputs that also passed;
+  - `steady` is not listed;
+  - the passing run's message names `t.on_retry`.
+
+**Verdict: SOLVED** for tests that report through JUnit. Limits:
+- `quarantine` is still per task, so a flaky test can't be quarantined on its own.
+- Tests are identified by `classname.name`, so a renamed test starts a new history.
+- Like the other history tables, `test_results` is never pruned.

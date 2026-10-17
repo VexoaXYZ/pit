@@ -1182,6 +1182,8 @@ impl Worker {
         let mut failures: Vec<String> = Vec::new();
         let mut duration_ms = 0u64;
         let mut attempt = 0;
+        // Tests that failed in an attempt that was then retried.
+        let mut retried_tests: std::collections::BTreeSet<String> = Default::default();
         let outcome = loop {
             attempt += 1;
             files::clear_outputs(ws, &def.reports)?;
@@ -1212,6 +1214,13 @@ impl Worker {
                 _ => "killed by a signal".to_string(),
             };
             failures.push(format!("attempt {attempt}: {why}"));
+            // Read now: the next attempt clears the reports.
+            if let Ok(reports) = files::collect_outputs(ws, &def.reports) {
+                let paths: Vec<&std::path::PathBuf> = reports.iter().map(|(_, a)| a).collect();
+                if let Some(s) = junit::summarize(&paths) {
+                    retried_tests.extend(s.failed_names().map(|n| masker.mask(n)));
+                }
+            }
             let note = format!("\n[pit: attempt {attempt} failed ({why}); retrying]\n");
             log.push_str(&note);
             let _ = client
@@ -1382,6 +1391,29 @@ impl Worker {
                 serde_json::json!({ "task": task.name, "times": reported })
             };
             let _ = client.post_empty("/api/timings", &body).await;
+        }
+        // Which tests failed, and which failed only before a retry, for
+        // `pit flaky --tests`.
+        let failed_now: std::collections::BTreeSet<String> = summary
+            .iter()
+            .flat_map(|s| s.failed_names())
+            .map(|n| masker.mask(n))
+            .collect();
+        let passed_on_retry: Vec<String> = retried_tests.difference(&failed_now).cloned().collect();
+        if !failed_now.is_empty() || !passed_on_retry.is_empty() {
+            if ok && !passed_on_retry.is_empty() {
+                let names: Vec<&str> = passed_on_retry.iter().take(5).map(String::as_str).collect();
+                message = message.map(|m| format!("{m} (flaky tests: {})", names.join(", ")));
+            }
+            let _ = client
+                .post_empty(
+                    &format!("/api/tasks/{}/tests", task.id),
+                    &TestOutcomes {
+                        failed: failed_now.into_iter().collect(),
+                        passed_on_retry,
+                    },
+                )
+                .await;
         }
         if let Some(summary) = summary {
             let text = masker.mask(&summary.message());
