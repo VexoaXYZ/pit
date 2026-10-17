@@ -91,14 +91,34 @@ pub struct PlannedGroup {
     pub tasks: Vec<(String, TaskDef)>,
     /// See `GroupDef::lock`.
     pub lock: Option<String>,
+    /// Why the group is not run in this kind of run (`GroupDef::on`). It is
+    /// still recorded, so its check reports and a required one never waits.
+    pub not_in: Option<String>,
 }
 
 /// Expands the config into schedulable groups. `selected` filters tasks by
 /// name (`task` or `group.task`); their deps are always included.
 pub fn plan(config: &PitConfig, selected: &[String]) -> Result<Vec<PlannedGroup>> {
+    plan_for(config, selected, &[])
+}
+
+/// The kinds of run a group's `on` can name.
+pub const RUN_KINDS: &[&str] = &["pr", "push", "main", "queue", "schedule", "local"];
+
+/// `plan` for a run of these kinds (see `GroupDef::on`); groups that do
+/// not run in any of them are left out. No kinds means no filtering.
+pub fn plan_for(
+    config: &PitConfig,
+    selected: &[String],
+    kinds: &[&str],
+) -> Result<Vec<PlannedGroup>> {
     let mut groups = Vec::new();
     let mut matched: BTreeSet<&str> = BTreeSet::new();
     for (gname, group) in &config.groups {
+        let not_in = (!kinds.is_empty()
+            && !group.on.is_empty()
+            && !group.on.iter().any(|o| kinds.contains(&o.as_str())))
+        .then(|| format!("runs only in {} runs (`on`)", group.on.join(", ")));
         let mut keep: BTreeSet<String> = BTreeSet::new();
         if selected.is_empty() {
             keep.extend(group.tasks.keys().cloned());
@@ -135,6 +155,7 @@ pub fn plan(config: &PitConfig, selected: &[String]) -> Result<Vec<PlannedGroup>
                     .into_iter()
                     .map(|g| PlannedGroup {
                         lock: group.lock.clone(),
+                        not_in: not_in.clone(),
                         ..g
                     }),
             );
@@ -162,6 +183,7 @@ fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<Planne
             os: os.to_string(),
             tasks: tasks.to_vec(),
             lock: None,
+            not_in: None,
         }];
     }
     let by_name: BTreeMap<String, TaskDef> = tasks.iter().cloned().collect();
@@ -203,6 +225,7 @@ fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<Planne
                 os: os.to_string(),
                 tasks,
                 lock: None,
+                not_in: None,
             }
         })
         .collect()

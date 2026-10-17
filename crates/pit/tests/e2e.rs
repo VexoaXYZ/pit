@@ -3404,3 +3404,186 @@ async fn bot_pushes_and_pull_requests_are_tested() {
         assert_eq!(view.sha, sha);
     }
 }
+
+/// A group's `on` limits the kinds of run it is in: e2e only in the merge
+/// queue and on main, a deploy only on main. Naming a task on a local run
+/// still runs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn groups_run_only_on_the_kinds_of_run_they_name() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    let config = serde_json::json!({ "groups": {
+        "unit": { "tasks": { "test": { "run": "true" } } },
+        "e2e": { "on": ["queue", "main"], "tasks": { "test": { "run": "true" } } },
+        "deploy": { "on": ["main"], "tasks": { "ship": { "run": "true", "cache": false } } },
+    } });
+    write(&work, "pit.config.json", &config.to_string());
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    let groups = |v: &RunView| {
+        let mut g: Vec<String> = v.groups.iter().map(|g| g.name.clone()).collect();
+        g.sort();
+        g
+    };
+    // Every group has a group (so required checks report); the ones this
+    // kind of run leaves out pass with skipped tasks.
+    let ran = |v: &RunView| {
+        let mut g: Vec<String> = v
+            .groups
+            .iter()
+            .filter(|g| g.worker.as_deref() != Some("on"))
+            .map(|g| g.name.clone())
+            .collect();
+        g.sort();
+        g
+    };
+    let local = run(&pit, &work).await;
+    assert_eq!(groups(&local), ["deploy", "e2e", "unit"], "{local:?}");
+    assert_eq!(ran(&local), ["unit"], "{local:?}");
+    assert_eq!(local.status, Status::Passed);
+    let e2e = local.groups.iter().find(|g| g.name == "e2e").unwrap();
+    assert_eq!(e2e.status, Status::Passed);
+    assert_eq!(e2e.tasks[0].status, Status::Skipped);
+    assert!(e2e
+        .message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("runs only in queue, main runs"));
+    let named = pit::cli::submit(
+        &pit.client,
+        &work,
+        vec!["e2e.test".into()],
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let named = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&pit.client, &named.run_id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ran(&named), ["e2e"], "{named:?}");
+    let sha = sh(&work, "git rev-parse HEAD").trim().to_string();
+    let url = tmp.path().join("origin.git").to_string_lossy().to_string();
+    let main = run_ref(&pit, &url, sha, "main", true).await;
+    assert_eq!(ran(&main), ["deploy", "e2e", "unit"], "{main:?}");
+    assert_eq!(main.status, Status::Passed);
+    // A typo in `on` is a config error.
+    let bad = serde_json::json!({ "groups": { "x": { "on": ["pull_request"], "tasks": { "t": { "run": "true" } } } } });
+    write(&work, "pit.config.json", &bad.to_string());
+    let view = run(&pit, &work).await;
+    assert_eq!(view.status, Status::Error);
+    assert!(view.message.unwrap_or_default().contains("unknown `on`"));
+}
+
+/// A group a pull request run leaves out (`on: ["main"]`) still posts its
+/// status, as success, so a required check for it never waits forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn groups_left_out_by_on_still_report_their_check() {
+    use axum::routing::post;
+    let statuses: std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>> = Default::default();
+    let seen = statuses.clone();
+    let mock = axum::Router::new().route(
+        "/repos/acme/web/statuses/{sha}",
+        post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+            let seen = seen.clone();
+            async move {
+                seen.lock().push(b);
+                axum::Json(serde_json::json!({}))
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await });
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github = pit::server::github::GitHub::with_token(&mock_url, "t", None).unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("on".into()),
+        data_dir: data.path().join("worker"),
+        slots: 1,
+        parallelism: 1,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let repo = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({ "groups": {
+        "unit": { "tasks": { "t": { "run": "true" } } },
+        "deploy": { "on": ["main"], "tasks": { "ship": { "run": "exit 1" } } },
+    } });
+    write(repo.path(), "pit.config.json", &config.to_string());
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    app.db
+        .upsert_repo(
+            "acme/web",
+            Some(&repo.path().to_string_lossy()),
+            Some("acme/web"),
+        )
+        .unwrap();
+    let id = app
+        .create_run(
+            CreateRun {
+                repo: "acme/web".into(),
+                url: None,
+                sha,
+                overlay: None,
+                tasks: vec![],
+                trigger: Some("pr".into()),
+                git_ref: Some("pull/1".into()),
+                no_cache: false,
+                fresh: false,
+                debug: false,
+                no_secrets: false,
+                trusted: false,
+            },
+            Some(1),
+        )
+        .await
+        .unwrap();
+    let client = Client::new(&base, None).unwrap();
+    let view = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&client, &id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.status, Status::Passed, "{view:?}");
+    let last = |ctx: &str| {
+        statuses
+            .lock()
+            .iter()
+            .rev()
+            .find(|s| s["context"] == ctx)
+            .map(|s| s["state"].as_str().unwrap_or_default().to_string())
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while last("pit / deploy").is_none() || last("pit / unit").as_deref() != Some("success") {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("statuses were not posted");
+    assert_eq!(last("pit / deploy").as_deref(), Some("success"));
+}

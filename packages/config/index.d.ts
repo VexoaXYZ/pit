@@ -115,6 +115,12 @@ export interface GroupDef {
    */
   lock?: string;
   /**
+   * Kinds of run the group is in: `"pr"`, `"push"`, `"main"` (default-branch
+   * pushes and post-merge), `"queue"` (merge queue), `"schedule"`, `"local"`
+   * (`pit run`). Default: all. Tasks named on a local `pit run` ignore it.
+   */
+  on?: ("pr" | "push" | "main" | "queue" | "schedule" | "local")[];
+  /**
    * Containers the group's tasks talk to, started before its first task and
    * removed after its last. Tasks get `PIT_SERVICE_<NAME>_HOST` and
    * `PIT_SERVICE_<NAME>_PORT`. Needs Docker on the worker.

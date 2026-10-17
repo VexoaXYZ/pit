@@ -756,14 +756,38 @@ impl Db {
         tasks: &[(String, TaskDef)],
         results: &[TaskResult],
     ) -> Result<String> {
+        self.insert_finished_group(
+            run_id,
+            name,
+            os,
+            tasks,
+            results,
+            "cache",
+            "every task came from the cache; no worker needed",
+        )
+    }
+
+    /// A group that is done without a worker: answered by the cache
+    /// (`worker` "cache"), or not part of this kind of run ("on").
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_finished_group(
+        &self,
+        run_id: &str,
+        name: &str,
+        os: &str,
+        tasks: &[(String, TaskDef)],
+        results: &[TaskResult],
+        worker: &str,
+        message: &str,
+    ) -> Result<String> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         let gid = new_id("grp");
         let now = now_ms();
         tx.execute(
             "INSERT INTO groups_ (id, run_id, name, os, backends, status, worker, prepare_ms, message, created_at, started_at, finished_at)
-             VALUES (?1, ?2, ?3, ?4, '[]', 'passed', 'cache', 0, 'every task came from the cache; no worker needed', ?5, ?5, ?5)",
-            params![gid, run_id, name, os, now],
+             VALUES (?1, ?2, ?3, ?4, '[]', 'passed', ?6, 0, ?7, ?5, ?5, ?5)",
+            params![gid, run_id, name, os, now, worker, message],
         )?;
         for (pos, ((tname, def), r)) in tasks.iter().zip(results).enumerate() {
             tx.execute(

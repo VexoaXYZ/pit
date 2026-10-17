@@ -139,6 +139,28 @@ command mentions the base or `affected` has the base in its cache key. A task th
 uncommitted changes (`pit run`), `NX_HEAD`/`TURBO_SCM_HEAD` are left unset, so the tools diff the
 working tree and count those changes.
 
+### Which runs a group is in
+
+`on` limits a group to some kinds of run, the way `if: github.ref == …` does in Actions:
+
+```ts
+e2e: { on: ["queue", "main"], tasks: { test: { run: "npm run e2e" } } },   // not on every PR push
+deploy: { on: ["main"], tasks: { ship: { run: "./deploy.sh" } } },
+```
+
+The kinds are:
+- `pr`: pull requests, their reruns and `/retest`;
+- `push`: any branch push;
+- `main`: pushes to the default branch and post-merge runs;
+- `queue`: merge queue candidates;
+- `schedule`;
+- `local`: `pit run`, the API, MCP.
+
+The default is all. A left-out group is still recorded, passed with its tasks skipped, so its check
+reports (`skipped` on a check run, `success` as a commit status) and a required `pit / e2e` never
+sits at "Expected". A task named on a local run (`pit run e2e.test`) runs whatever its group's `on`
+says.
+
 ### Shared resources
 
 `lock: "staging-db"` on a group makes groups with that lock run one at a time, across every run

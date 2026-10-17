@@ -249,6 +249,14 @@ impl GitHub {
         }
         for g in &view.groups {
             let summary = summarize(g);
+            // Not part of this kind of run (`on`): reported "skipped", which
+            // GitHub counts as passing for a required check, as for a job an
+            // `if:` skips.
+            let status = if g.worker.as_deref() == Some("on") {
+                Status::Skipped
+            } else {
+                g.status
+            };
             let annotations = if g.status.is_done() {
                 app.db.group_annotations(&g.id)?
             } else {
@@ -260,7 +268,7 @@ impl GitHub {
                 &run.sha,
                 Some(&g.id),
                 &g.name,
-                g.status,
+                status,
                 &summary,
                 &details,
                 &annotations,
@@ -284,11 +292,17 @@ impl GitHub {
         annotations: &[Annotation],
     ) -> Result<()> {
         let check_name = format!("pit / {name}");
+        // A group this kind of run leaves out (`on`) is recorded as passed
+        // with skipped tasks.
+        let not_in_run = status == Status::Skipped
+            && group_id
+                .and_then(|g| app.db.group(g).ok())
+                .is_some_and(|g| g.status == Status::Passed);
         match &self.auth {
             Auth::Token(_) => {
                 let state = match status {
                     Status::Queued | Status::Running => "pending",
-                    s if s.is_ok() => "success",
+                    s if s.is_ok() || not_in_run => "success",
                     Status::Error => "error",
                     _ => "failure",
                 };
@@ -322,6 +336,7 @@ impl GitHub {
                         body["status"] = "completed".into();
                         body["conclusion"] = match s {
                             Status::Passed | Status::Cached => "success",
+                            Status::Skipped if not_in_run => "skipped",
                             Status::Skipped => "cancelled",
                             _ => "failure",
                         }

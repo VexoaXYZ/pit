@@ -63,6 +63,12 @@ pub struct GroupDef {
     /// database. Others wait in line; none are cancelled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock: Option<String>,
+    /// Kinds of run this group runs in: `pr`, `push`, `main` (default-branch
+    /// pushes and post-merge), `queue` (merge queue candidates), `schedule`,
+    /// `local` (`pit run`). Empty means all. Tasks named on the command line
+    /// of a local run ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on: Vec<String>,
     /// Containers the group's tasks talk to (a database, a cache), started
     /// before its first task and removed after its last. Needs Docker.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

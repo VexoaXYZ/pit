@@ -3405,3 +3405,52 @@ checks with no PAT, App token or dispatch step. No loop guard is needed: the onl
 it tests as post-merge runs, and their push event's identical tasks come from the cache (P39).
 Not shown here: the GitHub side (real webhook delivery for a `GITHUB_TOKEN` push), which these
 sources describe but this machine can't produce.
+
+## P56. "Run this only in the merge queue / only on main" (and required checks that wait forever)
+
+**The pain.** Expensive suites (e2e, deploy previews, release steps) should run only in the merge
+queue or on main, not on every PR push. In Actions that takes an `if:` on the job, plus triggering
+the workflow on `merge_group` and `pull_request` both. The traps:
+- **A whole workflow filtered out never reports**, so its required check waits forever.
+- **A job skipped by `if:` reports success.** That's handy, but `github.ref == 'refs/heads/main'`
+  doesn't match in the queue (`gh-readonly-queue/…`), so e2e silently "passes" there having run
+  nothing ([ethpayserver#281](https://github.com/randomcash/ethpayserver/pull/281)).
+- **Teams build gatherer jobs** that read `toJSON(needs)` to decide
+  ([boinkor.net](https://boinkor.net/2023/11/neat-github-actions-patterns-for-github-merge-queues/),
+  [cubic](https://www.cubic.dev/blog/github-merge-queue),
+  [community #51120](https://github.com/orgs/community/discussions/51120),
+  [#171941](https://github.com/orgs/community/discussions/171941),
+  [lemma-platform#942](https://github.com/lemma-work/lemma-platform/pull/942),
+  [tester-army/e2e#931](https://github.com/tester-army/e2e/pull/931),
+  [GitHub docs](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)).
+
+**Reproduction.** Pit had no conditions. The config function's context held only `packages`, with
+no trigger or branch, so every group ran in every kind of run. An e2e group ran on every PR push,
+and a deploy group would have deployed from PRs.
+
+**Fix: `on` on a group.**
+- The kinds are `pr` (PRs, their reruns, `/retest`), `push`, `main` (default-branch pushes and
+  post-merge), `queue`, `schedule` and `local` (`pit run`, API, MCP).
+- Each run's kind comes from its trigger, trust and ref. A queue candidate is `queue`, whatever its
+  ref looks like, so the "skips silently in the queue" trap can't happen.
+- A left-out group is still recorded, passed with skipped tasks and a message ("runs only in queue,
+  main runs (`on`)"). Its check reports `skipped` as a check run, which GitHub counts as passing
+  for a required check, and `success` as a commit status. A required `pit / e2e` never waits.
+- Tasks named on a local run (`pit run e2e.test`) run regardless.
+- Unknown kinds are config errors.
+
+**Measured.**
+- e2e `groups_run_only_on_the_kinds_of_run_they_name`, with groups `unit`, `e2e` (`on: queue,
+  main`) and `deploy` (`on: main`):
+  - a local run executes only `unit`; `e2e` and `deploy` are recorded passed with skipped tasks;
+  - `pit run e2e.test` runs e2e;
+  - a trusted push to main runs all three;
+  - `on: ["pull_request"]` is rejected.
+- e2e `groups_left_out_by_on_still_report_their_check`: a PR run against a mock GitHub posts
+  `pit / deploy` as `success`. Its task, `exit 1`, never ran.
+- A unit test covers the trigger-to-kind mapping, reruns and `/retest` included.
+
+**Verdict: SOLVED.** Limits:
+- `on` is per group, not per task.
+- There's no branch-name filter beyond `main` (the default branch); the config function still
+  can't see the branch.

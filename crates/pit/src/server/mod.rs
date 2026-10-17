@@ -420,7 +420,18 @@ impl App {
             .load_config(&mirror, &req.sha, overlay.as_ref(), req.no_secrets)
             .await?;
         let t_config = t0.elapsed();
-        let mut groups = crate::graph::plan(&config, &req.tasks)?;
+        // `on`: which groups this kind of run includes. Tasks named on a
+        // local run's command line always run.
+        let kinds = if req.trigger.as_deref() == Some("local") && !req.tasks.is_empty() {
+            vec![]
+        } else {
+            run_kinds(
+                req.trigger.as_deref().unwrap_or("api"),
+                req.trusted,
+                req.git_ref.as_deref(),
+            )
+        };
+        let mut groups = crate::graph::plan_for(&config, &req.tasks, &kinds)?;
         let run = self.db.run(run_id)?;
         if run.status.is_done() {
             return Ok(()); // Cancelled while planning.
@@ -453,6 +464,26 @@ impl App {
         let files = if req.no_cache { None } else { index };
         let mut resolved = 0;
         for g in &groups {
+            if let Some(why) = &g.not_in {
+                let skipped: Vec<TaskResult> = g
+                    .tasks
+                    .iter()
+                    .map(|_| TaskResult {
+                        status: Status::Skipped,
+                        exit_code: None,
+                        action_key: None,
+                        duration_ms: 0,
+                        log_digest: None,
+                        message: Some(why.clone()),
+                    })
+                    .collect();
+                let gid = self
+                    .db
+                    .insert_finished_group(run_id, &g.name, &g.os, &g.tasks, &skipped, "on", why)?;
+                self.emit_cached_group(run_id, &gid)?;
+                resolved += 1;
+                continue;
+            }
             if let Some(results) = files
                 .as_deref()
                 .map(|f| resolve::resolve(self, g, f, trusted))
@@ -677,6 +708,22 @@ pub async fn serve_app(app: Arc<App>, addr: SocketAddr) -> Result<()> {
 
 /// Why no online worker can take a group, if none can: the GitHub "Waiting
 /// for a runner to pick up this job" that never says what is missing.
+/// The kinds of run (`GroupDef::on`) a run counts as.
+pub fn run_kinds(trigger: &str, trusted: bool, git_ref: Option<&str>) -> Vec<&'static str> {
+    let pr = git_ref.is_some_and(|r| r.starts_with("pull/"));
+    match trigger {
+        "pr" | "retest" => vec!["pr"],
+        "rerun" if pr => vec!["pr"],
+        "push" | "rerun" if trusted => vec!["push", "main"],
+        "push" | "rerun" => vec!["push"],
+        "post-merge" => vec!["main"],
+        "queue" => vec!["queue"],
+        t if t.starts_with("schedule:") => vec!["schedule"],
+        // `pit run`, the API, MCP.
+        _ => vec!["local"],
+    }
+}
+
 pub fn waiting_reason(os: &str, needs: &[Backend], online: &[WorkerInfo]) -> Option<String> {
     let fits = |w: &WorkerInfo| {
         (os == "any" || w.os == os) && needs.iter().all(|b| w.backends.contains(b))
@@ -865,5 +912,26 @@ mod waiting_tests {
         assert!(waiting_reason("linux", &[], &[])
             .unwrap()
             .contains("no workers are online"));
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::run_kinds;
+
+    #[test]
+    fn runs_count_as_the_kinds_on_names() {
+        assert_eq!(run_kinds("pr", false, Some("pull/3")), ["pr"]);
+        assert_eq!(run_kinds("retest", false, Some("pull/3")), ["pr"]);
+        assert_eq!(run_kinds("rerun", false, Some("pull/3")), ["pr"]);
+        assert_eq!(run_kinds("push", true, Some("main")), ["push", "main"]);
+        assert_eq!(run_kinds("push", false, Some("feature")), ["push"]);
+        assert_eq!(run_kinds("post-merge", true, Some("main")), ["main"]);
+        assert_eq!(run_kinds("queue", true, Some("queue/pr/3")), ["queue"]);
+        assert_eq!(
+            run_kinds("schedule:nightly", true, Some("main")),
+            ["schedule"]
+        );
+        assert_eq!(run_kinds("local", false, None), ["local"]);
     }
 }

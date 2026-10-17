@@ -246,6 +246,14 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
         if group.os.is_empty() {
             group.os.push("any".into());
         }
+        for kind in &group.on {
+            if !crate::graph::RUN_KINDS.contains(&kind.as_str()) {
+                bail!(
+                    "group {gname}: unknown `on` {kind:?} (use {})",
+                    crate::graph::RUN_KINDS.join(", ")
+                );
+            }
+        }
         for os in &group.os {
             if !matches!(os.as_str(), "any" | "linux" | "macos" | "windows") {
                 bail!("group {gname}: unknown os {os:?} (use linux, macos, windows or any)");
