@@ -254,9 +254,13 @@ move them to a new image, or pin a digest (`node:22@sha256:…`).
    Submodules are checked out at the commit the superproject pins, recursively, each from a mirror
    of its own on the worker, fetched once and shared like the main one. Relative URLs (`../lib.git`)
    resolve against the repo's URL, and private ones use the worker's git credentials or SSH keys.
-   Fork pull requests get no submodules, and a submodule URL that is a path on the worker is
-   refused unless the repo itself is local: either would let `.gitmodules` read other repos the
-   worker can reach.
+   `.gitmodules` is repository code, so:
+   - fork pull requests get no submodules;
+   - a hosted repo's submodules must be on its own host, or one listed in `PIT_SUBMODULE_HOSTS`
+     (comma separated). Paths on the worker, and URLs with `?`, `#`, `\`, `%` or brackets
+     (so no IPv6 literals), are refused.
+
+   Only a local repo (a dev setup) may use path submodules.
 4. **Execute.** For each task in the DAG, the worker computes the action key from git blob
    ids (free, from the index) and overlay digests of the matching inputs, plus dependency
    keys. Cache hit: restore outputs, replay the log. Miss: run, stream logs live, upload

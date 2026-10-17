@@ -582,13 +582,13 @@ impl Db {
             .with_context(|| format!("unknown run {id}"))
     }
 
-    /// The run a rerun of this commit copies its restrictions from: one
-    /// without secrets if any was (a fork's commit), else the newest.
-    /// The newest run of a pull request.
+    /// The newest run of a pull request's own commit (not a merge queue
+    /// candidate containing it).
     pub fn latest_pr_run(&self, repo_id: &str, pr: u64) -> Result<Option<RunRow>> {
         let c = self.conn.lock();
         Ok(c.query_row(
             "SELECT * FROM runs WHERE repo_id = ?1 AND github_pr = ?2 AND overlay IS NULL
+               AND ref = 'pull/' || ?2
              ORDER BY created_at DESC LIMIT 1",
             params![repo_id, pr as i64],
             run_row,
@@ -596,6 +596,8 @@ impl Db {
         .optional()?)
     }
 
+    /// The run a rerun of this commit copies its restrictions from: one
+    /// without secrets if any was (a fork's commit), else the newest.
     pub fn prior_run(&self, repo_id: &str, sha: &str) -> Result<Option<RunRow>> {
         let c = self.conn.lock();
         Ok(c.query_row(
@@ -1268,7 +1270,8 @@ impl Db {
              )
              SELECT recent.repo, recent.grp, recent.task, x.test, x.outcome, recent.run_id,
                     recent.finished_at,
-                    x.outcome = 'failed' AND recent.action_key IS NOT NULL AND EXISTS (
+                    x.outcome = 'failed' AND recent.status IN ('failed', 'error')
+                      AND recent.action_key IS NOT NULL AND EXISTS (
                       SELECT 1 FROM recent r2 WHERE r2.action_key = recent.action_key
                         AND r2.id != recent.id AND r2.status IN ('passed', 'cached'))
              FROM test_results x JOIN recent ON recent.id = x.task_id
@@ -2234,6 +2237,39 @@ mod tests {
         assert_eq!(db.notify_state("k").unwrap(), Some(("passed".into(), 200)));
         db.record_notify_state("k", "failed", 300).unwrap();
         assert_eq!(db.notify_state("k").unwrap(), Some(("failed".into(), 300)));
+    }
+
+    #[test]
+    fn retest_picks_the_pull_requests_own_commit() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        db.insert_run(
+            &repo.id,
+            "head",
+            Some("pull/9"),
+            None,
+            0,
+            "pr",
+            false,
+            Some(9),
+            false,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Queued later: a candidate merge commit, also tagged with the PR.
+        db.insert_run(
+            &repo.id,
+            "candidate",
+            Some("queue/pr/9"),
+            None,
+            0,
+            "queue",
+            false,
+            Some(9),
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.latest_pr_run(&repo.id, 9).unwrap().unwrap().sha, "head");
     }
 
     #[test]

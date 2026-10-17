@@ -719,7 +719,11 @@ impl Worker {
             if job.no_secrets {
                 // A fork's `.gitmodules` could point at another repo's mirror
                 // on this worker, or use its credentials.
-                note = Some("submodules are not fetched for pull requests from forks".into());
+                let msg = "submodules are not fetched for pull requests from forks";
+                note = Some(match note.take() {
+                    Some(n) => format!("{n}; {msg}"),
+                    None => msg.into(),
+                });
             } else {
                 self.prepare_submodules(ws, &job.url, 0).await?;
             }
@@ -808,9 +812,14 @@ impl Worker {
                 if !git::is_fetchable_url(&resolved) {
                     anyhow::bail!("submodule {name}: {resolved:?} is not a URL Pit fetches");
                 }
-                if git::is_local_url(&resolved) && !git::is_local_url(url) {
+                // A hosted repo's submodules come from its own host, or one the
+                // operator allows (`PIT_SUBMODULE_HOSTS`): `.gitmodules` is
+                // repository code, and the worker fetches with its
+                // credentials. A local repo (a dev setup) may use paths.
+                if !git::is_local_url(url) && !submodule_host_allowed(url, &resolved) {
                     anyhow::bail!(
-                        "submodule {name}: {resolved} is a path on the worker; use a URL"
+                        "submodule {name}: {resolved} is not on this repo's host; \
+                         allow its host with PIT_SUBMODULE_HOSTS"
                     );
                 }
                 let mirror = self.data_dir.join("mirrors").join(format!(
@@ -1510,8 +1519,16 @@ impl Worker {
             .flat_map(|s| s.failed_names())
             .map(|n| masker.mask(n))
             .collect();
-        let passed_on_retry: Vec<String> = retried_tests.difference(&failed_now).cloned().collect();
-        if !failed_now.is_empty() || !passed_on_retry.is_empty() {
+        // Without a report from the last attempt (it crashed before writing
+        // one), nothing is known to have passed on the retry.
+        let passed_on_retry: Vec<String> = if summary.is_some() {
+            retried_tests.difference(&failed_now).cloned().collect()
+        } else {
+            vec![]
+        };
+        // Posted even when empty: it replaces what an earlier attempt of this
+        // task (requeued) recorded.
+        if !def.reports.is_empty() {
             if ok && !passed_on_retry.is_empty() {
                 let names: Vec<&str> = passed_on_retry.iter().take(5).map(String::as_str).collect();
                 message = message.map(|m| format!("{m} (flaky tests: {})", names.join(", ")));
@@ -1626,6 +1643,52 @@ impl Worker {
             Ok(s) => Ok(Some(s.clone())),
             Err(e) => Err(anyhow::anyhow!("{e}")),
         }
+    }
+}
+
+/// Whether a hosted superproject may fetch this submodule URL: a remote on
+/// its own host, or on one listed in `PIT_SUBMODULE_HOSTS` (comma separated).
+fn submodule_host_allowed(superproject: &str, submodule: &str) -> bool {
+    if git::is_local_url(submodule) {
+        return false;
+    }
+    let Some(host) = git::url_host(submodule) else {
+        return false;
+    };
+    if git::url_host(superproject).as_deref() == Some(host.as_str()) {
+        return true;
+    }
+    std::env::var("PIT_SUBMODULE_HOSTS").is_ok_and(|list| {
+        list.split(',')
+            .any(|h| h.trim().eq_ignore_ascii_case(&host))
+    })
+}
+
+#[cfg(test)]
+mod submodule_tests {
+    #[test]
+    fn hosted_repos_fetch_submodules_from_their_own_host_only() {
+        let ok = super::submodule_host_allowed;
+        let app = "https://github.com/acme/app.git";
+        assert!(ok(app, "https://github.com/acme/lib.git"));
+        assert!(ok(app, "git@github.com:acme/lib.git"));
+        assert!(!ok(app, "https://evil.example/x.git"));
+        assert!(!ok(app, "objects/../../other.git"));
+        assert!(!ok(app, "/srv/mirrors/other.git"));
+        assert!(!ok("https://[fe80::1]/a.git", "https://[fe80::2]/b.git"));
+        // `ssh://evil%2f@github.com/x` reads as github.com but git goes to
+        // `evil`: refused before the host check (`is_fetchable_url`).
+        for sneaky in ["ssh://evil%2f@github.com/x", "[evil]@github.com:x"] {
+            assert!(!crate::git::is_fetchable_url(sneaky), "{sneaky}");
+        }
+        // git resolves `github.com:1.evil.com` as one name, in evil.com.
+        for sneaky in [
+            "git://github.com:1.evil.com/x",
+            "ssh://git@github.com:1.evil.com/x",
+        ] {
+            assert!(!ok(app, sneaky), "{sneaky}");
+        }
+        assert!(ok(app, "ssh://git@github.com:22/acme/lib.git"));
     }
 }
 

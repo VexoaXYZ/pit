@@ -224,6 +224,16 @@ pub fn is_fetchable_url(url: &str) -> bool {
     if url.is_empty() || url.starts_with('-') || url.contains("::") {
         return false;
     }
+    // Parsers disagree on where a host ends around these: `?`, `#` and `\`
+    // (`https://evil#@github.com/x` goes to `evil`), and for ssh:// and
+    // git:// git decodes `%2f` and strips `[…]` before picking the host
+    // (`ssh://evil%2f@github.com/x`, `[evil]@github.com:x`). A repository
+    // URL needs none of them, so IPv6 literals are refused too.
+    if url.chars().any(|c| {
+        matches!(c, '?' | '#' | '\\' | '%' | '[' | ']') || c.is_whitespace() || c.is_control()
+    }) {
+        return false;
+    }
     if let Some((scheme, rest)) = url.split_once("://") {
         return matches!(scheme, "https" | "http" | "ssh" | "git" | "file")
             && !rest.starts_with('-');
@@ -232,12 +242,49 @@ pub fn is_fetchable_url(url: &str) -> bool {
 }
 
 /// Whether a URL is a path on this machine rather than a remote.
+/// As git decides it: a URL is remote only with a `scheme://` (other than
+/// `file://`) or in scp form, a `:` before any `/` (`git@host:repo`);
+/// everything else, `objects/../../x.git` included, is a path.
 pub fn is_local_url(url: &str) -> bool {
-    url.starts_with("file:") || url.starts_with('/') || url.starts_with('.') || {
-        // `C:\x` or `C:/x`, not `git@host:repo`.
-        let b = url.as_bytes();
-        b.len() > 2 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    if let Some((scheme, _)) = url.split_once("://") {
+        return scheme == "file";
     }
+    let b = url.as_bytes();
+    // `C:\x` or `C:/x` is a drive, not a host called `C`.
+    let drive = b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    let scp = match (url.find(':'), url.find('/')) {
+        (Some(c), Some(s)) => c < s,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    drive || !scp
+}
+
+/// The host a remote URL points at (`github.com` for
+/// `https://github.com/a/b`, `git@github.com:a/b` and `ssh://git@github.com/a`).
+pub fn url_host(url: &str) -> Option<String> {
+    let (host, port) = match url.split_once("://") {
+        Some((_, rest)) => {
+            let authority = rest.split('/').next()?;
+            let hostport = authority.rsplit('@').next()?;
+            match hostport.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (hostport, None),
+            }
+        }
+        // scp form: `user@host:path`.
+        None => (url.split(':').next()?.rsplit('@').next()?, None),
+    };
+    // Strict, or None: git keeps `github.com:1.evil.com` whole as a host
+    // name where a lax parse would read `github.com`.
+    let port_ok =
+        port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
+    let host_ok = !host.is_empty()
+        && !host.starts_with(['-', '.'])
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    (port_ok && host_ok).then(|| host.to_ascii_lowercase())
 }
 
 /// Whether the commit's `.gitattributes` send any path through Git LFS.
@@ -479,12 +526,44 @@ mod tests {
         assert_eq!(r("https://x/a.git", "https://y/b.git"), "https://y/b.git");
         assert!(is_local_url("/tmp/x.git") && is_local_url("file:///x") && is_local_url("C:\\x"));
         assert!(!is_local_url("git@github.com:a/b") && !is_local_url("https://github.com/a/b"));
+        // Paths git takes as local though they look relative or hostless.
+        for local in [
+            "objects/../../x.git",
+            "a/b:c",
+            "lib.git",
+            "C:/x",
+            "file:///x",
+        ] {
+            assert!(is_local_url(local), "{local}");
+        }
+        assert_eq!(
+            url_host("https://GitHub.com/a/b.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            url_host("git@github.com:a/b").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            url_host("ssh://git@gh.example:22/a").as_deref(),
+            Some("gh.example")
+        );
+        assert_eq!(url_host("https://[::1/x"), None);
         for bad in [
             "-oProxyCommand=x",
             "ext::sh -c id",
             "ssh://-oProxyCommand=x/a",
             "fd::3",
             "gopher://x/a",
+            "https://evil.example#@github.com/x",
+            "https://evil.example?@github.com/x",
+            "git://127.0.0.1:19418%2f@github.com/acme/x",
+            "ssh://127.0.0.1%2f@github.com/acme/x",
+            "ssh://evil.example%3a2222%2f@github.com/x",
+            "ssh://[evil.example]@github.com/acme/x",
+            "git://[127.0.0.1]@github.com/acme/x",
+            "[evil.example]@github.com:acme/x",
+            "https://evil.example\\@github.com/x",
         ] {
             assert!(!is_fetchable_url(bad), "{bad}");
         }

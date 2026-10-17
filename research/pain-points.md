@@ -3293,10 +3293,13 @@ Safety:
 - A `.gitmodules` URL is repository code. Fork PRs get no submodules (the group says so); a fork
   could otherwise point one at another repo's mirror on the worker, or fetch with the worker's
   credentials.
-- A local-path URL (`/…`, `file:`, `C:\`) is refused unless the superproject itself is local, so a
-  hosted repo can't read the worker's other mirrors.
+- A hosted repo's submodules must be on its own host or one in `PIT_SUBMODULE_HOSTS`. Paths on the
+  worker are refused, using git's own rule for what counts as a path (`objects/../../x.git` is
+  one). Only a local superproject may use paths.
 - Only http(s), ssh, git, scp-style and path URLs are fetched. A URL git could read as an option
-  (`-oProxyCommand=…`) or run as a command (`ext::sh -c …`) is refused (unit-tested).
+  (`-oProxyCommand=…`) or run as a command (`ext::sh -c …`) is refused, and so is any URL with `?`,
+  `#`, `\`, `%` or brackets (unit-tested). *(The first version's path check missed git-local forms and allowed
+  any host; see "Review of P51–P54".)*
 
 **Measured.**
 - The repro passes and prints the submodule's file.
@@ -3315,3 +3318,55 @@ Safety:
   doesn't match its files. The default (all files) does include the pointer, so keys change when
   it moves.
 - `pit run` with an uncommitted submodule change isn't carried in the overlay.
+
+## Review of P51–P54
+
+GPT Sol couldn't run: the machine's Codex login is revoked. An independent Claude reviewer did
+five rounds instead. Tests: `cargo test` 76 unit and 43 e2e, clippy clean.
+
+Round 1:
+
+1. **S1 (blocker): the "no worker paths for hosted repos" rule could be bypassed.** git treats
+   any URL without `scheme://` or an scp `host:` as a path, so `objects/../../other.git` passed
+   Pit's check. It reached other repos' mirrors on the worker, reproduced with git 2.43.
+   `is_local_url` now follows git's rule.
+2. **S2: any branch could make the worker fetch from any host with its credentials.** That meant
+   SSRF, and tokens that cover more than this repo. A hosted repo's submodules must now be on its
+   own host or in `PIT_SUBMODULE_HOSTS`.
+3. **S3: `/retest` could pick a merge queue candidate run** (tagged with the PR) instead of the
+   PR's own commit. It now selects `ref = pull/<n>` only. Unit test added.
+4. **S4: a last attempt that wrote no JUnit report** marked every earlier failure "passed on a
+   retry". Now nothing counts as passed on a retry without a final report.
+5. **Nits, all fixed:**
+   - tasks that exit 0 with JUnit failures no longer count as "same inputs";
+   - outcomes are always posted, so a requeued attempt's rows are replaced;
+   - the fork submodule note no longer hides the LFS note;
+   - a comment overstated who may `/retest` (read-only collaborators can);
+   - a doc comment had moved onto the wrong function.
+
+Rounds 2 to 5:
+
+6. **S10 (blocker): the host check itself could be fooled.** For
+   `https://evil.example#@github.com/x` (and the `?` form), Pit read the host as `github.com`
+   while git fetched from `evil.example`, tested against a local listener. URLs with `?`, `#`,
+   `\`, whitespace or control characters are now refused.
+7. **S11:** IPv6 literal hosts were truncated to `[`, so any two matched.
+8. **S12 (blocker): the host check could still be fooled.** For `ssh://` and `git://`, git decodes
+   `%2f` and strips `[…]` before choosing the host. Six URLs reached another host against real git
+   and a fake ssh, among them `ssh://evil%2f@github.com/x`, `git://[127.0.0.1]@github.com/x` and
+   `[evil]@github.com:x`. URLs with `%` or brackets are now refused, which fails closed: no
+   IPv6-literal submodule hosts. All six are rejected in unit tests.
+9. **S13 (high): a `:` mid-host.** git keeps `github.com:1.evil.com` whole as a host name,
+   resolved in evil.com's DNS zone. With a fake DNS server, Alpine/musl git connected to the
+   attacker; glibc happened to drop the answer. Pit read the host as `github.com`. Hosts must now
+   be strict `[A-Za-z0-9.-]`, with an optional 1–5 digit port, or the URL is refused.
+
+Checked and fine:
+- `.gitmodules` `update = !command` can't run (`--checkout` overrides it, and git refuses it from
+  `.gitmodules`);
+- `/retest` never runs a fork's unapproved commit;
+- test outcomes need the live lease;
+- the DST logic is correct.
+
+Claims corrected: P54's local-path and safety lines, P53's "the commit it last ran", P51's
+retried-test rule.

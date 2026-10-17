@@ -709,7 +709,9 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
             else {
                 return Ok(serde_json::json!({ "ignored": "not a pull request" }));
             };
-            // People who could push a commit anyway; not drive-by commenters.
+            // Owners, organisation members and collaborators (read-only ones
+            // included), not drive-by accounts. A rerun only repeats a commit
+            // Pit already ran, with the restrictions it ran under.
             let who = comment["author_association"].as_str().unwrap_or_default();
             if !matches!(who, "OWNER" | "MEMBER" | "COLLABORATOR") {
                 return Ok(serde_json::json!({
