@@ -27,8 +27,13 @@ pub struct PitConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Schedule {
-    /// Five-field cron expression, in UTC (`"17 3 * * *"`).
+    /// Five-field cron expression, in UTC unless `timezone` is set
+    /// (`"17 3 * * *"`).
     pub cron: String,
+    /// IANA time zone the expression is read in (`"America/New_York"`),
+    /// following its daylight saving time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     /// Tasks to run (`task` or `group.task`). Empty means all.
     #[serde(default)]
     pub tasks: Vec<String>,

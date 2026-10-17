@@ -182,11 +182,15 @@ visible to the worker's `ps`, so keep them to test credentials.
 schedules: {
   // A nightly `pit verify`: no cache, no warm state, so a bug that warm runs hide shows up.
   verify: { cron: "17 3 * * *", fresh: true, noCache: true },
+  // 9:00 on weekdays in New York, summer and winter.
+  standup: { cron: "0 9 * * 1-5", timezone: "America/New_York", tasks: ["report"] },
 },
 ```
 
 The server reads `schedules` from the config on each repo's default branch and starts a trusted
-run of the branch tip when a cron (five fields, UTC) matches. It checks twice a minute and
+run of the branch tip when a cron (five fields, UTC unless `timezone` names an IANA zone)
+matches. A zoned schedule follows daylight saving the way GitHub's does: a time the clocks skip
+fires at the next valid minute, and a time they repeat fires once. It checks twice a minute and
 records each slot, so a slot fires once. A slot missed while the server was down is skipped, not
 replayed. A bad cron is a config error.
 

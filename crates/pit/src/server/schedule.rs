@@ -84,10 +84,10 @@ async fn repo_tick(app: &Arc<App>, repo: &super::db::Repo, first: i64, now: i64)
         },
     };
     for (name, s) in &schedules {
-        let Ok(cron) = crate::cron::Cron::parse(&s.cron) else {
+        let Ok(cron) = crate::cron::Schedule::parse(&s.cron, s.timezone.as_deref()) else {
             continue;
         };
-        let Some(minute) = (first..=now).rev().find(|m| cron.matches(*m)) else {
+        let Some(minute) = (first..=now).rev().find(|m| cron.fires(*m)) else {
             continue;
         };
         if !app

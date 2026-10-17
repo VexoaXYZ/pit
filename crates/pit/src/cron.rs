@@ -1,5 +1,5 @@
 //! Five-field cron expressions (`minute hour day-of-month month day-of-week`),
-//! evaluated in UTC, for scheduled runs.
+//! evaluated in UTC or in a time zone, for scheduled runs.
 //!
 //! Supports `*`, numbers, ranges (`1-5`), steps (`*/15`, `0-30/10`) and lists
 //! (`1,15`). Day of week is 0-7 with both 0 and 7 meaning Sunday. When both
@@ -91,6 +91,57 @@ impl Cron {
     }
 }
 
+/// A schedule: an expression read in UTC or in a time zone.
+#[derive(Debug, Clone)]
+pub struct Schedule {
+    cron: Cron,
+    tz: Option<jiff::tz::TimeZone>,
+}
+
+impl Schedule {
+    pub fn parse(expr: &str, timezone: Option<&str>) -> Result<Schedule> {
+        let tz = match timezone {
+            None => None,
+            Some(name) => Some(jiff::tz::TimeZone::get(name).with_context(|| {
+                format!("unknown time zone {name:?} (use an IANA name like \"Europe/London\")")
+            })?),
+        };
+        Ok(Schedule {
+            cron: Cron::parse(expr)?,
+            tz,
+        })
+    }
+
+    /// The wall-clock minute in the schedule's zone, counted like a UTC
+    /// minute, for a minute since the epoch.
+    fn wall(&self, epoch_minute: i64) -> i64 {
+        let Some(tz) = &self.tz else {
+            return epoch_minute;
+        };
+        let offset = tz
+            .to_offset(jiff::Timestamp::from_second(epoch_minute * 60).unwrap_or_default())
+            .seconds() as i64;
+        epoch_minute + offset.div_euclid(60)
+    }
+
+    /// Whether the schedule fires in this minute (since the epoch). Across
+    /// daylight saving changes, as GitHub does: a time skipped by the clocks
+    /// going forward fires at the next valid minute, and one repeated by the
+    /// clocks going back fires only the first time.
+    pub fn fires(&self, epoch_minute: i64) -> bool {
+        let w = self.wall(epoch_minute);
+        if self.tz.is_none() {
+            return self.cron.matches(w);
+        }
+        let prev = self.wall(epoch_minute - 1);
+        if self.cron.matches(w) {
+            // The same wall time earlier (the repeated hour).
+            return !(1..=180).any(|k| self.wall(epoch_minute - k) == w);
+        }
+        w > prev + 1 && (prev + 1..w).any(|m| self.cron.matches(m))
+    }
+}
+
 /// A UTC calendar time, without a date library.
 struct Civil {
     month: u32,
@@ -153,6 +204,39 @@ mod tests {
         assert!(Cron::parse("7 3 1 * 5").unwrap().matches(FRI_0307));
         assert!(!Cron::parse("7 3 1 * 6").unwrap().matches(FRI_0307));
         assert!(Cron::parse("7 3 * 10 7").is_ok());
+    }
+
+    /// Minutes since the epoch of a UTC date and time.
+    fn utc(s: &str) -> i64 {
+        s.parse::<jiff::Timestamp>().unwrap().as_second() / 60
+    }
+
+    #[test]
+    fn time_zones_follow_daylight_saving_like_github() {
+        let ny = Schedule::parse("30 9 * * *", Some("America/New_York")).unwrap();
+        // 9:30 in New York is 13:30 UTC in summer and 14:30 in winter.
+        assert!(ny.fires(utc("2026-07-01T13:30:00Z")));
+        assert!(!ny.fires(utc("2026-07-01T14:30:00Z")));
+        assert!(ny.fires(utc("2026-12-01T14:30:00Z")));
+        assert!(!ny.fires(utc("2026-12-01T13:30:00Z")));
+        // 2:30 does not exist on 2026-03-08 (clocks go 2:00 -> 3:00 at
+        // 07:00 UTC): it fires at 3:00 local instead, once.
+        let gap = Schedule::parse("30 2 * * *", Some("America/New_York")).unwrap();
+        let fired: Vec<i64> = (utc("2026-03-08T05:00:00Z")..utc("2026-03-08T09:00:00Z"))
+            .filter(|m| gap.fires(*m))
+            .collect();
+        assert_eq!(fired, [utc("2026-03-08T07:00:00Z")]);
+        // 1:30 happens twice on 2026-11-01; it fires the first time only.
+        let twice = Schedule::parse("30 1 * * *", Some("America/New_York")).unwrap();
+        let fired: Vec<i64> = (utc("2026-11-01T04:00:00Z")..utc("2026-11-01T08:00:00Z"))
+            .filter(|m| twice.fires(*m))
+            .collect();
+        assert_eq!(fired, [utc("2026-11-01T05:30:00Z")]);
+        // UTC as before, and bad zones are errors.
+        assert!(Schedule::parse("30 9 * * *", None)
+            .unwrap()
+            .fires(utc("2026-07-01T09:30:00Z")));
+        assert!(Schedule::parse("30 9 * * *", Some("Mars/Olympus")).is_err());
     }
 
     #[test]

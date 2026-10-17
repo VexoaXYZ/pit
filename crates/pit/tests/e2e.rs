@@ -1434,7 +1434,12 @@ async fn schedules_start_one_run_per_slot() {
     sh(&root, "git init -q --bare -b main origin.git");
     let config = serde_json::json!({
         "tasks": { "check": { "run": "true", "cache": false } },
-        "schedules": { "nightly": { "cron": "17 3,4 * * *", "fresh": true, "noCache": true } },
+        "schedules": {
+            "nightly": { "cron": "17 3,4 * * *", "fresh": true, "noCache": true },
+            // 12:17 in Tokyo is 03:17 UTC; 03:17 in Tokyo is not.
+            "tokyo": { "cron": "17 12 * * *", "timezone": "Asia/Tokyo" },
+            "tokyo-night": { "cron": "17 3 * * *", "timezone": "Asia/Tokyo" },
+        },
     });
     write(&work, "pit.config.json", &config.to_string());
     sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
@@ -1442,23 +1447,24 @@ async fn schedules_start_one_run_per_slot() {
     assert_eq!(run(&pit, &work).await.status, Status::Passed);
 
     let at = |h: i64, m: i64| (20_377 * 1440 + h * 60 + m) * 60_000; // 2025-10-16
-    let scheduled = || async {
-        let runs: Vec<RunView> = pit.client.get("/api/runs?limit=50").await.unwrap();
-        runs.into_iter()
-            .filter(|r| r.trigger == "schedule:nightly")
-            .count()
-    };
+
     pit::server::schedule::tick(&pit.app, at(3, 16))
         .await
         .unwrap();
-    assert_eq!(scheduled().await, 0, "not due yet");
+    assert_eq!(count_trigger(&pit, "nightly").await, 0, "not due yet");
     pit::server::schedule::tick(&pit.app, at(3, 17))
         .await
         .unwrap();
     pit::server::schedule::tick(&pit.app, at(3, 17) + 30_000)
         .await
         .unwrap();
-    assert_eq!(scheduled().await, 1, "one run per slot");
+    assert_eq!(count_trigger(&pit, "nightly").await, 1, "one run per slot");
+    assert_eq!(count_trigger(&pit, "tokyo").await, 1, "12:17 in Tokyo");
+    assert_eq!(
+        count_trigger(&pit, "tokyo-night").await,
+        0,
+        "03:17 UTC is noon in Tokyo"
+    );
     // A slow tick that skips over 04:17 still fires it on the next one.
     pit::server::schedule::tick(&pit.app, at(4, 15))
         .await
@@ -1466,7 +1472,11 @@ async fn schedules_start_one_run_per_slot() {
     pit::server::schedule::tick(&pit.app, at(4, 19))
         .await
         .unwrap();
-    assert_eq!(scheduled().await, 2, "the missed minute was caught up");
+    assert_eq!(
+        count_trigger(&pit, "nightly").await,
+        2,
+        "the missed minute was caught up"
+    );
 
     // A bad cron is a config error, like any other typo.
     let bad = serde_json::json!({
@@ -3103,4 +3113,12 @@ sys.exit(1 if any(bad.values()) else 0)
     let flip = get("t.flip").expect("failed where the same inputs passed");
     assert_eq!((flip.failures, flip.mixed_inputs), (1, 1), "{flip:?}");
     assert!(get("t.steady").is_none());
+}
+
+/// Runs started by the named schedule.
+async fn count_trigger(pit: &Pit, schedule: &str) -> usize {
+    let runs: Vec<RunView> = pit.client.get("/api/runs?limit=50").await.unwrap();
+    runs.into_iter()
+        .filter(|r| r.trigger == format!("schedule:{schedule}"))
+        .count()
 }

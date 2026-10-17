@@ -156,8 +156,14 @@ export interface PitConfig {
 }
 
 export interface Schedule {
-  /** Five-field cron expression in UTC: minute hour day-of-month month day-of-week. */
+  /** Five-field cron expression: minute hour day-of-month month day-of-week. UTC unless `timezone` is set. */
   cron: string;
+  /**
+   * IANA time zone to read `cron` in, e.g. `"America/New_York"`. Daylight
+   * saving is followed: a skipped time fires at the next valid minute, a
+   * repeated one fires once.
+   */
+  timezone?: string;
   /** Tasks to run (`task` or `group.task`). Default: all. */
   tasks?: string[];
   /** Run in new, empty workspaces instead of warm ones. */

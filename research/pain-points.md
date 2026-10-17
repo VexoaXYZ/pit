@@ -3164,3 +3164,40 @@ fails about half the time; the other 19 always pass. After 10 runs, before:
 - `quarantine` is still per task, so a flaky test can't be quarantined on its own.
 - Tests are identified by `classname.name`, so a renamed test starts a new history.
 - Like the other history tables, `test_results` is never pruned.
+
+## P52. Schedules in local time (cron is UTC, and daylight saving moves it)
+
+**The pain.** GitHub Actions schedules were UTC-only for years. The workaround was two cron
+entries, one per DST offset, gated on a date check, and runs still drifted an hour twice a year
+([gitdash](https://gitdash.dev/blog/github-actions-scheduled-workflows-timezone),
+[cronuru](https://cronuru.com/guides/github-actions-scheduled-workflows),
+[crondst](https://github.com/lawcal/crondst)). In March 2026 GitHub added a `timezone` field: an
+IANA zone, with DST followed, a skipped time advancing to the next valid one, and no `CRON_TZ`
+([GitHub changelog](https://github.blog/changelog/2026-03-19-github-actions-late-march-2026-updates/)).
+Tools lagged: actionlint rejected the new key
+([actionlint#638](https://github.com/rhysd/actionlint/issues/638)), and older guides still say it
+can't be done ([cronjobpro](https://cronjobpro.com/blog/github-actions-scheduled-workflows)).
+
+**Reproduction.** Pit's schedules (P26) read cron in UTC only, so "9:30 in New York" ran at 9:30
+in winter and 10:30 in summer, or needed two schedules. `timezone` was a config error (`unknown
+field`). This put Pit behind GitHub.
+
+**Fix.**
+- Schedules take `timezone`, an IANA name, checked when the config loads; unknown zones are errors.
+- Each UTC minute is mapped to the zone's wall clock (`jiff`, with the system zone database, or
+  one bundled on Windows) and matched there. Across DST changes it behaves like GitHub:
+  - a wall time the clocks skip (2:30 on spring-forward day) fires at the next valid minute,
+    3:00;
+  - a time the clocks repeat (1:30 on fall-back day) fires the first time only.
+- Without `timezone`, nothing changes.
+
+**Measured.**
+- Unit test `time_zones_follow_daylight_saving_like_github`, with 2026's New York dates:
+  - `30 9 * * *` fires at 13:30 UTC in July and 14:30 UTC in December, and not at the other hour;
+  - `30 2` on 2026-03-08 fires exactly once, at 07:00 UTC (3:00 EDT);
+  - `30 1` on 2026-11-01 fires exactly once, at 05:30 UTC (the first 1:30);
+  - `Mars/Olympus` is rejected.
+- e2e `schedules_start_one_run_per_slot` now drives the real scheduler with two Tokyo schedules.
+  At 03:17 UTC, `17 12` in Tokyo (12:17 JST) starts a run and `17 3` in Tokyo does not.
+
+**Verdict: SOLVED** (parity with GitHub's March 2026 feature).
