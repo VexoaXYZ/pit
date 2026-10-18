@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::client::Client;
 use crate::model::*;
@@ -46,6 +46,14 @@ pub async fn up(opts: UpOpts) -> Result<()> {
     // PIT_WORKER_TOKEN to join.
     let worker_token = worker_token.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
     let public = format!("http://{addr}");
+    // Before anything starts: a bad secrets file stops the built-in worker,
+    // and `pit up` should not say it is up first.
+    if let Some(p) = &secrets_file {
+        let text = std::fs::read_to_string(p)
+            .with_context(|| format!("reading secrets file {}", p.display()))?;
+        crate::worker::parse_secrets(&text)
+            .with_context(|| format!("reading secrets file {}", p.display()))?;
+    }
     let app = crate::server::App::new(&data.join("server"), token.clone(), public.clone())?;
     app.cache_max_bytes
         .store(cache_max_bytes, std::sync::atomic::Ordering::Relaxed);

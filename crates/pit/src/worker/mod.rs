@@ -649,7 +649,11 @@ impl Worker {
                 }
             })
         };
-        let lease = if job.fresh {
+        // A confined job (a fork's, or a branch's on a worker holding
+        // `[trusted]` secrets) gets a throwaway workspace: its container can
+        // write `.git` (hooks, `core.fsmonitor`, filters), which the worker's
+        // own git would run on the host at the next checkout.
+        let lease = if job.fresh || self.confined(&job) {
             self.lease_fresh_workspace(&job.repo, &job.group)
         } else {
             self.lease_workspace(&job.repo, &job.group, job.trusted)
@@ -979,11 +983,16 @@ impl Worker {
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default(),
         ));
-        // A fork's tasks run one at a time. Between them no fork code is
+        // A confined job's tasks (a fork's, or see `confined`) run one at a
+        // time. Between them none of its code is
         // running (a task's container goes with it), so nothing can swap a
         // checked directory for a symlink while the worker clears outputs,
         // collects them or reads reports.
-        let parallelism = if job.no_secrets { 1 } else { self.parallelism };
+        let parallelism = if self.confined(job) {
+            1
+        } else {
+            self.parallelism
+        };
         let mut state: HashMap<String, (Status, Option<String>)> = HashMap::new();
         let mut started: std::collections::HashSet<String> = Default::default();
         let mut running: JoinSet<(String, Status, Option<String>)> = JoinSet::new();
@@ -2277,8 +2286,6 @@ async fn image_id(image: &str) -> String {
     inspect().await.unwrap_or_else(|| "unavailable".into())
 }
 
-/// `KEY=VALUE` lines; blank lines and `#` comments are skipped, and a value
-/// may be wrapped in matching quotes.
 impl Worker {
     /// Whether this job's code runs only in a container: a fork's always,
     /// and any other run without `trusted_secrets` on a worker that holds
@@ -2288,12 +2295,13 @@ impl Worker {
     }
 }
 
-/// `KEY=VALUE` lines; those after a `[trusted]` line are the second map.
-/// Any other line starting with `[` is an error: a mistyped header must not
-/// turn deploy keys into secrets for every run.
 type Secrets = HashMap<String, String>;
 
-fn parse_secrets(text: &str) -> Result<(Secrets, Secrets)> {
+/// `KEY=VALUE` lines; blank lines and `#` comments are skipped, and a value
+/// may be wrapped in matching quotes. Those after a `[trusted]` line are the
+/// second map. Any other line starting with `[` is an error: a mistyped
+/// header must not turn deploy keys into secrets for every run.
+pub fn parse_secrets(text: &str) -> Result<(Secrets, Secrets)> {
     let (mut all, mut trusted) = (Secrets::new(), Secrets::new());
     let mut in_trusted = false;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
@@ -2309,8 +2317,9 @@ fn parse_secrets(text: &str) -> Result<(Secrets, Secrets)> {
                 .map(str::trim);
             match name {
                 Some(name) if name.eq_ignore_ascii_case("trusted") => in_trusted = true,
+                // The line itself is not quoted: it may hold a secret.
                 _ => anyhow::bail!(
-                    "line {}: {l:?} is not a section this file has (only `[trusted]`)",
+                    "line {}: not a section this file has (the only one is `[trusted]`)",
                     n + 1
                 ),
             }

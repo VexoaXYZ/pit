@@ -5175,6 +5175,36 @@ async fn trusted_secrets_reach_only_trusted_runs() {
             .unwrap();
         confined(log(pit::cli::wait(&client, &sub.run_id, |_| {}).await.unwrap()).await);
 
+        // Its code can write `.git` (a hook, here); the next branch run's
+        // checkout on the host must not run it: confined runs get a fresh
+        // workspace.
+        if docker && token.is_none() {
+            let marker = root.join("hook-ran-on-host");
+            let plant = format!(
+                "mkdir -p .git/hooks && printf '#!/bin/sh\\ntouch {m}\\n' > .git/hooks/post-checkout \
+                 && chmod +x .git/hooks/post-checkout",
+                m = marker.display()
+            );
+            for _ in 0..2 {
+                write(
+                    &work,
+                    "pit.config.json",
+                    &serde_json::json!({ "tasks": { "plant": { "run": plant, "cache": false } } })
+                        .to_string(),
+                );
+                let sub = pit::cli::submit(&client, &work, vec![], Default::default())
+                    .await
+                    .unwrap();
+                let v = pit::cli::wait(&client, &sub.run_id, |_| {}).await.unwrap();
+                assert_eq!(v.status, Status::Passed, "{v:?}");
+            }
+            assert!(
+                !marker.exists(),
+                "a branch's git hook ran on the worker's host"
+            );
+            sh(&work, "git checkout -q -- pit.config.json");
+        }
+
         let main = log(scheduled().await).await;
         match token {
             None => assert!(main.2.contains("prod=12 npm=1"), "{main:?}"),

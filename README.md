@@ -395,7 +395,9 @@ the config. Anything else that asks gets a note in its log instead. GitHub's Re-
 `/retest` aren't trusted runs, so to redo a deploy, push again or use `pit schedules run`. On a
 worker holding these secrets, every other run's code runs only in the `docker` backend, as
 forks' do, so it can't read the secrets file or a trusted task's environment on the host. Its
-`runtime` commands run there too. Branch runs fail on such a worker if it has no docker, so
+`runtime` commands run there too. Like a fork's, such a run gets a throwaway workspace (its
+container can write `.git`, which the worker's own git would run on the next checkout) and runs
+its tasks one at a time. Branch runs fail on such a worker if it has no docker, so
 keep deploy secrets on separate workers if branches need the host. Don't also export them in
 the worker's environment, which every task inherits.
 Upgrade workers before adding a `[trusted]` section: an older worker skips the header and hands
