@@ -1128,7 +1128,7 @@ pub async fn reconcile(app: &Arc<App>, at_start: bool) -> Result<usize> {
     let Some(gh) = &app.github else {
         return Ok(0);
     };
-    let previous = std::mem::take(&mut *missing().lock());
+    let previous = std::mem::take(&mut *app.catch_up_missing.lock());
     let mut now_missing = std::collections::HashSet::new();
     let mut started = 0;
     for repo in app.db.repos()? {
@@ -1151,15 +1151,8 @@ pub async fn reconcile(app: &Arc<App>, at_start: bool) -> Result<usize> {
             Err(e) => tracing::warn!("catching up on {full}: {e:#}"),
         }
     }
-    *missing().lock() = now_missing;
+    *app.catch_up_missing.lock() = now_missing;
     Ok(started)
-}
-
-/// Heads a catch-up pass found without a run, for the next pass to start.
-fn missing() -> &'static Mutex<std::collections::HashSet<String>> {
-    static MISSING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    MISSING.get_or_init(Default::default)
 }
 
 fn millis(t: &serde_json::Value) -> i64 {
@@ -1178,7 +1171,10 @@ async fn reconcile_repo(
 ) -> Result<usize> {
     let get = reqwest::Method::GET;
     let none = serde_json::Value::Null;
-    let cutoff = now_ms() - 3 * 86_400_000;
+    // Three days, and never more than the run history kept: a head whose
+    // run was pruned must not look unrun.
+    let days = super::history_days().map_or(3, |d| d.min(3));
+    let cutoff = now_ms() - days * 86_400_000;
     let mut started = 0;
     let info = gh
         .call(full, get.clone(), &format!("/repos/{full}"), none.clone())

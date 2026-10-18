@@ -14,7 +14,7 @@ pub mod schedule;
 pub mod shards;
 pub mod web;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -57,6 +57,9 @@ pub struct App {
     pub inflight: parking_lot::Mutex<HashMap<String, String>>,
     /// The last minute `schedule::tick` evaluated.
     pub schedule_minute: parking_lot::Mutex<Option<i64>>,
+    /// Heads the last catch-up pass found without a run (see
+    /// `github::reconcile`).
+    pub catch_up_missing: parking_lot::Mutex<HashSet<String>>,
     /// Signs OIDC tokens for tasks; set only by `pit server --oidc`.
     pub oidc: std::sync::OnceLock<oidc::Issuer>,
 }
@@ -120,6 +123,7 @@ impl App {
             notify_url: Default::default(),
             inflight: Default::default(),
             schedule_minute: Default::default(),
+            catch_up_missing: Default::default(),
             oidc: Default::default(),
             gc_grace_ms: AtomicU64::new(2 * 60 * 1000),
             evicted_entries: AtomicU64::new(0),
@@ -901,14 +905,20 @@ fn skip_marker(message: &str) -> Option<&'static str> {
     MARKERS.iter().copied().find(|m| lower.contains(m))
 }
 
-/// Finished runs are kept `PIT_HISTORY_DAYS` (default 90, `0` forever); their
-/// logs only 14 days anyway. Without this the database grows with every run.
-fn prune_history(app: &App) {
+/// `PIT_HISTORY_DAYS`: how long finished runs are kept (default 90; `0`
+/// forever, returned as `None`).
+pub fn history_days() -> Option<i64> {
     let days: i64 = std::env::var("PIT_HISTORY_DAYS")
         .ok()
         .and_then(|d| d.parse().ok())
         .unwrap_or(90);
-    if days > 0 {
+    (days > 0).then_some(days)
+}
+
+/// Finished runs are kept `PIT_HISTORY_DAYS` (default 90, `0` forever); their
+/// logs only 14 days anyway. Without this the database grows with every run.
+fn prune_history(app: &App) {
+    if let Some(days) = history_days() {
         match app.db.prune_runs(now_ms() - days * 86_400_000) {
             Ok(0) => {}
             Ok(n) => tracing::info!("deleted {n} run(s) older than {days} days"),
