@@ -209,7 +209,7 @@ async fn merge_queue_lands_disjoint_lanes_in_parallel_and_ejects_failures() {
         &work,
         "pit.config.json",
         r#"{"tasks":{
-            "a":{"run":"sleep 3 && ! grep -rq FAIL a","inputs":["a/**"]},
+            "a":{"run":"sleep 6 && ! grep -rq FAIL a","inputs":["a/**"]},
             "b":{"run":"sleep 1 && ! grep -rq FAIL b","inputs":["b/**"]}
         }}"#,
     );
@@ -2031,10 +2031,27 @@ async fn merge_queue_batches_waiting_changes_and_bisects_failures() {
         sh(&work, &format!("git checkout -q -b {b} main && echo {body} > shared/{b} && git add -A && git commit -qm {b} && git push -q origin {b} && git checkout -q main"));
     }
     // Occupy all four worker slots so queued candidates cannot start yet.
-    let _busy = pit::cli::submit(&pit.client, &work, vec![], Default::default())
+    // Waited for, not slept on: under load, planning alone can take longer
+    // than a fixed pause, and a candidate that starts alone is not batched.
+    let busy = pit::cli::submit(&pit.client, &work, vec![], Default::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..300 {
+        let v: RunView = pit
+            .client
+            .get(&format!("/api/runs/{}", busy.run_id))
+            .await
+            .unwrap();
+        if v.groups
+            .iter()
+            .filter(|g| g.status == Status::Running)
+            .count()
+            >= 4
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let url = origin.to_string_lossy().to_string();
     for b in ["a", "b", "c"] {
         let _: QueueEntryView = pit
@@ -2135,10 +2152,27 @@ async fn a_change_batched_into_a_removed_one_still_lands() {
         sh(&work, &format!("git checkout -q -b {b} main && echo {body} > shared/{b} && git add -A && git commit -qm {b} && git push -q origin {b} && git checkout -q main"));
     }
     // Occupy all four worker slots so queued candidates cannot start yet.
-    let _busy = pit::cli::submit(&pit.client, &work, vec![], Default::default())
+    // Waited for, not slept on: under load, planning alone can take longer
+    // than a fixed pause, and a candidate that starts alone is not batched.
+    let busy = pit::cli::submit(&pit.client, &work, vec![], Default::default())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..300 {
+        let v: RunView = pit
+            .client
+            .get(&format!("/api/runs/{}", busy.run_id))
+            .await
+            .unwrap();
+        if v.groups
+            .iter()
+            .filter(|g| g.status == Status::Running)
+            .count()
+            >= 4
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let url = origin.to_string_lossy().to_string();
     let mut ids = std::collections::HashMap::new();
     for b in ["a", "c"] {

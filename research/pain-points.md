@@ -4822,3 +4822,30 @@ Two of my own mistakes along the way, both caught by measuring:
   failed once in a full local run at load about 12, as it did once during P70. It passed 4/4
   alone and in a full rerun, and has never failed in CI. Its "nothing was batched" assertion
   depends on timing; noted, not fixed.
+
+## Note: Pit's own flaky merge-queue tests
+
+Not a user-facing pain point, but the kind of thing Pit exists to surface, so it's written down.
+Two merge-queue e2e tests failed now and then in local runs on this busy box:
+- `merge_queue_batches_waiting_changes_and_bisects_failures` ("nothing was batched"), twice
+  in roughly ten full-suite runs;
+- `merge_queue_lands_disjoint_lanes_in_parallel_and_ejects_failures` ("lanes did not overlap"),
+  twice in seven runs of the five merge-queue tests together.
+
+Neither has failed in CI. Both rest on timing:
+- **The batching test** (and its sibling, the stranded-batch test) slept a fixed 500 ms and
+  assumed four busy groups had taken every worker slot by then.
+- **The lanes test** needed lane B's run to start within the 3 s that lane A's task took.
+
+Changes, test-only:
+- the batching tests now wait until the busy run really has four groups running;
+- lane A's task sleeps 6 s instead of 3.
+
+Evidence, which is modest, not proof:
+- 0 failures in 6 further runs of the five merge-queue tests and in a full-suite run (93 unit,
+  65 e2e);
+- the batching failure could not be reproduced on demand in 22 targeted runs before the change,
+  even with 16 CPU-burning processes alongside.
+
+So this is hardening of two visible races, not a demonstrated fix. Pit's server code is
+unchanged.
