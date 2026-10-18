@@ -4395,8 +4395,9 @@ dropped under load (P26's sources). A self-hosted scheduler has its own version:
 is being restarted, upgraded or rebooted when the cron minute passes, that night's run simply
 doesn't happen, and nothing says so. Cron has the same problem on machines that aren't always
 on, which is why anacron exists and why systemd timers offer `Persistent=true`: "the time when
-the service unit was last triggered is stored on disk… [it] is triggered immediately if it would
-have been triggered at least once during the time when the timer was inactive"
+the service unit was last triggered is stored on disk. When the timer is activated, the service
+unit is triggered immediately if it would have been triggered at least once during the time when
+the timer was inactive"
 ([systemd.timer(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html),
 [anacron(8)](https://manpages.debian.org/bookworm/anacron/anacron.8.en.html)). P26 recorded it as
 a limit: "Missed slots are not replayed."
