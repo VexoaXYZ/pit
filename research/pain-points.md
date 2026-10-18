@@ -5180,9 +5180,16 @@ Limits:
 `redis-server --daemonize yes`, `pg_ctl start`) and never stop it. On a persistent runner it
 outlives the job and holds ports, files and memory for the next one. GitHub's runner handles this
 at the end of a job: it tags every process it starts with `RUNNER_TRACKING_ID` and kills whatever
-still carries the tag ("Cleaning up orphan processes"). That's also why the known way to keep a
-process alive past a job is starting it with `RUNNER_TRACKING_ID=""`. P50, P54 and P59 already
-deal with what jobs leave behind on disk; this is the same problem with processes.
+still carries the tag ("Cleaning up orphan processes"), which is why the known way to keep a
+process alive past a job is starting it with an empty `RUNNER_TRACKING_ID`
+([actions/runner#4601](https://github.com/actions/runner/issues/4601), which shows the code and
+a gap: a single snapshot misses processes forked during it;
+[toolu-ghrunner#163](https://github.com/Falconiere/toolu-ghrunner/pull/163), a reimplementation
+that describes the empty-string opt-out). The cleanup has its own pain: it killed a shared build
+server (`mspdbsrv.exe`) another job on the machine was still using
+([actions/runner#4702](https://github.com/actions/runner/issues/4702)), so an opt-out has to
+exist. P50, P54 and P59 already deal with what jobs leave behind on disk; this is the same
+problem with processes.
 
 **Reproduction** (`/tmp/painhunt/p82`). Pit already killed a task's process group when it ended,
 so a plain `cmd &` died with the task. A daemon that leaves the session escaped. The task ran
