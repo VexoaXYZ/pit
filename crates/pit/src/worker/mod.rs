@@ -1311,6 +1311,17 @@ impl Worker {
                 def.shards.unwrap_or(1).to_string(),
             ),
         ];
+        // The same zone and locale on every worker, as GitHub's hosted
+        // runners have: a date or sort-order test must not pass on one
+        // worker and fail on another, and a cached result must mean the
+        // same on all of them. A task that wants the worker's own lists the
+        // name in `env` (which also puts its value in the cache key).
+        #[cfg(unix)]
+        env.push(("TZ".into(), "UTC".into()));
+        #[cfg(target_os = "linux")]
+        for k in ["LANG", "LC_ALL"] {
+            env.push((k.into(), "C.UTF-8".into()));
+        }
         // For Turborepo and Bazel (`TURBO_API=$PIT_CACHE_URL
         // TURBO_TOKEN=$PIT_CACHE_TOKEN`): the server gives requests with this
         // token the run's cache scope, so a branch never writes what main

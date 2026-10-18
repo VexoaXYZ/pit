@@ -447,8 +447,9 @@ pub fn key_inputs(
     };
     Ok(KeyInputs {
         // 4: tasks run with `-e` and pipefail, so a result that passed
-        // without them may not pass now.
-        v: 4,
+        // without them may not pass now. 5: tasks run in UTC (and C.UTF-8 on
+        // Linux), so a result from a worker in another zone may not hold.
+        v: 5,
         config: crate::cas::digest(&serde_json::to_vec(&config)?),
         deps,
         files: matched,

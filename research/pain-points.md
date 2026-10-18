@@ -4849,3 +4849,54 @@ Evidence, which is modest, not proof:
 
 So this is hardening of two visible races, not a demonstrated fix. Pit's server code is
 unchanged.
+
+## P76. A date test passes on one worker and fails on another (and the cache hides which)
+
+**The pain.** Tests that format or parse times without naming a zone depend on the machine's
+zone. GitHub's hosted Ubuntu runners are UTC, "an accident of the runner image, not a repository
+invariant": a self-hosted runner or a container in another zone gets a different answer.
+- One project's local runner "inherits the host's Europe/London time (BST)", and three
+  date-sensitive tests that pass on hosted runners failed there. The fix set `TZ=UTC`,
+  `LANG=C.UTF-8` and `LC_ALL=C.UTF-8`, matching hosted jobs
+  ([agent-stack#159](https://github.com/korallis/agent-stack/pull/159)).
+- The same bug from the other side: tests that pass only because CI is UTC
+  ([HomeDashboard#271](https://github.com/gkoch02/HomeDashboard/issues/271),
+  [spotify-mcp-server#1636](https://github.com/NovaLux12/spotify-mcp-server/issues/1636),
+  [healthtracker#291](https://github.com/NevinJulian/healthtracker/issues/291)).
+
+**Reproduction** (`/tmp/painhunt/p76`). A test checks `date -d @0` is 1970-01-01, which is true
+in UTC and false west of it. The same commit, with the local worker restarted in different zones:
+```
+worker TZ=UTC                  zone: UTC   ✓ passed   (and cached)
+worker TZ=America/Los_Angeles  ◆ cached    passed     ← the UTC result, reused
+same, --no-cache               zone: PDT   ✗ failed
+```
+Pit passed the worker's own `TZ` and locale to every host task. The cache key doesn't include
+them, so whichever worker ran first decided the result for everyone.
+
+**Fix.**
+- **The same zone and locale everywhere.** Every task gets `TZ=UTC` on Unix, and
+  `LANG`/`LC_ALL=C.UTF-8` on Linux, as GitHub's hosted runners have. macOS doesn't reliably have
+  that locale, so it gets only the zone.
+- **Opting out.** A task that needs the worker's own value lists `TZ`, `LANG` or `LC_ALL` in
+  `env`, which also puts the value in the cache key.
+- **Cache key v5.** The key version goes from 4 to 5, so results computed in other zones aren't
+  reused. As with P63, every task runs once cold after upgrading.
+
+**After:**
+```
+worker TZ=America/Los_Angeles, --no-cache  zone: UTC  ✓ passed
+same, with env: ["TZ"]                     zone: PDT  ✗ failed   (the worker's own zone, on request)
+worker TZ=UTC, --no-cache                  zone: UTC  ✓ passed
+```
+The e2e test `tasks_get_one_time_zone_and_locale_on_every_worker` checks that a task sees
+`tz=UTC`, and `lc=C.UTF-8` on Linux, and that `date +%z` is `+0000`. It runs on Linux and macOS
+in CI.
+
+**Verdict: SOLVED** for zone and locale differences between workers. Limits:
+- **UTC-only bugs stay hidden.** As the sources point out, a test that passes only in UTC is still
+  wrong; this makes results agree, not correct. A team can run one task with
+  `env: ["TZ"]` on a worker in another zone to catch those.
+- **Windows tasks** keep the worker's zone.
+- **One cold run per task** after upgrading, because of the key bump.
+- **No independent review:** environment defaults only.

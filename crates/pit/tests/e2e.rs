@@ -5406,3 +5406,33 @@ async fn draft_pull_requests_run_when_marked_ready() {
     let v = pit::cli::wait(&client, &id, |_| {}).await.unwrap();
     assert_eq!(v.status, Status::Passed, "{v:?}");
 }
+
+/// Tasks get the same zone and locale on every worker (UTC, and C.UTF-8 on
+/// Linux), so a date test means the same everywhere, cached or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tasks_get_one_time_zone_and_locale_on_every_worker() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    write(
+        dir,
+        "pit.config.json",
+        r#"{"tasks":{"env":{"run":"echo \"tz=$TZ lc=${LC_ALL:-unset}\"; test \"$(date -u +%Z)\" = UTC && test \"$(date +%z)\" = +0000","cache":false}}}"#,
+    );
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let v = run(&pit, dir).await;
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    let id = v.groups[0].tasks[0].id.clone();
+    let log = pit
+        .client
+        .get_text(&format!("/api/tasks/{id}/log"))
+        .await
+        .unwrap();
+    assert!(log.contains("tz=UTC"), "{log}");
+    if cfg!(target_os = "linux") {
+        assert!(log.contains("lc=C.UTF-8"), "{log}");
+    }
+}
