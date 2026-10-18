@@ -4102,7 +4102,7 @@ fs.writeFileSync("/tmp/painhunt/p65/marker-" + process.pid, `evaluated as uid ${
 $ PIT_TOKEN=apitok pit run --server http://127.0.0.1:7272
 passed in 364ms · 1 ran, 0 cached
 $ cat /tmp/painhunt/p65/marker-868650
-evaluated as uid 0 on vmi3566801
+evaluated as uid 0 on <the server's host>
 ```
 
 **Fix.** On a server with an API token, a `pit.config.ts` is evaluated on the host only for a
@@ -5765,7 +5765,7 @@ space actually free.
 balancer), and proxies close long-lived connections: idle timeouts, config reloads, redeploys.
 A client that follows a run over one stream then reports a failure that isn't one.
 
-**Found in the rivo trial** (Pit behind Dokploy's Traefik, over HTTPS): `pit run` stopped after
+**Found in a trial on a private monorepo** (Pit behind Dokploy's Traefik, over HTTPS): `pit run` stopped after
 41 s with
 ```
 pit: error decoding response body: error reading a body from connection: unexpected EOF during chunk size line
