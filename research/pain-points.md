@@ -4900,3 +4900,43 @@ in CI.
 - **Windows tasks** keep the worker's zone.
 - **One cold run per task** after upgrading, because of the key bump.
 - **No independent review:** environment defaults only.
+
+## P77. Converting a PR back to draft leaves its CI running (P72's open gap)
+
+**The pain.** Turning a pull request back into a draft says it isn't ready, but CI already running
+on it keeps going. On GitHub there's no setting for it:
+- the usual recipe adds `converted_to_draft` to the triggers, so a new run in the same
+  `concurrency` group with `cancel-in-progress` cancels the old one, and the new run's jobs skip
+  themselves with `if: draft == false`
+  ([Yonatan Kra](https://yonatankra.com/7-github-actions-tricks-i-wish-i-knew-before-i-started/),
+  [Meziantou](https://www.meziantou.net/how-to-cancel-github-workflows-when-pushing-new-commits-on-a-branch.htm));
+- or a Marketplace action does it
+  ([Cancel Draft PRs](https://github.com/marketplace/actions/cancel-draft-prs), which "will show
+  up as failed by design").
+
+P72 recorded the same gap in Pit: "converting a PR back to draft doesn't cancel a run already in
+progress".
+
+**Before.** `converted_to_draft` webhooks were ignored (`{"ignored":"converted_to_draft"}`), so a
+running PR run went on to the end.
+
+**Fix.** On `converted_to_draft`, Pit reads the config at the commit it last ran for the PR,
+which is already in its mirror, so there's no fetch. That config is evaluated sandboxed, like any
+pull request's.
+- **With `drafts: false`:** the PR's runs still queued or running are cancelled with "pull
+  request converted to draft", which stops their tasks at the next heartbeat (P62).
+- **Without it:** nothing happens. Nothing is cancelled, and nothing runs twice.
+
+**Proof.** The e2e test `draft_pull_requests_run_when_marked_ready` (signed webhooks) now also
+covers:
+- without the setting, `converted_to_draft` is ignored;
+- with `drafts: false`, a PR whose task sleeps 30 s is converted while running: the webhook
+  answers `{"cancelled": 1}` and the run ends `failed`, "pull request converted to draft".
+
+On the old code the webhook was ignored and the assertion fails.
+
+**Verdict: SOLVED.** Limits:
+- The setting is read from the last run's commit. A PR that changed `drafts` in a commit Pit
+  hasn't run yet follows the older setting.
+- No independent review: it only cancels the PR's own runs, on a signed webhook, when the PR's
+  own config asks for it.

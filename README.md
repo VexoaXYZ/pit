@@ -348,7 +348,8 @@ with a plain token too, where checks have no Re-run button.
 **Drafts.** Draft pull requests run like any other by default. With `drafts: false` in the
 config, a draft's pushes get no run and post no checks. GitHub can't merge a draft, so required
 checks just wait. Marking it ready for review (`ready_for_review`, which needs the
-`pull_request` event, already subscribed) runs its head commit. This replaces the usual
+`pull_request` event, already subscribed) runs its head commit, and converting it back to draft
+(`converted_to_draft`) stops the runs still in progress. This replaces the usual
 `if: draft == false` job condition, whose skipped check counts as passed and isn't rerun when the
 draft becomes ready.
 

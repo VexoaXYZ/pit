@@ -900,6 +900,37 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                     super::queue::remove(app, &format!("pr/{number}"), Some(&repo.name), reason)?;
                 return Ok(serde_json::json!({ "dequeued": n }));
             }
+            // Back to draft, with `drafts: false`: the PR's runs still in
+            // progress stop, as its next pushes would be skipped. The config
+            // comes from the commit Pit last ran for the PR, already in the
+            // mirror; without that setting nothing changes.
+            if action == "converted_to_draft" {
+                let Some(last) = app.db.latest_pr_run(&repo.id, number)? else {
+                    return Ok(serde_json::json!({ "ignored": action }));
+                };
+                let sandboxed = fork || app.config_sandboxed(&repo, false);
+                let skips = app
+                    .load_config(&app.mirror_dir(&repo.id), &last.sha, None, sandboxed)
+                    .await
+                    .is_ok_and(|c| c.drafts == Some(false));
+                if !skips {
+                    return Ok(serde_json::json!({ "ignored": action }));
+                }
+                let mut cancelled = 0;
+                for id in app
+                    .db
+                    .superseded_runs(&repo.id, "pr", &format!("pull/{number}"), "")?
+                {
+                    if app
+                        .db
+                        .cancel_run_because(&id, "pull request converted to draft")?
+                    {
+                        app.run_finished(&id).await;
+                        cancelled += 1;
+                    }
+                }
+                return Ok(serde_json::json!({ "cancelled": cancelled }));
+            }
             // `ready_for_review`: a draft marked ready runs then, if the
             // config skips drafts (`drafts: false`).
             if !matches!(

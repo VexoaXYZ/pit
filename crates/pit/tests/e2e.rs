@@ -5405,6 +5405,49 @@ async fn draft_pull_requests_run_when_marked_ready() {
     let id = event("synchronize", true, &sha).await.expect("a run");
     let v = pit::cli::wait(&client, &id, |_| {}).await.unwrap();
     assert_eq!(v.status, Status::Passed, "{v:?}");
+    // ... and converting it back to draft changes nothing.
+    assert_eq!(event("converted_to_draft", true, &sha).await, None);
+
+    // Converted back to draft while it runs: with `drafts: false`, it stops.
+    let sha = commit(
+        r#"{"drafts":false,"tasks":{"slow":{"run":"sleep 30","cache":false}}}"#,
+        3,
+    );
+    let id = event("synchronize", false, &sha).await.expect("a run");
+    for _ in 0..200 {
+        let v: RunView = client.get(&format!("/api/runs/{id}")).await.unwrap();
+        if v.groups.iter().any(|g| g.status == Status::Running) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let body = serde_json::json!({ "action": "converted_to_draft", "number": 7,
+        "repository": { "full_name": "acme/web", "clone_url": dir.to_string_lossy(), "default_branch": "main" },
+        "pull_request": { "number": 7, "draft": true,
+            "head": { "sha": sha, "ref": "feature", "repo": { "full_name": "acme/web" } },
+            "base": { "ref": "main", "repo": { "full_name": "acme/web" } } } })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let resp: serde_json::Value = http
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "pull_request")
+        .header("x-hub-signature-256", sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["cancelled"], 1, "{resp}");
+    let v: RunView = client.get(&format!("/api/runs/{id}")).await.unwrap();
+    assert_eq!(v.status, Status::Failed, "{v:?}");
+    assert_eq!(
+        v.message.as_deref(),
+        Some("pull request converted to draft")
+    );
 }
 
 /// Tasks get the same zone and locale on every worker (UTC, and C.UTF-8 on
