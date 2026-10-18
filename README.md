@@ -392,9 +392,9 @@ PROD_DEPLOY_KEY=…
 These reach only trusted runs: the default branch, the merge queue and schedules. On a server
 with an API token, only those of repos the GitHub webhook registered. The server decides, not
 the config. Anything else that asks gets a note in its log instead, and a branch's run can't
-get them. Don't also export them in the worker's environment, which every task inherits. A
-worker older than this version ignores the section header, and a server older than this
-version never allows these secrets.
+get them. Don't also export them in the worker's environment, which every task inherits.
+Upgrade workers before adding a `[trusted]` section: an older worker skips the header and hands
+those secrets to every task that asks. A server older than this version never allows them.
 
 ## Cloud credentials (OIDC)
 
