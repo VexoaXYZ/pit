@@ -305,7 +305,8 @@ lease that is no longer live is refused. Set `PIT_WORKER_TOKEN` on the server an
 workers: claiming jobs then needs it, so holders of the API token cannot act as a worker
 (`pit up` sets one for its built-in worker). Without it, every API token holder can. This
 does not stop a task on the `host` backend from writing elsewhere on the worker: run
-untrusted code with `sandbox` or `docker`. The Turborepo and Bazel caches are not split yet.
+untrusted code with `sandbox` or `docker`. The Turborepo and Bazel caches are split the same
+way for tasks that use their job's `$PIT_CACHE_TOKEN` (see "Remote cache for existing tools").
 
 Trusted results are shared by every repo on the server (a key holds no repo). On a server with
 an API token, only repos the GitHub webhook registered write them. A repo registered through
@@ -479,6 +480,25 @@ The server speaks the protocols your build tools already use, backed by the same
 TURBO_API=http://127.0.0.1:7070 TURBO_TOKEN=$PIT_TOKEN TURBO_TEAM=me turbo run build
 bazel build //... --remote_cache=http://127.0.0.1:7070/bazel
 ```
+
+Inside a Pit task, use the job's own token rather than `$PIT_TOKEN`:
+
+```sh
+TURBO_API=$PIT_CACHE_URL TURBO_TOKEN=$PIT_CACHE_TOKEN TURBO_TEAM=me turbo run build
+bazel build //... --remote_cache=$PIT_CACHE_URL/bazel \
+  --remote_header=Authorization="Bearer $PIT_CACHE_TOKEN"
+```
+
+A request with a job's token gets that run's trust, the same as Pit's own cache:
+- a pull request's or branch's builds write artifacts that only untrusted builds reuse;
+- main's builds, trusted, write what everyone reuses and never read a branch's.
+
+So a branch can't plant an artifact under a hash main will compute, which is cache poisoning
+([CVE-2025-36852](https://nx.dev/blog/cve-2025-36852-critical-cache-poisoning-vulnerability-creep)).
+The token works only while its job runs, and only on these cache routes; it can't report
+results. Bazel's CAS is shared whatever the trust, because every blob is checked against its
+sha256. Requests with the API token keep full access, so don't hand `$PIT_TOKEN` to pull
+request builds.
 
 ## Agents (MCP)
 

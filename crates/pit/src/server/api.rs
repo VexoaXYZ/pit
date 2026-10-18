@@ -39,6 +39,10 @@ impl IntoResponse for ApiError {
     }
 }
 
+pub fn unauthorized(why: impl std::fmt::Display) -> ApiError {
+    ApiError(StatusCode::UNAUTHORIZED, anyhow::anyhow!("{why}"))
+}
+
 pub fn not_found(what: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, anyhow::anyhow!("{what} not found"))
 }
@@ -115,8 +119,18 @@ async fn auth(
         .and_then(|v| v.to_str().ok());
     // OIDC discovery and keys are public: clouds fetch them to verify tokens.
     let path = req.uri().path();
+    // A job's cache token opens the Turborepo and Bazel routes only; those
+    // handlers check it is live and give it its run's scope.
+    let cache_token = (path.starts_with("/v8/") || path.starts_with("/bazel/"))
+        && header
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .is_some_and(|b| {
+                b.trim()
+                    .starts_with(super::remote_cache::CACHE_TOKEN_PREFIX)
+            });
     if path == "/api/health"
         || path.starts_with("/.well-known/")
+        || cache_token
         || app.authorized(header, q.token.as_deref())
     {
         next.run(req).await

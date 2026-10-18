@@ -301,6 +301,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_lock_until {
         conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lock_until INTEGER")?;
     }
+    let has_cache_token: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'cache_token'")?
+        .exists([])?;
+    if !has_cache_token {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN cache_token TEXT")?;
+    }
     let notify_ordered: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('notify_state') WHERE name = 'run_created_at'")?
         .exists([])?;
@@ -427,7 +433,7 @@ impl CacheScope {
 
     /// The row keys it may read, most trusted first. A trusted run never
     /// reads untrusted results; a repo's own namespace is read only by it.
-    fn read_keys(&self, key: &str) -> Vec<String> {
+    pub fn read_keys(&self, key: &str) -> Vec<String> {
         let mut keys = vec![key.to_string()];
         if let Some(r) = &self.repo {
             keys.push(format!("r:{r}:{key}"));
@@ -1053,11 +1059,14 @@ impl Db {
             return Ok((None, held));
         };
         let lease = new_id("lease");
+        // A bearer token: unguessable, unlike ids.
+        let cache_token = format!("pitc_{}", uuid::Uuid::new_v4().simple());
         tx.execute(
             "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2, lease = ?4,
+               cache_token = ?5,
                message = CASE WHEN message LIKE 'waiting:%' THEN NULL ELSE message END
              WHERE id = ?3",
-            params![worker.name, now, gid, lease],
+            params![worker.name, now, gid, lease, cache_token],
         )?;
         // A new attempt of these tasks: an earlier one's summary and artifacts are not its.
         tx.execute(
@@ -1104,6 +1113,7 @@ impl Db {
             no_secrets: run.no_secrets,
             debug: run.debug,
             base_sha: run.base_sha,
+            cache_token: Some(cache_token),
             tasks,
         };
         Ok((Some(job), held))
@@ -1906,6 +1916,28 @@ impl Db {
                  WHERE groups_.lease = ?1 AND groups_.status = 'running' AND tasks.name = ?2",
                 params![lease, task],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+            )
+            .optional()?)
+    }
+
+    /// Like `lease_trust`, for a running group's cache token.
+    pub fn cache_token_trust(&self, token: &str) -> Result<Option<(bool, String, bool)>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT runs.trusted, repos.id, repos.github IS NOT NULL FROM groups_
+                 JOIN runs ON runs.id = groups_.run_id
+                 JOIN repos ON repos.id = runs.repo_id
+                 WHERE groups_.cache_token = ?1 AND groups_.status = 'running'",
+                params![token],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? != 0,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                    ))
+                },
             )
             .optional()?)
     }

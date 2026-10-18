@@ -1284,6 +1284,14 @@ impl Worker {
                 def.shards.unwrap_or(1).to_string(),
             ),
         ];
+        // For Turborepo and Bazel (`TURBO_API=$PIT_CACHE_URL
+        // TURBO_TOKEN=$PIT_CACHE_TOKEN`): the server gives requests with this
+        // token the run's cache scope, so a branch never writes what main
+        // reads. Valid while this group runs.
+        if let Some(t) = &job.cache_token {
+            env.push(("PIT_CACHE_URL".into(), self.client.base.clone()));
+            env.push(("PIT_CACHE_TOKEN".into(), t.clone()));
+        }
         // The same names `nx-set-shas` and Turborepo use.
         if let Some(base) = &job.base_sha {
             for k in ["PIT_BASE_SHA", "NX_BASE", "TURBO_SCM_BASE"] {

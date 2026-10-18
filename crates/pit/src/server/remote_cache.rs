@@ -1,6 +1,13 @@
 //! Remote cache protocols for existing build tools, stored in Pit's CAS:
 //! Turborepo (`TURBO_API=<pit>`) and Bazel's HTTP cache
 //! (`--remote_cache=<pit>/bazel`).
+//!
+//! A task in a Pit run authenticates with its job's `PIT_CACHE_TOKEN` and
+//! gets that run's cache scope, like Pit's own action cache: a branch's or a
+//! pull request's builds never write what main reads (cache poisoning,
+//! CVE-2025-36852). Requests with the API token keep full access. Bazel's
+//! CAS is shared whatever the scope: each blob is checked against its
+//! sha256, so nobody can plant one under another's name.
 
 use std::sync::Arc;
 
@@ -13,8 +20,47 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use sha2::Digest;
 
-use super::api::{not_found, ApiError};
+use super::api::{not_found, unauthorized, ApiError};
+use super::db::CacheScope;
 use super::App;
+
+/// The prefix of a job's cache token (see `Db::claim`).
+pub const CACHE_TOKEN_PREFIX: &str = "pitc_";
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+}
+
+/// A job's cache token gives its run's scope; one that is no longer live is
+/// refused, never treated as the API token. Anything else got past auth with
+/// the API token (or the server has none), which is trusted, as before.
+fn scope(app: &App, headers: &HeaderMap) -> Result<CacheScope, ApiError> {
+    match bearer(headers).filter(|b| b.starts_with(CACHE_TOKEN_PREFIX)) {
+        None => Ok(CacheScope {
+            trusted: true,
+            repo: None,
+        }),
+        Some(token) => match app.db.cache_token_trust(token)? {
+            Some((trusted, repo, github)) => Ok(app.cache_scope(&repo, github, trusted)),
+            None => Err(unauthorized("this job's cache token is no longer live")),
+        },
+    }
+}
+
+/// The first entry under `ns` this scope may read.
+fn find(app: &App, scope: &CacheScope, ns: &str, key: &str) -> Result<Option<String>, ApiError> {
+    for ns in scope.read_keys(ns) {
+        if let Some(v) = app.db.kv_get(&ns, key)? {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
+}
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -73,11 +119,13 @@ struct HashesQuery {
 async fn turbo_query(
     State(app): State<Arc<App>>,
     Query(team): Query<TeamQuery>,
+    headers: HeaderMap,
     Json(q): Json<HashesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let scope = scope(&app, &headers)?;
     let mut out = serde_json::Map::new();
     for h in q.hashes.iter().filter(|h| valid_key(h)) {
-        if let Some(meta) = app.db.kv_get(&team.ns(), h)? {
+        if let Some(meta) = find(&app, &scope, &team.ns(), h)? {
             let (digest, duration) = split_meta(&meta);
             let size = app
                 .cas
@@ -107,14 +155,13 @@ async fn turbo_get(
     method: Method,
     Path(hash): Path<String>,
     Query(team): Query<TeamQuery>,
+    req_headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     if !valid_key(&hash) {
         return Err(not_found("artifact"));
     }
-    let meta = app
-        .db
-        .kv_get(&team.ns(), &hash)?
-        .ok_or_else(|| not_found("artifact"))?;
+    let scope = scope(&app, &req_headers)?;
+    let meta = find(&app, &scope, &team.ns(), &hash)?.ok_or_else(|| not_found("artifact"))?;
     let (digest, duration) = split_meta(&meta);
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -144,9 +191,13 @@ async fn turbo_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let scope = scope(&app, &headers)?;
     let digest = app.cas.put(&body)?;
-    app.db
-        .kv_put(&team.ns(), &hash, &format!("{digest}:{duration}"))?;
+    app.db.kv_put(
+        &scope.write_key(&team.ns()),
+        &hash,
+        &format!("{digest}:{duration}"),
+    )?;
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "urls": [] })),
@@ -166,9 +217,15 @@ async fn bazel_get(
     State(app): State<Arc<App>>,
     method: Method,
     Path((kind, hash)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let ns = bazel_ns(&kind)?;
-    let digest = app.db.kv_get(ns, &hash)?.ok_or_else(|| not_found("blob"))?;
+    let digest = if ns == "bazel:cas" {
+        app.db.kv_get(ns, &hash)?
+    } else {
+        find(&app, &scope(&app, &headers)?, ns, &hash)?
+    }
+    .ok_or_else(|| not_found("blob"))?;
     if method == Method::HEAD {
         return Ok(StatusCode::OK.into_response());
     }
@@ -179,9 +236,12 @@ async fn bazel_get(
 async fn bazel_put(
     State(app): State<Arc<App>>,
     Path((kind, hash)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let ns = bazel_ns(&kind)?;
+    // Checked before anything is stored, CAS writes included.
+    let scope = scope(&app, &headers)?;
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(anyhow::anyhow!("bazel keys are sha256 hex").into());
     }
@@ -194,6 +254,11 @@ async fn bazel_put(
         }
     }
     let digest = app.cas.put(&body)?;
-    app.db.kv_put(ns, &hash.to_ascii_lowercase(), &digest)?;
+    let ns = if ns == "bazel:cas" {
+        ns.to_string()
+    } else {
+        scope.write_key(ns)
+    };
+    app.db.kv_put(&ns, &hash.to_ascii_lowercase(), &digest)?;
     Ok(StatusCode::OK)
 }

@@ -4886,3 +4886,116 @@ async fn cache_routes_refuse_keys_that_are_not_digests() {
         .unwrap_err();
     assert!(err.to_string().contains("404"), "{err:#}");
 }
+
+/// Turborepo's cache, used from Pit tasks with their job's token, is split
+/// by trust like Pit's own (CVE-2025-36852): a branch's build cannot plant
+/// an artifact main's build reads, main's artifacts are reused by branches,
+/// and a finished job's token is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turbo_cache_from_tasks_is_split_by_trust() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    let auth = r#"-H "Authorization: Bearer $PIT_CACHE_TOKEN""#;
+    let url = "$PIT_CACHE_URL/v8/artifacts";
+    let task = |run: String| serde_json::json!({ "run": run, "cache": false });
+    write(
+        &work,
+        "pit.config.json",
+        &serde_json::json!({
+            "tasks": {
+                "plant": task(format!(
+                    "echo token=$PIT_CACHE_TOKEN; curl -sf -X PUT {auth} --data planted {url}/h1"
+                )),
+                "trusted": task(format!(
+                    "echo \"sees h1: $(curl -s -o /dev/null -w '%{{http_code}}' {auth} {url}/h1)\"; \
+                     curl -sf -X PUT {auth} --data from-main {url}/h2"
+                )),
+                "reader": task(format!("echo \"h2: $(curl -sf {auth} {url}/h2)\"")),
+            },
+            "schedules": { "nightly": { "cron": "17 3 * * *", "tasks": ["trusted"] } },
+        })
+        .to_string(),
+    );
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    let log = |run: &RunView, task: &str| {
+        let id = run
+            .groups
+            .iter()
+            .flat_map(|g| &g.tasks)
+            .find(|t| t.name == task)
+            .unwrap()
+            .id
+            .clone();
+        let client = pit.client.clone();
+        async move {
+            client
+                .get_text(&format!("/api/tasks/{id}/log"))
+                .await
+                .unwrap()
+        }
+    };
+    let opts = |tasks: &[&str]| tasks.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+
+    // A branch (here: `pit run`, untrusted) plants an artifact.
+    let sub = pit::cli::submit(&pit.client, &work, opts(&["plant"]), Default::default())
+        .await
+        .unwrap();
+    let planted = pit::cli::wait(&pit.client, &sub.run_id, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(planted.status, Status::Passed, "{planted:?}");
+    let plant_log = log(&planted, "plant").await;
+    let token = plant_log
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("token="))
+        .expect("the task got a token")
+        .to_string();
+    assert!(token.starts_with("pitc_"), "{token}");
+
+    // Main (a schedule, trusted) does not see it, and writes its own.
+    let repo = pit.app.db.repos().unwrap()[0].name.clone();
+    let started: serde_json::Value = pit
+        .client
+        .post(
+            "/api/schedules/run",
+            &serde_json::json!({ "name": "nightly", "repo": repo }),
+        )
+        .await
+        .unwrap();
+    let main = pit::cli::wait(&pit.client, started["id"].as_str().unwrap(), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(main.status, Status::Passed, "{main:?}");
+    assert!(log(&main, "trusted").await.contains("sees h1: 404"));
+
+    // A branch reuses main's artifact.
+    let sub = pit::cli::submit(&pit.client, &work, opts(&["reader"]), Default::default())
+        .await
+        .unwrap();
+    let read = pit::cli::wait(&pit.client, &sub.run_id, |_| {})
+        .await
+        .unwrap();
+    assert!(log(&read, "reader").await.contains("h2: from-main"));
+
+    // The planted artifact is in no trusted namespace, and the finished
+    // job's token is refused rather than treated as the API token.
+    let http = reqwest::Client::new();
+    let base = &pit.base;
+    let got = http
+        .get(format!("{base}/v8/artifacts/h1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), 404);
+    let stale = http
+        .get(format!("{base}/v8/artifacts/h2"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 401);
+}

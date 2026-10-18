@@ -354,6 +354,12 @@ pub struct Job {
     /// `App::base_commit`.
     #[serde(default)]
     pub base_sha: Option<String>,
+    /// For the job's tasks' Turborepo and Bazel cache requests
+    /// (`PIT_CACHE_TOKEN`): they get this run's cache scope, so a branch
+    /// cannot write what main reads. Unlike the lease, it cannot report
+    /// results.
+    #[serde(default)]
+    pub cache_token: Option<String>,
     pub tasks: Vec<JobTask>,
 }
 
