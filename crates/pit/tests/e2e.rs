@@ -5623,8 +5623,11 @@ async fn missed_webhooks_are_caught_up() {
 
     // What the fake GitHub API answers: the default branch's head and the
     // open pull requests.
-    let state: Arc<Mutex<(String, serde_json::Value)>> =
-        Arc::new(Mutex::new((first.clone(), serde_json::json!([]))));
+    let now = jiff::Timestamp::now().to_string();
+    let state: Arc<Mutex<((String, String), serde_json::Value)>> = Arc::new(Mutex::new((
+        (first.clone(), now.clone()),
+        serde_json::json!([]),
+    )));
     let (s1, s2) = (state.clone(), state.clone());
     let gh_api = axum::Router::new()
         .route(
@@ -5636,8 +5639,9 @@ async fn missed_webhooks_are_caught_up() {
             get(move || {
                 let s = s1.clone();
                 async move {
-                    let sha = s.lock().unwrap().0.clone();
-                    axum::Json(serde_json::json!({ "commit": { "sha": sha } }))
+                    let (sha, date) = s.lock().unwrap().0.clone();
+                    axum::Json(serde_json::json!({ "commit": { "sha": sha,
+                        "commit": { "committer": { "date": date } } } }))
                 }
             }),
         )
@@ -5672,7 +5676,7 @@ async fn missed_webhooks_are_caught_up() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // A catch-up before Pit has run the repo starts nothing.
-    assert_eq!(pit::server::github::reconcile(&app).await.unwrap(), 0);
+    assert_eq!(pit::server::github::reconcile(&app, true).await.unwrap(), 0);
 
     // The first push arrives by webhook, registering the repo.
     let body = serde_json::json!({ "ref": "refs/heads/main", "after": first,
@@ -5700,13 +5704,12 @@ async fn missed_webhooks_are_caught_up() {
     let main_head = sh(&work, "git rev-parse HEAD").trim().to_string();
     sh(&work, "git checkout -q -b feature && echo f > f.txt && git add -A && git commit -qm f && git push -q origin feature && git checkout -q main");
     let pr_head = sh(&work, "git rev-parse feature").trim().to_string();
-    let now = jiff::Timestamp::now().to_string();
     let pr = |n: u64, sha: &str, repo: &str, updated: &str| {
         serde_json::json!({ "number": n, "draft": false, "updated_at": updated,
             "head": { "sha": sha, "repo": { "full_name": repo } } })
     };
     *state.lock().unwrap() = (
-        main_head.clone(),
+        (main_head.clone(), now.clone()),
         serde_json::json!([
             pr(7, &pr_head, "acme/web", &now),
             pr(8, &pr_head, "someone/web", &now),
@@ -5714,8 +5717,15 @@ async fn missed_webhooks_are_caught_up() {
         ]),
     );
 
-    pit::server::github::reconcile(&app).await.unwrap();
+    // A periodic pass waits one pass (a live webhook may just be late) ...
     let repo = app.db.repos().unwrap()[0].clone();
+    assert_eq!(
+        pit::server::github::reconcile(&app, false).await.unwrap(),
+        0
+    );
+    assert!(!app.db.has_run(&repo.id, &main_head, "main").unwrap());
+    // ... then starts what is still missing.
+    pit::server::github::reconcile(&app, false).await.unwrap();
     assert!(
         app.db.has_run(&repo.id, &main_head, "main").unwrap(),
         "main's head"
@@ -5733,5 +5743,19 @@ async fn missed_webhooks_are_caught_up() {
         "a stale one"
     );
     // Caught up: nothing more.
-    assert_eq!(pit::server::github::reconcile(&app).await.unwrap(), 0);
+    assert_eq!(pit::server::github::reconcile(&app, true).await.unwrap(), 0);
+
+    // An old default-branch head without a run (its run pruned from history)
+    // is not run again.
+    sh(
+        &work,
+        "echo 3 > three.txt && git add -A && git commit -qm three && git push -q origin main",
+    );
+    let old_head = sh(&work, "git rev-parse HEAD").trim().to_string();
+    state.lock().unwrap().0 = (old_head.clone(), "2020-01-01T00:00:00Z".into());
+    pit::server::github::reconcile(&app, true).await.unwrap();
+    assert!(
+        !app.db.has_run(&repo.id, &old_head, "main").unwrap(),
+        "an old head"
+    );
 }

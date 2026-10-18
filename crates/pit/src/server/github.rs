@@ -1113,14 +1113,23 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
 
 /// Pushes and pull requests whose webhook never arrived (the server was down
 /// or unreachable, and GitHub does not redeliver): for each GitHub repo Pit
-/// has run before, the default branch's head and the head of each open,
-/// same-repo pull request updated in the last three days get a run if they
-/// have none, as their webhook would have started. Forks still wait for the
-/// label; drafts and skip markers apply as usual. Returns how many runs.
-pub async fn reconcile(app: &Arc<App>) -> Result<usize> {
+/// has run before, the default branch's head (if committed in the last three
+/// days) and the head of each open, same-repo pull request updated in the
+/// last three days get a run if they have none, as their webhook would have
+/// started. Forks still wait for the label; drafts and skip markers apply as
+/// usual. Returns how many runs.
+///
+/// `at_start`: the first pass after the server starts, which acts at once
+/// (the down-time case). A later pass only starts a head that was already
+/// missing on the pass before: GitHub's API often shows a new head before
+/// its webhook is handled, and a live webhook must not race this into a
+/// second run (on the default branch, runs are never superseded).
+pub async fn reconcile(app: &Arc<App>, at_start: bool) -> Result<usize> {
     let Some(gh) = &app.github else {
         return Ok(0);
     };
+    let previous = std::mem::take(&mut *missing().lock());
+    let mut now_missing = std::collections::HashSet::new();
     let mut started = 0;
     for repo in app.db.repos()? {
         let Some(full) = repo.github.clone() else {
@@ -1130,12 +1139,34 @@ pub async fn reconcile(app: &Arc<App>) -> Result<usize> {
         if !app.db.repo_has_runs(&repo.id)? {
             continue;
         }
-        match reconcile_repo(app, gh, &repo, &full).await {
+        let mut ready = |key: String| {
+            let go = at_start || previous.contains(&key);
+            if !go {
+                now_missing.insert(key);
+            }
+            go
+        };
+        match reconcile_repo(app, gh, &repo, &full, &mut ready).await {
             Ok(n) => started += n,
             Err(e) => tracing::warn!("catching up on {full}: {e:#}"),
         }
     }
+    *missing().lock() = now_missing;
     Ok(started)
+}
+
+/// Heads a catch-up pass found without a run, for the next pass to start.
+fn missing() -> &'static Mutex<std::collections::HashSet<String>> {
+    static MISSING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    MISSING.get_or_init(Default::default)
+}
+
+fn millis(t: &serde_json::Value) -> i64 {
+    t.as_str()
+        .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+        .map(|t| t.as_millisecond())
+        .unwrap_or(0)
 }
 
 async fn reconcile_repo(
@@ -1143,16 +1174,19 @@ async fn reconcile_repo(
     gh: &GitHub,
     repo: &super::db::Repo,
     full: &str,
+    ready: &mut impl FnMut(String) -> bool,
 ) -> Result<usize> {
     let get = reqwest::Method::GET;
     let none = serde_json::Value::Null;
+    let cutoff = now_ms() - 3 * 86_400_000;
     let mut started = 0;
     let info = gh
         .call(full, get.clone(), &format!("/repos/{full}"), none.clone())
         .await?;
+    // Not guessed: the head of the wrong branch would run as trusted.
     let default = info["default_branch"]
         .as_str()
-        .unwrap_or("main")
+        .context("the repository has no default_branch")?
         .to_string();
     let branch = gh
         .call(
@@ -1162,8 +1196,13 @@ async fn reconcile_repo(
             none.clone(),
         )
         .await?;
-    if let Some(sha) = branch["commit"]["sha"].as_str() {
-        if !app.db.has_run(&repo.id, sha, &default)? {
+    // Only a recent head: an old one's run may just have been pruned from
+    // history (`PIT_HISTORY_DAYS`), and must not run again as trusted.
+    let recent = millis(&branch["commit"]["commit"]["committer"]["date"]) >= cutoff;
+    if let (Some(sha), true) = (branch["commit"]["sha"].as_str(), recent) {
+        if !app.db.has_run(&repo.id, sha, &default)?
+            && ready(format!("{}:{default}:{sha}", repo.id))
+        {
             let id = app
                 .create_run(
                     CreateRun {
@@ -1189,30 +1228,30 @@ async fn reconcile_repo(
             started += 1;
         }
     }
-    let cutoff = now_ms() - 3 * 86_400_000;
+    // Most recently updated first, so one page covers the window even on a
+    // repo with hundreds of open pull requests.
     let pulls = gh
         .call(
             full,
             get,
-            &format!("/repos/{full}/pulls?state=open&per_page=100"),
+            &format!("/repos/{full}/pulls?state=open&sort=updated&direction=desc&per_page=100"),
             none,
         )
         .await?;
     for pr in pulls.as_array().into_iter().flatten() {
-        let updated = pr["updated_at"]
-            .as_str()
-            .and_then(|t| t.parse::<jiff::Timestamp>().ok())
-            .map(|t| t.as_millisecond())
-            .unwrap_or(0);
+        if millis(&pr["updated_at"]) < cutoff {
+            break;
+        }
         let same_repo = pr["head"]["repo"]["full_name"].as_str() == Some(full);
-        let (Some(number), Some(sha)) = (pr["number"].as_u64(), pr["head"]["sha"].as_str()) else {
+        let (Some(number), Some(sha), true) =
+            (pr["number"].as_u64(), pr["head"]["sha"].as_str(), same_repo)
+        else {
             continue;
         };
-        if updated < cutoff || !same_repo {
-            continue;
-        }
         let git_ref = format!("pull/{number}");
-        if app.db.has_run(&repo.id, sha, &git_ref)? {
+        if app.db.has_run(&repo.id, sha, &git_ref)?
+            || !ready(format!("{}:{git_ref}:{sha}", repo.id))
+        {
             continue;
         }
         let id = app

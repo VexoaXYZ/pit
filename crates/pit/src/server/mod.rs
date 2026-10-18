@@ -929,8 +929,11 @@ pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) ->
         let app = app.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let mut at_start = true;
             loop {
-                match github::reconcile(&app).await {
+                let pass = github::reconcile(&app, at_start).await;
+                at_start = false;
+                match pass {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("caught up on {n} missed push(es) and pull request(s)"),
                     Err(e) => tracing::warn!("catching up on missed webhooks: {e:#}"),

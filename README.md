@@ -347,9 +347,12 @@ with a plain token too, where checks have no Re-run button.
 
 **Missed webhooks.** GitHub doesn't redeliver a webhook that failed because the server was down
 or unreachable. So ten seconds after start, and every ten minutes, Pit asks GitHub for the
-default branch's head and each open pull request updated in the last three days. Any head commit
-without a run gets the run its webhook would have started; forks still wait for the label. Repos
-Pit has never run are left alone, so installing it doesn't run every open pull request.
+default branch's head (if committed in the last three days) and each open pull request updated
+in the last three days. Any head commit without a run gets the run its webhook would have
+started; forks still wait for the label. Repos Pit has never run are left alone, so installing
+it doesn't run every open pull request. After start, a head is only run once it has been missing
+for two passes, so a webhook that's merely late doesn't produce a second run. A draft marked
+ready while the server was down isn't caught up: `/retest` runs it.
 
 **Skipping.** A pushed commit (or a pull request's head commit) whose message has `[skip ci]`,
 `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]` or `[skip pit]` gets no run, as on
