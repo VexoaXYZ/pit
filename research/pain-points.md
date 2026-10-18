@@ -4643,3 +4643,65 @@ On the old code the draft would have run and `ready_for_review` returned no run.
   skipped.
 - No independent review: the draft flag comes from a signed webhook, and skipping only means not
   running.
+
+## P73. Multi-line secrets: a private key that can't be stored, and leaks when printed
+
+**The pain.** SSH deploy keys, PEM certificates and GitHub App private keys are multi-line, and
+CI secret handling is built around one-line values.
+- **Masking.** GitHub's runner masks by exact match, and "since we do our processing line by
+  line, a multi-line secret will never mask" ([actions/runner#161](https://github.com/actions/runner/issues/161),
+  where the proposed fix was to "split the string into individual secrets and mask all of
+  those"). Projects still work around it:
+  - masking each line with `add-mask`
+    ([airbyte-python-cdk#774](https://github.com/airbytehq/airbyte-python-cdk/pull/774));
+  - escaping newlines first ([Yuya Takeyama on dev.to](https://dev.to/yuyatakeyama/mask-multiple-lines-text-in-github-actions-workflow-1a0),
+    to store a GitHub App's private key);
+  - fixing a masker that "masked [a PEM key] only when the whole value appeared as one string,
+    so indented output leaked" ([vznjs/vx#2314](https://github.com/vznjs/vx/pull/2314)).
+- **Storing.** How to put a multi-line value in a local secrets/env file is a recurring question
+  ([nektos/act#1461](https://github.com/nektos/act/discussions/1461)).
+
+**Reproduction** (`/tmp/painhunt/p73`). Pit had both problems:
+1. **The secrets file couldn't hold a key at all.** It was parsed line by line, and `\n` in quotes
+   stayed literal. `SSH_KEY="-----BEGIN OPENSSH PRIVATE KEY-----\n…\n-----END…"` arrived as one
+   line, so the key file a task writes from it is unusable:
+   ```
+   deploy │ key file: 1 lines
+   ```
+2. **A multi-line secret printed line by line or indented leaked.** The only multi-line source,
+   the worker's environment, was masked as one whole value. Printed indented, line by line, it
+   never matched, live or in the stored log:
+   ```
+   deploy │   envkeyLINEoneFAKEsecretAAAAAAAA
+   deploy │   envkeyLINEtwoFAKEsecretBBBBBBBB
+   ```
+   Live log chunks flush every 50 ms, so even unindented output can arrive split across chunks.
+
+**Fix.**
+- **The secrets file reads quoted values the way `.env` files do.** A quoted value may span lines
+  until its closing quote. In double quotes, `\n`, `\t`, `\r`, `\"` and `\\` are escapes, while
+  single quotes are literal. A value that is never closed is an error, as is any unknown
+  `[section]`.
+- **The masker also masks each line of a multi-line secret** (at least 6 characters, like any
+  secret), so line-by-line output, indentation and chunk boundaries don't get past it.
+
+**After** (same repro):
+```
+deploy │ key file: 4 lines, valid header: 1
+deploy │   ***
+deploy │   ***
+stored log: the same
+```
+Unit tests:
+- `quoted_values_can_span_lines_and_escape` covers escaped and literal multi-line values, a `[`
+  line inside a value not being a section, single quotes being literal, escaped quotes, and an
+  unclosed value being an error.
+- `each_line_of_a_multi_line_secret_is_masked` covers indented and line-by-line output.
+
+**Verdict: SOLVED.** Limits:
+- **Strict parsing.** A secrets file that relied on a stray unmatched quote being kept literally
+  now fails to load, with the line number.
+- **Short lines.** Lines shorter than 6 characters aren't masked on their own, as with any short
+  secret.
+- **No independent review this round.** The parser only reads the operator's own file, and masking
+  more is the safe direction.

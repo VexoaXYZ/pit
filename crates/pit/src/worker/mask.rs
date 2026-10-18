@@ -19,9 +19,19 @@ pub struct Masker {
 
 impl Masker {
     pub fn new(values: impl IntoIterator<Item = String>) -> Masker {
+        // Each line of a multi-line secret (a private key) is masked on its
+        // own too: printed line by line, indented, or split across live log
+        // chunks, the whole value never appears in one piece.
         let mut secrets: Vec<String> = values
             .into_iter()
-            .map(|v| v.trim().to_string())
+            .flat_map(|v| {
+                let lines: Vec<String> = if v.trim().contains('\n') {
+                    v.lines().map(|l| l.trim().to_string()).collect()
+                } else {
+                    vec![]
+                };
+                std::iter::once(v.trim().to_string()).chain(lines)
+            })
             .filter(|v| v.len() >= MIN_SECRET_LEN)
             .collect();
         // Longest first, so a secret that contains another is masked whole.
@@ -108,6 +118,16 @@ impl Masker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_line_of_a_multi_line_secret_is_masked() {
+        let key = "-----BEGIN KEY-----\nAAAAlineONEsecret\nBBBBlineTWOsecret\n-----END KEY-----";
+        let m = Masker::new([key.to_string()]);
+        // Printed indented, or one line per live log chunk.
+        assert_eq!(m.mask("  AAAAlineONEsecret\n"), "  ***\n");
+        assert_eq!(m.mask("BBBBlineTWOsecret"), "***");
+        assert!(!m.mask(&format!("x {key} y")).contains("lineONE"));
+    }
 
     fn b64(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s)

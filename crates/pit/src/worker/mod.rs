@@ -2335,7 +2335,9 @@ pub fn parse_secrets(text: &str) -> Result<(Secrets, Secrets)> {
     let (mut all, mut trusted) = (Secrets::new(), Secrets::new());
     let mut in_trusted = false;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    for (n, l) in text.lines().map(str::trim).enumerate() {
+    let mut lines = text.lines().enumerate();
+    while let Some((n, raw)) = lines.next() {
+        let l = raw.trim();
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
@@ -2359,16 +2361,71 @@ pub fn parse_secrets(text: &str) -> Result<(Secrets, Secrets)> {
             continue;
         };
         let v = v.trim();
-        let unquoted = ['"', '\'']
-            .iter()
-            .find_map(|q| v.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
-            .unwrap_or(v);
+        // dotenv style: a quoted value may span lines until its closing
+        // quote (an SSH deploy key, a certificate), and in double quotes
+        // `\n`, `\t`, `\r`, `\"` and `\\` are escapes.
+        let value = match v.chars().next() {
+            Some(q @ ('"' | '\'')) => {
+                let mut body = v[1..].to_string();
+                while closing_quote(&body, q).is_none() {
+                    let Some((_, next)) = lines.next() else {
+                        anyhow::bail!("line {}: a quoted value is never closed", n + 1);
+                    };
+                    body.push('\n');
+                    body.push_str(next);
+                }
+                let end = closing_quote(&body, q).unwrap_or(body.len());
+                let inner = &body[..end];
+                if q == '"' {
+                    unescape(inner)
+                } else {
+                    inner.to_string()
+                }
+            }
+            _ => v.to_string(),
+        };
         let map = if in_trusted { &mut trusted } else { &mut all };
-        map.insert(k.trim().to_string(), unquoted.to_string());
+        map.insert(k.trim().to_string(), value);
     }
     // A name in both is trusted-only.
     all.retain(|k, _| !trusted.contains_key(k));
     Ok((all, trusted))
+}
+
+/// Where an unescaped `q` closes a value (in double quotes, `\"` does not).
+fn closing_quote(s: &str, q: char) -> Option<usize> {
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '\\' if q == '"' && !escaped => escaped = true,
+            c if c == q && !escaped => return Some(i),
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(o @ ('"' | '\\')) => out.push(o),
+            Some(o) => {
+                out.push('\\');
+                out.push(o);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// A task's time limits: its own settings, or an hour in total and fifteen
@@ -2442,6 +2499,27 @@ mod secrets_file_tests {
         assert_eq!(s["X"], "y");
         assert_eq!(s.len(), 3);
         assert!(trusted.is_empty());
+    }
+
+    #[test]
+    fn quoted_values_can_span_lines_and_escape() {
+        let (s, _) = parse_secrets(concat!(
+            "ONE=\"-----BEGIN KEY-----\\nAAAA\\n-----END KEY-----\"\n",
+            "PEM=\"-----BEGIN KEY-----\n",
+            "[not a section]\n",
+            "-----END KEY-----\"\n",
+            "RAW='a\\nb'\n",
+            "Q=\"say \\\"hi\\\" \\\\ x\"\n",
+        ))
+        .unwrap();
+        assert_eq!(s["ONE"], "-----BEGIN KEY-----\nAAAA\n-----END KEY-----");
+        assert_eq!(
+            s["PEM"],
+            "-----BEGIN KEY-----\n[not a section]\n-----END KEY-----"
+        );
+        assert_eq!(s["RAW"], "a\\nb", "single quotes are literal");
+        assert_eq!(s["Q"], "say \"hi\" \\ x");
+        assert!(parse_secrets("K=\"never closed\nX=y\n").is_err());
     }
 
     #[test]

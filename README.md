@@ -384,7 +384,10 @@ evaluates on the host as before: its one user already runs the server.
 **Secrets on workers.** Every task inherits the worker's environment (minus `PIT_*`), so a
 token exported there can be read by any task, declared or not. Put secrets in
 `pit worker --secrets-file FILE` (`KEY=VALUE` lines, `PIT_SECRETS_FILE`) instead: those values
-reach only tasks that list them in `secrets`. On the `host` backend a task still runs as the
+reach only tasks that list them in `secrets`. As in a `.env` file, a quoted value may span
+lines until its closing quote, which is how an SSH deploy key or a certificate goes in. In
+double quotes, `\n`, `\t`, `\r`, `\"` and `\\` are escapes. Each line of a multi-line secret is
+also masked on its own, so printing it line by line or indented doesn't get past masking. On the `host` backend a task still runs as the
 worker's user and could read the file itself, so run untrusted code in `docker`.
 
 Any branch's config can list any secret, so secrets a branch must never see (deploy keys,
