@@ -3753,3 +3753,60 @@ tried again: a final "passed" could be lost and the check left "pending".
   reports again, but a run that has already finished gets none.
 - There's no global request budget across runs, so many large runs at once can still meet the
   limit. They then wait and retry rather than lose checks.
+
+## P61. Artifacts: zips of zips, and nothing kept from the run that failed
+
+**The pain.** Getting files out of CI (a Playwright report from a failed e2e, a build to try) has
+meant `upload-artifact`, and for years only zips: a single file downloads as a `.zip`, an
+uploaded zip as `.zip.zip`
+([community #26223](https://github.com/orgs/community/discussions/26223),
+[#38706](https://github.com/orgs/community/discussions/38706),
+[upload-artifact#39](https://github.com/actions/upload-artifact/issues/39)). On that last issue,
+upload-artifact's own zipping took 2m36s against 12s for 7zip.
+
+Corruption and lost files are reported too:
+[upload-artifact#74](https://github.com/actions/upload-artifact/issues/74),
+[#575](https://github.com/actions/upload-artifact/issues/575),
+[act#2371](https://github.com/nektos/act/issues/2371).
+
+v4 rebuilt the backend
+([GitHub blog](https://github.blog/news-insights/product-news/get-started-with-v4-of-github-actions-artifacts/)).
+In February 2026, unzipped artifacts arrived for single files only, behind `archive: false` with
+upload v7 and download v8
+([changelog](https://github.blog/changelog/2026-02-26-github-actions-now-supports-uploading-and-downloading-non-zipped-artifacts/),
+[zenn](https://zenn.dev/korosuke613/articles/github-actions-use-archive-artifact?locale=en),
+[docs](https://docs.github.com/en/actions/tutorials/store-and-share-data)).
+
+**Reproduction.** Pit had no artifacts at all. A task's `outputs` went into the cache only when it
+*passed*, and nothing could download them. A failing e2e's `playwright-report/` stayed in the
+worker's workspace, where the next run overwrote it.
+
+**Fix: `artifacts` on a task** (globs).
+- **Cleared first.** Matching files are cleared before each attempt, so a warm workspace's
+  leftovers from an earlier run aren't kept.
+- **Kept from every run.** After the task, passed or failed, the matches are collected (regular
+  files, not through symlinks, at most 100 MiB a file and 512 MiB a task; anything left out is
+  noted in the log), stored in the CAS and recorded on the task (`POST /api/tasks/{id}/artifacts`,
+  lease-checked, only digests the CAS has).
+- **Downloadable two ways:**
+  - each file as itself, no zip, `Content-Disposition: attachment`, at
+    `GET /api/tasks/<id>/artifacts/<path>`;
+  - all of them with `pit artifacts <run> [--task t] [--out dir]`, into
+    `<out>/<group>/<task>/<path>`.
+- **Kept 14 days.** The CAS GC keeps artifact blobs for the same 14 days it keeps a run's logs.
+- **Cleared on a new claim**, so a requeued attempt's artifacts aren't shown.
+
+**Measured.**
+- A failing task writes `playwright-report/index.html` and a 20,000-byte `checkout-failed.png`.
+  Both are recorded. The API returns the PNG with `content-disposition: attachment;
+  filename="checkout-failed.png"`, byte-identical to the copy `pit artifacts` wrote.
+- e2e `artifacts_are_kept_from_failed_runs_and_served_as_files`:
+  - a failing run keeps both of its files, and one is served as itself;
+  - `pit artifacts` writes it under `default/e2e/`;
+  - the next run, which writes only `fail.png`, does not keep the previous run's `stale.txt`.
+- A unit test: the GC keeps artifact blobs.
+
+**Verdict: SOLVED.** Limits:
+- Files are read whole into memory to upload (hence the caps).
+- Artifacts are not restored on a cache hit; that's what `outputs` is for.
+- No dashboard links yet.

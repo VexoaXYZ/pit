@@ -4355,3 +4355,65 @@ async fn rate_limited_reports_are_retried() {
     });
     assert!(refused.load(std::sync::atomic::Ordering::SeqCst) >= 8);
 }
+
+/// `artifacts` keeps files from a failed run too, serves each one as itself
+/// (no zip), and `pit artifacts` downloads them; a file an earlier run left
+/// in the warm workspace is not kept again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn artifacts_are_kept_from_failed_runs_and_served_as_files() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let config = |run: &str| {
+        serde_json::json!({ "tasks": { "e2e": {
+            "run": run, "artifacts": ["report/**"], "cache": false,
+        } } })
+        .to_string()
+    };
+    write(dir, ".gitignore", "report/\n");
+    write(dir, "pit.config.json", &config("mkdir -p report && echo old > report/stale.txt && echo shot > report/fail.png && exit 1"));
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let first = run(&pit, dir).await;
+    assert_eq!(first.status, Status::Failed);
+    let t = &first.groups[0].tasks[0];
+    let mut paths: Vec<&str> = t.artifacts.iter().map(|a| a.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, ["report/fail.png", "report/stale.txt"]);
+    let body = pit
+        .client
+        .get_text(&format!("/api/tasks/{}/artifacts/report/fail.png", t.id))
+        .await
+        .unwrap();
+    assert_eq!(body, "shot\n");
+    // `pit artifacts` writes them under <out>/<group>/<task>/.
+    let out = tempfile::tempdir().unwrap();
+    assert_eq!(
+        pit::cli::artifacts(&pit.client, &first.id, Some("e2e"), out.path())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.path().join("default/e2e/report/fail.png")).unwrap(),
+        "shot\n"
+    );
+    // The next run writes only fail.png; stale.txt from the first run (still
+    // in the warm workspace before the task) is not kept again.
+    write(
+        dir,
+        "pit.config.json",
+        &config("mkdir -p report && echo shot2 > report/fail.png"),
+    );
+    sh(dir, "git commit -qam again");
+    let second = run(&pit, dir).await;
+    assert_eq!(second.status, Status::Passed);
+    let paths: Vec<&str> = second.groups[0].tasks[0]
+        .artifacts
+        .iter()
+        .map(|a| a.path.as_str())
+        .collect();
+    assert_eq!(paths, ["report/fail.png"]);
+}

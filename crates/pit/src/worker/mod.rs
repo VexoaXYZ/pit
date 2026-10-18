@@ -1393,6 +1393,8 @@ impl Worker {
         let outcome = loop {
             attempt += 1;
             files::clear_outputs(ws, &def.reports)?;
+            // The last attempt's artifacts, never a warm workspace's leftovers.
+            files::clear_outputs(ws, &def.artifacts)?;
             // Each attempt starts a summary of its own.
             files::write_file(&summary_path, b"", false)?;
             let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -1712,6 +1714,9 @@ impl Worker {
             )
             .await;
         let _ = std::fs::remove_file(&summary_path);
+        if !def.artifacts.is_empty() {
+            self.keep_artifacts(&client, task, ws, def).await?;
+        }
         let message = message.map(|m| masker.mask(&m));
         let status = if ok { Status::Passed } else { Status::Failed };
         let r = finish(
@@ -1805,7 +1810,63 @@ mod submodule_tests {
     }
 }
 
+/// Largest artifact file kept, and the most a task keeps in all.
+const MAX_ARTIFACT_FILE: u64 = 100 << 20;
+const MAX_ARTIFACT_TOTAL: usize = 512 << 20;
+
 impl Worker {
+    /// Uploads the files `artifacts` matches, passed or failed, and records
+    /// them on the task.
+    async fn keep_artifacts(
+        &self,
+        client: &crate::client::Client,
+        task: &JobTask,
+        ws: &Path,
+        def: &TaskDef,
+    ) -> Result<()> {
+        let mut kept = Vec::new();
+        let mut blobs = Vec::new();
+        let mut total = 0usize;
+        let mut skipped = 0usize;
+        for (rel, abs) in files::collect_outputs(ws, &def.artifacts)? {
+            // Not through a symlink; regular files only.
+            let Some(bytes) = files::read_task_file(&abs, MAX_ARTIFACT_FILE) else {
+                skipped += 1;
+                continue;
+            };
+            if total + bytes.len() > MAX_ARTIFACT_TOTAL {
+                skipped += 1;
+                continue;
+            }
+            total += bytes.len();
+            let digest = self.cas.put(&bytes)?;
+            kept.push(Artifact {
+                path: rel,
+                digest: digest.clone(),
+                size: bytes.len() as u64,
+            });
+            blobs.push((digest, bytes));
+        }
+        if skipped > 0 {
+            let note = format!(
+                "\n[pit: {skipped} artifact file(s) left out: over {} MiB each or {} MiB in all]\n",
+                MAX_ARTIFACT_FILE >> 20,
+                MAX_ARTIFACT_TOTAL >> 20
+            );
+            let _ = client
+                .post_empty(
+                    &format!("/api/tasks/{}/log", task.id),
+                    &LogChunk { text: note },
+                )
+                .await;
+        }
+        client.upload_missing(blobs).await?;
+        client
+            .post_empty(&format!("/api/tasks/{}/artifacts", task.id), &kept)
+            .await?;
+        Ok(())
+    }
+
     /// The `$HOME` a job's `docker` tasks keep between runs: one per repo and
     /// trust pool, like warm workspaces (P20), so neither another repo nor a
     /// branch can leave a poisoned tool cache for main. A fork's run, or a

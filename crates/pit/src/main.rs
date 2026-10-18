@@ -188,6 +188,18 @@ enum Command {
         #[command(flatten)]
         conn: Conn,
     },
+    /// Download a run's artifacts (files its tasks' `artifacts` kept, from
+    /// passed and failed runs alike) into `<out>/<group>/<task>/`.
+    Artifacts {
+        run: String,
+        /// Only this task (`task` or `group.task`).
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long, default_value = "pit-artifacts")]
+        out: PathBuf,
+        #[command(flatten)]
+        conn: Conn,
+    },
     /// The merge queue.
     Queue {
         #[command(subcommand)]
@@ -431,6 +443,20 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Slow { conn, days } => {
             cli::slow(&cli::client(&conn.server, conn.token)?, days).await
+        }
+        Command::Artifacts {
+            run,
+            task,
+            out,
+            conn,
+        } => {
+            cli::artifacts(
+                &cli::client(&conn.server, conn.token)?,
+                &run,
+                task.as_deref(),
+                &out,
+            )
+            .await
         }
         Command::Logs { run, task, conn } => {
             cli::logs(&cli::client(&conn.server, conn.token)?, &run, &task).await

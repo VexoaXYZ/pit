@@ -117,6 +117,11 @@ pub struct TaskDef {
     /// before each attempt, so a warm workspace never reports stale results.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reports: Vec<String>,
+    /// Globs of files kept from every run of the task, passed or failed
+    /// (`playwright-report/**`, screenshots, a built binary), to download
+    /// one by one. Unlike `outputs` they are not restored on a cache hit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     /// Environment variable names that are passed through and hashed.
     #[serde(default)]
     pub env: Vec<String>,
@@ -611,6 +616,18 @@ pub struct TaskView {
     /// Markdown the task wrote to `$PIT_SUMMARY` (`$GITHUB_STEP_SUMMARY`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Files kept by `TaskDef::artifacts`, with their sizes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Artifact>,
+}
+
+/// A file a task kept (`TaskDef::artifacts`); its bytes are in the CAS.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artifact {
+    pub path: String,
+    pub digest: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1096,6 +1096,7 @@ mod tests {
             started_at: None,
             finished_at: None,
             summary: None,
+            artifacts: vec![],
         };
         let g: GroupView = serde_json::from_value(serde_json::json!({
             "id": "g", "name": "ci", "os": "linux", "status": "failed", "worker": null,

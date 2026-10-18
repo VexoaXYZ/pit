@@ -339,6 +339,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_planned {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN planned_at INTEGER")?;
     }
+    let has_artifacts: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'artifacts'")?
+        .exists([])?;
+    if !has_artifacts {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN artifacts TEXT")?;
+    }
     let has_summary: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'summary'")?
         .exists([])?;
@@ -733,6 +739,10 @@ impl Db {
                         started_at: r.get("started_at")?,
                         finished_at: r.get("finished_at")?,
                         summary: r.get("summary")?,
+                        artifacts: r
+                            .get::<_, Option<String>>("artifacts")?
+                            .and_then(|a| serde_json::from_str(&a).ok())
+                            .unwrap_or_default(),
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -956,9 +966,9 @@ impl Db {
              WHERE id = ?3",
             params![worker.name, now, gid, lease],
         )?;
-        // A new attempt of these tasks: an earlier one's summary is not its.
+        // A new attempt of these tasks: an earlier one's summary and artifacts are not its.
         tx.execute(
-            "UPDATE tasks SET summary = NULL WHERE group_id = ?1",
+            "UPDATE tasks SET summary = NULL, artifacts = NULL WHERE group_id = ?1",
             params![gid],
         )?;
         let (run, repo_name, url, group_name): (RunRow, String, String, String) = tx.query_row(
@@ -1292,6 +1302,47 @@ impl Db {
                            WHERE tasks.id = ?1 AND groups_.status = 'running' AND groups_.lease = ?3)",
             params![task_id, text, lease],
         )? > 0)
+    }
+
+    /// Stores a running task's artifacts (see `TaskView::artifacts`).
+    pub fn set_artifacts(
+        &self,
+        task_id: &str,
+        lease: Option<&str>,
+        files: &[Artifact],
+    ) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE tasks SET artifacts = ?2 WHERE id = ?1 AND EXISTS (
+               SELECT 1 FROM groups_ WHERE groups_.id = tasks.group_id
+                 AND groups_.status = 'running' AND groups_.lease = ?3)",
+            params![task_id, serde_json::to_string(files)?, lease],
+        )? > 0)
+    }
+
+    /// A task's artifact by path: its digest.
+    pub fn artifact(&self, task_id: &str, path: &str) -> Result<Option<Artifact>> {
+        let c = self.conn.lock();
+        let json: Option<String> = c
+            .query_row(
+                "SELECT artifacts FROM tasks WHERE id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(json
+            .and_then(|j| serde_json::from_str::<Vec<Artifact>>(&j).ok())
+            .and_then(|all| all.into_iter().find(|a| a.path == path)))
+    }
+
+    #[cfg(test)]
+    fn view_task_artifact_for_test(&self, group_id: &str) -> Result<Option<Artifact>> {
+        let id: String = self.conn.lock().query_row(
+            "SELECT id FROM tasks WHERE group_id = ?1",
+            params![group_id],
+            |r| r.get(0),
+        )?;
+        self.artifact(&id, "report/a.png")
     }
 
     /// Stores a running task's summary (see `TaskView::summary`).
@@ -1890,6 +1941,17 @@ impl Db {
             ))?;
             for d in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
                 keep.insert(d?);
+            }
+        }
+        {
+            let mut st = c.prepare(&format!(
+                "SELECT tasks.artifacts FROM tasks JOIN runs ON runs.id = tasks.run_id
+                 WHERE tasks.artifacts IS NOT NULL AND {recent}"
+            ))?;
+            for a in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
+                for f in serde_json::from_str::<Vec<Artifact>>(&a?).unwrap_or_default() {
+                    keep.insert(f.digest);
+                }
             }
         }
         let mut overlays = Vec::new();
@@ -2501,6 +2563,45 @@ mod tests {
         let mut kinds = db.commit_kinds(&repo.id, "x").unwrap();
         kinds.sort();
         assert_eq!(kinds, ["pr", "push"]);
+    }
+
+    #[test]
+    fn artifacts_of_recent_runs_survive_cas_gc() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = db
+            .insert_run(&repo.id, "x", None, None, 0, "local", false, None, false)
+            .unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let g = db
+            .insert_locked_group(&run, "g", "any", &[], &task, None)
+            .unwrap();
+        let files = vec![Artifact {
+            path: "report/a.png".into(),
+            digest: "d1".into(),
+            size: 1,
+        }];
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE tasks SET artifacts = ?2 WHERE group_id = ?1",
+                params![g, serde_json::to_string(&files).unwrap()],
+            )
+            .unwrap();
+        let (keep, _) = db.referenced_blobs(0).unwrap();
+        assert!(keep.contains("d1"));
+        assert_eq!(
+            db.view_task_artifact_for_test(&g)
+                .unwrap()
+                .map(|a| a.digest),
+            Some("d1".into())
+        );
     }
 
     #[test]

@@ -79,6 +79,11 @@ export interface TaskDef {
    */
   reports?: string[];
   /**
+   * Globs of files kept from every run, passed or failed (screenshots,
+   * traces, a build), downloadable one by one (`pit artifacts <run>`).
+   */
+  artifacts?: string[];
+  /**
    * An OIDC audience, e.g. `"sts.amazonaws.com"`. The task gets a 10-minute
    * token signed by the Pit server in `PIT_OIDC_TOKEN`, to trade for cloud
    * credentials instead of storing keys. Never given to fork pull requests.

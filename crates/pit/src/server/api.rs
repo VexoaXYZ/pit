@@ -61,6 +61,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/tasks/{id}/annotations", post(set_annotations))
         .route("/api/tasks/{id}/tests", post(set_test_outcomes))
         .route("/api/tasks/{id}/summary", post(set_summary))
+        .route("/api/tasks/{id}/artifacts", post(set_artifacts))
+        .route("/api/tasks/{id}/artifacts/{*path}", get(get_artifact))
         .route("/api/tasks/{id}/finish", post(finish_task))
         .route("/api/groups/{id}/heartbeat", post(heartbeat))
         .route("/api/groups/{id}/release", post(release_group))
@@ -429,6 +431,60 @@ async fn append_log(
         serde_json::json!({ "text": chunk.text }),
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Artifact files a task keeps at most.
+const MAX_ARTIFACTS: usize = 1000;
+
+/// `POST /api/tasks/{id}/artifacts`: the files the running task kept; their
+/// bytes are already in the CAS.
+async fn set_artifacts(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(mut files): Json<Vec<Artifact>>,
+) -> ApiResult<StatusCode> {
+    let (group_id, _, _) = app.db.task_group(&id)?;
+    files.truncate(MAX_ARTIFACTS);
+    files.retain(|f| app.cas.contains(&f.digest));
+    if !app.db.set_artifacts(&id, lease(&headers), &files)? {
+        return Err(stale(&group_id));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/tasks/{id}/artifacts/<path>`: one artifact file, as itself (no
+/// zip), named for download.
+async fn get_artifact(
+    State(app): State<Arc<App>>,
+    Path((id, path)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let a = app
+        .db
+        .artifact(&id, &path)?
+        .ok_or_else(|| not_found("artifact"))?;
+    let bytes = app
+        .cas
+        .get(&a.digest)?
+        .ok_or_else(|| not_found("artifact blob"))?;
+    let name: String = path
+        .rsplit('/')
+        .next()
+        .unwrap_or("artifact")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+        .collect();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// The most of a task summary kept: a check shows about 60 KB, and every
