@@ -11,6 +11,7 @@ struct Pit {
     _data: tempfile::TempDir,
     client: Client,
     app: std::sync::Arc<pit::server::App>,
+    base: String,
 }
 
 async fn start() -> Pit {
@@ -41,6 +42,7 @@ async fn start() -> Pit {
         _data: data,
         client,
         app,
+        base,
     }
 }
 
@@ -4434,4 +4436,77 @@ async fn artifacts_are_kept_from_failed_runs_and_served_as_files() {
         .collect();
     paths.sort();
     assert_eq!(paths, ["snapshots/diff.png"]);
+}
+
+/// Interrupting `pit run` (Ctrl-C, or SIGTERM from a timeout or an agent)
+/// cancels its run, so the task stops instead of holding a worker until it
+/// ends; `pit cancel` says when there was nothing left to cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupting_pit_run_cancels_its_run() {
+    let pit = start().await;
+    let base = pit.base.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let started = tmp.path().join("started");
+    let done = tmp.path().join("done");
+    let task = format!(
+        "touch {} && sleep 8 && touch {}",
+        started.display(),
+        done.display()
+    );
+    write(
+        &repo,
+        "pit.config.json",
+        &serde_json::json!({ "tasks": { "long": { "run": task, "cache": false } } }).to_string(),
+    );
+    sh(
+        &repo,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    for signal in ["INT", "TERM"] {
+        let _ = std::fs::remove_file(&started);
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_pit"))
+            .args(["run", "--server", &base])
+            .current_dir(&repo)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..300 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(started.exists(), "task never started");
+        let pid = child.id().unwrap().to_string();
+        sh(&repo, &format!("kill -{signal} {pid}"));
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("pit run kept waiting after the interrupt")
+            .unwrap();
+        assert_eq!(status.code(), Some(130), "SIG{signal}");
+        let runs: Vec<serde_json::Value> = pit.client.get("/api/runs?limit=1").await.unwrap();
+        let id = runs[0]["id"].as_str().unwrap().to_string();
+        let v: RunView = pit.client.get(&format!("/api/runs/{id}")).await.unwrap();
+        assert_eq!(v.status, Status::Failed, "SIG{signal}: {v:?}");
+        assert_eq!(v.message.as_deref(), Some("cancelled"));
+        // Nothing left to cancel: said so, not reported as done.
+        let again: serde_json::Value = pit
+            .client
+            .post(&format!("/api/runs/{id}/cancel"), &())
+            .await
+            .unwrap();
+        assert_eq!(again["cancelled"], false);
+        assert_eq!(again["status"], "failed");
+    }
+    // Long enough for an unstopped task to have finished.
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    assert!(!done.exists(), "the interrupted run's task kept running");
+    let unknown = pit
+        .client
+        .post::<_, serde_json::Value>("/api/runs/run_nope/cancel", &())
+        .await
+        .unwrap_err();
+    assert!(unknown.to_string().contains("404"), "{unknown:#}");
 }

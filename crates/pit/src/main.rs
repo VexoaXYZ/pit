@@ -181,6 +181,13 @@ enum Command {
         #[arg(long, default_value_t = 14)]
         days: u32,
     },
+    /// Cancel a queued or running run; its running tasks are stopped
+    /// within a few seconds.
+    Cancel {
+        run: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
     /// Print a task's log.
     Logs {
         run: String,
@@ -457,6 +464,9 @@ async fn run(cli: Cli) -> Result<i32> {
                 &out,
             )
             .await
+        }
+        Command::Cancel { run, conn } => {
+            cli::cancel(&cli::client(&conn.server, conn.token)?, &run).await
         }
         Command::Logs { run, task, conn } => {
             cli::logs(&cli::client(&conn.server, conn.token)?, &run, &task).await

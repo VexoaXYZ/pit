@@ -258,7 +258,7 @@ pub async fn run(
     let mut names: HashMap<String, (String, String)> = HashMap::new();
     let mut groups: HashMap<String, (String, String)> = HashMap::new();
     let mut stderr = std::io::stderr();
-    let view = wait(client, &sub.run_id, |e| {
+    let watch = wait(client, &sub.run_id, |e| {
         match e.kind.as_str() {
             "snapshot" => {
                 if let Ok(v) = serde_json::from_value::<RunView>(e.data.clone()) {
@@ -356,8 +356,28 @@ pub async fn run(
                 names.insert(id.clone(), (String::new(), name.to_string()));
             }
         }
-    })
-    .await?;
+    });
+    tokio::pin!(watch);
+    // Interrupting `pit run` (Ctrl-C, or SIGTERM from a timeout or an
+    // agent) cancels its run, so its tasks stop instead of holding a worker
+    // until they time out. A second interrupt quits without waiting.
+    let mut interrupted = false;
+    let view = tokio::select! {
+        v = &mut watch => v?,
+        () = interrupt() => {
+            interrupted = true;
+            eprintln!("cancelling {} (interrupt again to quit now)", sub.run_id);
+            if let Err(e) = cancel_run(client, &sub.run_id).await {
+                eprintln!("could not cancel {}: {e:#}", sub.run_id);
+                return Ok(130);
+            }
+            tokio::select! {
+                v = &mut watch => v?,
+                () = interrupt() => return Ok(130),
+                () = tokio::time::sleep(std::time::Duration::from_secs(15)) => return Ok(130),
+            }
+        }
+    };
     let elapsed = started.elapsed().as_millis() as u64;
 
     if json {
@@ -435,7 +455,57 @@ pub async fn run(
         }
         eprintln!("{line}");
     }
-    Ok(if view.status.is_ok() { 0 } else { 1 })
+    Ok(if interrupted {
+        130
+    } else if view.status.is_ok() {
+        0
+    } else {
+        1
+    })
+}
+
+/// Resolves on Ctrl-C or, on Unix, SIGTERM; never if neither can be caught.
+async fn interrupt() {
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    let int = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        () = int => {}
+        () = term => {}
+    }
+}
+
+/// Whether the call cancelled the run, and the run's status after it.
+async fn cancel_run(client: &Client, run: &str) -> Result<(bool, String)> {
+    let v: serde_json::Value = client.post(&format!("/api/runs/{run}/cancel"), &()).await?;
+    Ok((
+        v["cancelled"].as_bool().unwrap_or(false),
+        v["status"].as_str().unwrap_or_default().to_string(),
+    ))
+}
+
+pub async fn cancel(client: &Client, run: &str) -> Result<i32> {
+    let (cancelled, status) = cancel_run(client, run).await?;
+    if cancelled {
+        eprintln!("cancelled {run}; its running tasks are being stopped");
+        Ok(0)
+    } else {
+        eprintln!("{run} had already finished ({status})");
+        Ok(1)
+    }
 }
 
 pub async fn runs(client: &Client, limit: usize) -> Result<i32> {

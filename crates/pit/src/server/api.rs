@@ -297,10 +297,20 @@ async fn cancel_run(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if app.db.cancel_run(&id)? {
+    let cancelled = app.db.cancel_run(&id)?;
+    if cancelled {
         app.run_finished(&id).await;
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    // `cancelled: false` with the status says the run had already ended.
+    let run = app
+        .db
+        .run(&id)
+        .map_err(|_| not_found(format!("run {id}")))?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "cancelled": cancelled,
+        "status": run.status.as_str(),
+    })))
 }
 
 fn to_sse(e: &Event) -> SseEvent {

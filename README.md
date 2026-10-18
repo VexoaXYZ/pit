@@ -473,6 +473,7 @@ seconds without pushing.
 | `pit slow [--days 14]` | Tasks whose last 5 passing runs take clearly longer (1.3x and 1s more) than the ones before. A single pass at 1.5x and 2s over its usual (median of the last 10) also says `slow: took …, usually …` in its result, on the CLI, the MCP summary and the GitHub check. |
 | `pit verify` | `pit run --no-cache --fresh`: proves results depend neither on the cache nor on files earlier runs left in a warm workspace. |
 | `pit runs`, `pit logs RUN TASK`, `pit stats` | Inspect. |
+| `pit cancel RUN` | Cancel a queued or running run. Its running tasks are killed (process group, or container) at the worker's next heartbeat, within about 2s. Interrupting `pit run` (Ctrl-C, or SIGTERM from a timeout or an agent) cancels its run the same way and exits 130; interrupt again to quit without waiting. |
 | `pit queue add BRANCH`, `pit queue list` | Merge queue. |
 | `pit init`, `pit import` | Write a config from the repo or from Actions workflows. |
 | `pit mcp` | MCP server over stdio. |

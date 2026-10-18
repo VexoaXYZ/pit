@@ -3835,3 +3835,81 @@ version, all fixed:
 - A file changed back to its old size and mtime looks unchanged.
 - Artifacts are not restored on a cache hit; that's what `outputs` is for.
 - No dashboard links yet.
+
+## P62. Cancel that doesn't cancel
+
+**The pain.** On GitHub Actions, "Cancel workflow" often doesn't stop anything. Runs sit in
+`queued` with no runner, and both cancel and force-cancel fail
+([community #196717](https://github.com/orgs/community/discussions/196717),
+[#205874](https://github.com/orgs/community/discussions/205874),
+[#205628](https://github.com/orgs/community/discussions/205628) (HTTP 500 on both),
+[#205893](https://github.com/orgs/community/discussions/205893) (queued with zero jobs),
+[actions/runner#3872](https://github.com/actions/runner/issues/3872)).
+- The UI may only say "Failed to cancel workflow"
+  ([#163182](https://github.com/orgs/community/discussions/163182)).
+- A re-run that hasn't queued yet can't be cancelled at all
+  ([#135366](https://github.com/orgs/community/discussions/135366)).
+- GitHub's answer was a separate force-cancel API, for runs that don't respond to cancel
+  ([changelog](https://github.blog/changelog/2023-09-21-github-actions-force-cancel-workflows/),
+  [lwebapp](https://lwebapp.com/en/post/force-stop-github-actions)).
+
+The cost isn't just a stale red X. A run that keeps going holds a runner, and with concurrency
+groups it holds back the next push.
+
+**Reproduction** (`/tmp/painhunt/p62`). A config with two groups:
+- `stuck` (`os: windows`), which no worker can run;
+- `long`, `sleep 300` with `cache: false`.
+
+`pit run`, then cancel while `long` is running.
+
+1. **`POST /api/runs/<id>/cancel`.** Both groups end `skipped` and the run `failed · cancelled`.
+   The queued group no worker could take goes too. The `sleep` process was gone **325 ms** after
+   the cancel; the worker learns of it from a refused heartbeat, sent every 2 s. A first
+   measurement said 35 s, but that script was matching the wrong process.
+2. **No way to cancel from the CLI.** `pit --help` had no cancel command.
+3. **Interrupting `pit run` didn't cancel anything.** On Ctrl-C (and SIGTERM, which a timeout, an
+   agent harness or a parent CI job sends) the CLI just died. The run stayed `running` on the
+   server, and the `sleep` kept its worker slot until the task timed out:
+   ```
+   run_abc166575350   running  local    main   p62@832e5ac9 2 tasks (0 cached) …
+   sleep 302    # still running after pit run exited
+   ```
+   For an agent that runs `pit run` under a timeout, every timeout leaked a run like this.
+4. **The cancel API answered `{"ok":true}` for anything**, a run id that doesn't exist included,
+   so a caller couldn't tell a cancel from a no-op.
+
+**Fix.**
+- **`pit run` cancels its own run when interrupted**, by SIGINT or SIGTERM. It prints
+  `cancelling <run> (interrupt again to quit now)`, waits up to 15 s for the run to end, prints
+  the usual verdict line, and exits **130**. A second interrupt quits at once.
+- **`pit cancel <run>`** exits 0 if it cancelled the run, 1 if the run had already finished
+  (`<run> had already finished (failed)`), and 2 with `404 Not Found` for an unknown id.
+- **The cancel API** returns `{"ok":true,"cancelled":bool,"status":…}`, and 404 for an unknown
+  run. The dashboard's Cancel button ignores the body, so it is unaffected.
+
+**Measured** (script `/tmp/painhunt/p62-scripts/sig.sh`, the real pid this time):
+```
+SIGINT: pit run exit=130, task process gone 1812 ms after the signal
+cancelling run_db1cf59507a3 (interrupt again to quit now)
+failed in 535ms · 0 ran, 0 cached · cancelled
+SIGTERM: pit run exit=130, task process gone 1869 ms after the signal
+```
+The ~1.8 s is the heartbeat interval: the task is killed at the worker's next heartbeat after the
+cancel.
+
+The e2e test `interrupting_pit_run_cancels_its_run` runs the real binary:
+- for SIGINT and SIGTERM, `pit run` exits 130 and the run ends `failed · cancelled`;
+- a second cancel returns `cancelled: false`, `status: failed`;
+- the task (`sleep 8 && touch done`) never writes `done`;
+- an unknown run gets a 404.
+
+Without the fix, `pit run` dies from the signal itself, so it has no exit code and the test fails.
+
+**Verdict: SOLVED** for Pit's side. Limits:
+- Cancel reaches a running task at the worker's next heartbeat, so up to about 2 s (plus a
+  container's stop time), not at once.
+- A worker that has lost contact with the server can't hear the cancel. It stops the task when it
+  next reaches the server, or at the task's timeout.
+- `kill -9` of `pit run` can't be caught, so that run keeps going. `pit cancel` it.
+- There's no separate "force" cancel. Cancelling marks the run finished in the database first, so
+  a worker that never answers can't keep the run open.
