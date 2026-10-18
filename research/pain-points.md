@@ -5720,3 +5720,67 @@ under a 3 s idle limit; without the fix it is stopped as idle.
   their output when it isn't a terminal. Only Python has a standard variable that turns it off.
 - **CI not run.** GitHub Actions wouldn't start jobs on this account (billing). The workflow's
   commands pass locally on Linux.
+
+## P90. The CI box fills its disk, and takes everything else on it down
+
+**The pain.** A self-hosted runner shares a disk with whatever else runs on the machine, and CI
+fills it: node_modules for every checkout, Go build caches, Docker layers. GitHub's runner has
+no disk budget; its docs leave cleanup to the owner (P19). This hunt hit it for real.
+
+**What happened** (a trial of Pit for a private TypeScript/Go monorepo, on a 4-CPU, 7 GB
+self-hosted box that also runs a Dokploy panel, a business app and two GitHub runners): one
+cold run of the repo's checks filled the disk. Pit's own database stopped writing ("database or
+disk is full"), and the Dokploy panel on the same disk went down (502) until the volume was
+removed. The worker had a fixed workspace budget (50 GB by default) and never looked at the
+space actually free.
+
+**Fix.**
+- **A free-space floor.** Pit keeps `PIT_MIN_FREE_GB` free on its disk (default 5, `0` to turn
+  it off).
+- **Before each claim,** a worker below the floor removes idle workspaces, least recently used
+  first. If that isn't enough, it takes no new job and warns ("taking no new jobs until there is
+  room") until there is room.
+- **The server's cache** lowers its size limit the same way while the disk is below the floor.
+
+**Proof.**
+- **e2e test.** `a_worker_takes_no_job_on_a_nearly_full_disk` starts a worker whose floor is
+  above any disk's free space. The job stays queued and the warning is logged; with the floor
+  off the job runs. Without the fix the job runs at once.
+- **The repo's checks on an 8 GB filesystem** (container capped at 3 CPUs and 4.5 GB, floor
+  1.5 GB). After the first groups, the worker removed idle workspaces before taking the next
+  (`workspaces: 11.8 GB → 8.1 GB → 4.5 GB`).
+
+**Verdict: PARTIAL.** Limits:
+- **Within one job.** The floor is checked between jobs, so a single job can still use what
+  is left. In the 8 GB test, the Go tests' build cache took the last 1.8 GB to 0. The floor
+  must be larger than the largest job's growth (about 3 GB for that repo), or Pit's data must
+  sit on a filesystem of its own.
+- **Waiting runs.** A run waiting for room shows no reason; only the worker's log says why.
+- **The cache empties.** On a disk below the floor, the result cache is emptied, which frees
+  little next to workspaces.
+
+## P91. `pit run` gives up when a proxy drops its connection, though the run goes on
+
+**The pain.** Self-hosted CI usually sits behind a reverse proxy (Traefik, nginx, a cloud load
+balancer), and proxies close long-lived connections: idle timeouts, config reloads, redeploys.
+A client that follows a run over one stream then reports a failure that isn't one.
+
+**Found in the rivo trial** (Pit behind Dokploy's Traefik, over HTTPS): `pit run` stopped after
+41 s with
+```
+pit: error decoding response body: error reading a body from connection: unexpected EOF during chunk size line
+```
+and exit 2, while the run carried on and finished on the server. An agent or a script would
+have read that as a failed run.
+
+**Fix.** Following a run reconnects when the stream ends or breaks before the run is done, and
+the new stream's snapshot fills in what happened meanwhile. It gives up only after a minute with
+no events, saying the run may still be running. Lines a snapshot replays are not printed twice
+(group headers by name, task lines by id).
+
+**Proof.** The e2e test `following_a_run_survives_a_dropped_stream` puts a proxy that cuts every
+connection after 1.5 s in front of a run whose task takes 4 s. Without the fix it fails with the
+same "error decoding response body"; with it, the run is followed to `passed`.
+
+**Verdict: SOLVED.** Limit: a stream that keeps reconnecting, but never gets an event, is given
+up after a minute.

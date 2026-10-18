@@ -30,6 +30,11 @@ pub fn is_digest(s: &str) -> bool {
 }
 
 impl Cas {
+    /// Where the blobs are kept.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(root.join("tmp"))

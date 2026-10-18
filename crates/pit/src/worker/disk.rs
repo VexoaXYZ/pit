@@ -198,6 +198,59 @@ fn on_disk(meta: &std::fs::Metadata) -> u64 {
     meta.len()
 }
 
+/// Space free to an unprivileged user on the filesystem holding `path`.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // the field types differ between platforms
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid C string and `s` a valid place for the result.
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    Some(s.f_bavail as u64 * s.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+pub fn free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// The free space Pit leaves on its disk, whatever its size limits say:
+/// `PIT_MIN_FREE_GB` (default 5, `0` for none). A cache and workspaces under
+/// their limits can still fill a small disk shared with other services.
+pub fn min_free_bytes() -> u64 {
+    std::env::var("PIT_MIN_FREE_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map_or(5_000_000_000, |gb| (gb.max(0.0) * 1e9) as u64)
+}
+
+/// How far the disk holding `path` is below that floor (0 when it isn't,
+/// or its free space is unknown).
+pub fn shortfall(path: &Path) -> u64 {
+    let floor = min_free_bytes();
+    if floor == 0 {
+        return 0;
+    }
+    free_bytes(path).map_or(0, |free| floor.saturating_sub(free))
+}
+
+/// A size limit that also frees `short` bytes from `total`: `max_bytes` (0
+/// for none) lowered to fit. Never 0, which would mean no limit.
+pub fn limit_for(total: u64, max_bytes: u64, short: u64) -> u64 {
+    if short == 0 {
+        return max_bytes;
+    }
+    let room = total.saturating_sub(short).max(1);
+    if max_bytes == 0 {
+        room
+    } else {
+        max_bytes.min(room)
+    }
+}
+
 /// Which idle workspaces to remove: stale ones, then least recently used
 /// until the total fits `max_bytes` (0 means no size limit). Busy
 /// workspaces are never chosen but count toward the total.
@@ -292,6 +345,20 @@ mod tests {
         let now = SystemTime::now() + STALE_AFTER;
         assert_eq!(plan(&found, |_| false, 1, now), std::slice::from_ref(&home));
         assert!(plan(&found, |_| true, 1, now).is_empty());
+    }
+
+    #[test]
+    fn a_disk_short_of_its_floor_lowers_the_limit() {
+        assert_eq!(limit_for(10, 0, 0), 0);
+        assert_eq!(limit_for(10, 50, 0), 50);
+        assert_eq!(limit_for(10, 0, 4), 6);
+        assert_eq!(limit_for(10, 5, 4), 5);
+        assert_eq!(
+            limit_for(3, 0, 4),
+            1,
+            "everything idle goes, never 'no limit'"
+        );
+        assert!(free_bytes(Path::new(".")).is_none_or(|b| b > 0));
     }
 
     #[test]

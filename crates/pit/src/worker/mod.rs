@@ -477,7 +477,11 @@ impl Worker {
             // is chosen and moved out of the way.
             let mut pools = self.workspaces.lock();
             let busy = |p: &Path| pools.values().flatten().any(|s| s.busy && s.path == p);
-            let chosen = disk::plan(&found, busy, self.workspace_max_bytes, now);
+            // Below the free-space floor, idle workspaces go, least recently
+            // used first, until the disk is back over it.
+            let total: u64 = found.iter().map(|w| w.bytes).sum();
+            let max = disk::limit_for(total, self.workspace_max_bytes, disk::shortfall(&root));
+            let chosen = disk::plan(&found, busy, max, now);
             for path in chosen {
                 let dest = trash.join(uuid::Uuid::new_v4().simple().to_string());
                 std::fs::create_dir_all(&trash)?;
@@ -579,6 +583,26 @@ impl Worker {
         loop {
             if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
+            }
+            // A disk below the floor: make room, and take no new job until
+            // there is some. A job started on a full disk fails, and fills it
+            // for whatever else runs there.
+            if disk::shortfall(&self.data_dir) > 0 {
+                let w = self.clone();
+                let _ = tokio::task::spawn_blocking(move || w.collect_workspaces()).await;
+                if disk::shortfall(&self.data_dir) > 0 {
+                    if slot == 0 {
+                        tracing::warn!(
+                            "{:.1} GB free on {}, under the {:.1} GB Pit keeps free (PIT_MIN_FREE_GB): \
+                             taking no new jobs until there is room",
+                            disk::free_bytes(&self.data_dir).unwrap_or_default() as f64 / 1e9,
+                            self.data_dir.display(),
+                            disk::min_free_bytes() as f64 / 1e9
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
             }
             match self.client.claim(&self.info).await {
                 // A claim long-polls for up to 20s: one that was in flight

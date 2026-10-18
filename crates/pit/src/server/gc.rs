@@ -32,10 +32,17 @@ pub struct GcReport {
 
 /// Runs a collection if the CAS is over its limit (or always, if `force`).
 pub fn collect(app: &App, force: bool) -> Result<GcReport> {
-    let limit = app.cache_max_bytes.load(Ordering::Relaxed);
+    let bytes_before = app.cas.total_bytes();
+    // Lowered while the disk is below the free-space floor (see
+    // `disk::min_free_bytes`), so a cache under its limit can't fill it.
+    let limit = crate::worker::disk::limit_for(
+        bytes_before,
+        app.cache_max_bytes.load(Ordering::Relaxed),
+        crate::worker::disk::shortfall(app.cas.root()),
+    );
     let mut report = GcReport {
         limit_bytes: limit,
-        bytes_before: app.cas.total_bytes(),
+        bytes_before,
         ..Default::default()
     };
     let over = limit > 0 && report.bytes_before > limit;

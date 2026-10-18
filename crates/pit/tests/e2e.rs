@@ -6414,3 +6414,125 @@ async fn python_output_is_not_held_back_until_exit() {
     let v = run(&pit, dir).await;
     assert_eq!(v.status, Status::Passed, "{v:?}");
 }
+
+/// A worker whose disk is below the free space Pit keeps (`PIT_MIN_FREE_GB`)
+/// takes no job, and says why; once there is room it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_takes_no_job_on_a_nearly_full_disk() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = pit::server::App::new(&data.path().join("server"), None, base.clone()).unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    let log = data.path().join("worker.log");
+    let (root, server) = (data.path().to_path_buf(), base.clone());
+    let worker = |floor: &str| {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_pit"))
+            .args([
+                "worker",
+                "--server",
+                &server,
+                "--name",
+                "small-disk",
+                "--slots",
+                "1",
+            ])
+            .arg("--data")
+            .arg(&root)
+            // More than any disk has: always below the floor.
+            .env("PIT_MIN_FREE_GB", floor)
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(std::fs::File::options().append(true).open(&log).unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let full = worker("1000000000");
+    let pit = Pit {
+        client: Client::new(&base, None).unwrap(),
+        _data: data,
+        app,
+        base,
+    };
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    write(
+        dir,
+        "pit.config.json",
+        r#"{"tasks":{"t":{"run":"echo ran","cache":false}}}"#,
+    );
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sub = pit::cli::submit(&pit.client, dir, vec![], Default::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let v: RunView = pit
+        .client
+        .get(&format!("/api/runs/{}", sub.run_id))
+        .await
+        .unwrap();
+    assert!(v.groups.iter().all(|g| g.status == Status::Queued), "{v:?}");
+    let said = std::fs::read_to_string(&log).unwrap();
+    assert!(said.contains("taking no new jobs"), "{said}");
+    drop(full);
+    let _room = worker("0");
+    let v = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&pit.client, &sub.run_id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+}
+
+/// Following a run survives a proxy that drops long connections (Traefik,
+/// a load balancer): it reconnects, and ends with the run's real result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn following_a_run_survives_a_dropped_stream() {
+    let pit = start().await;
+    let upstream = pit.base.trim_start_matches("http://").to_string();
+    // Cuts every connection after 1.5 s.
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (mut down, _) = proxy.accept().await.unwrap();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let mut up = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(1500),
+                    tokio::io::copy_bidirectional(&mut down, &mut up),
+                )
+                .await;
+            });
+        }
+    });
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    write(
+        dir,
+        "pit.config.json",
+        r#"{"tasks":{"slow":{"run":"sleep 4 && echo done","cache":false}}}"#,
+    );
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let client = Client::new(&proxy_url, None).unwrap();
+    let sub = pit::cli::submit(&client, dir, vec![], Default::default())
+        .await
+        .unwrap();
+    let v = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&client, &sub.run_id, |_| {}),
+    )
+    .await
+    .expect("still following after a minute")
+    .unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+}
