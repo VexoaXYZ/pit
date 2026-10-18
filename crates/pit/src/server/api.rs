@@ -818,11 +818,17 @@ async fn claim(
 /// running a trusted run's group holds one. A lease that is no longer live
 /// (the run was cancelled or requeued) is refused rather than treated as
 /// untrusted, which would let a trusted job read untrusted results.
+///
+/// The trusted namespace is shared by every repo (keys hold no repo), so on
+/// a shared server only GitHub repos' trusted runs write it: a repo anyone
+/// with the API token can register gets trusted runs on its own default
+/// branch, and could otherwise plant a result under a key another repo's
+/// main computes. Its runs read trusted results and write their own.
 fn cache_trust(app: &App, headers: &HeaderMap) -> ApiResult<bool> {
     match lease(headers) {
         None => Ok(false),
         Some(l) => match app.db.lease_trust(l)? {
-            Some(trusted) => Ok(trusted),
+            Some((trusted, github)) => Ok(trusted && (github || app.token.is_none())),
             None => Err(ApiError(
                 StatusCode::CONFLICT,
                 anyhow::anyhow!("this job's lease is no longer live"),

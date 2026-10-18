@@ -1873,18 +1873,21 @@ impl Db {
 
     /// Whether the group holding this live lease belongs to a trusted run;
     /// `None` if no running group holds it.
-    pub fn lease_trust(&self, lease: &str) -> Result<Option<bool>> {
+    /// Whether a live lease's run is trusted, and whether its repo came from
+    /// the GitHub webhook: `(trusted, github)`.
+    pub fn lease_trust(&self, lease: &str) -> Result<Option<(bool, bool)>> {
         Ok(self
             .conn
             .lock()
             .query_row(
-                "SELECT runs.trusted FROM groups_ JOIN runs ON runs.id = groups_.run_id
+                "SELECT runs.trusted, repos.github IS NOT NULL FROM groups_
+                 JOIN runs ON runs.id = groups_.run_id
+                 JOIN repos ON repos.id = runs.repo_id
                  WHERE groups_.lease = ?1 AND groups_.status = 'running'",
                 params![lease],
-                |r| r.get::<_, i64>(0),
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0)),
             )
-            .optional()?
-            .map(|t| t != 0))
+            .optional()?)
     }
 
     pub fn kv_get(&self, ns: &str, key: &str) -> Result<Option<String>> {

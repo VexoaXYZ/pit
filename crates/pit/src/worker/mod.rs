@@ -266,6 +266,23 @@ impl Shutdown {
     }
 }
 
+/// A repo's directory name: readable, plus a hash of the full name, because
+/// `safe_name` folds names together (`acme/web`, `acme:web` and `acme_web`
+/// are all `acme_web`) and two repos must never share a warm workspace or a
+/// container home: one would inherit the other's `node_modules`.
+fn repo_dir(repo: &str) -> String {
+    format!(
+        "{}-{}",
+        safe_name(repo),
+        &crate::cas::digest(repo.as_bytes())[..8]
+    )
+}
+
+#[doc(hidden)]
+pub fn repo_dir_for_test(repo: &str) -> String {
+    repo_dir(repo)
+}
+
 fn safe_name(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -336,7 +353,7 @@ impl Worker {
         let dir = self
             .data_dir
             .join("workspaces")
-            .join(safe_name(repo))
+            .join(repo_dir(repo))
             .join(pool);
         let key = dir.to_string_lossy().to_string();
         let mut pools = self.workspaces.lock();
@@ -398,7 +415,7 @@ impl Worker {
         let dir = self
             .data_dir
             .join("workspaces")
-            .join(safe_name(repo))
+            .join(repo_dir(repo))
             .join(format!("{}~fresh", safe_name(group)));
         let key = dir.to_string_lossy().to_string();
         let path = dir.join(uuid::Uuid::new_v4().simple().to_string());
@@ -1934,11 +1951,7 @@ impl Worker {
         // group's tool writes to `$HOME` (`~/.npmrc`, `docker login`) is not
         // read by another group's tasks.
         let pool = if job.trusted { "trusted" } else { "untrusted" };
-        let repo = format!(
-            "{}-{}",
-            safe_name(&job.repo),
-            &crate::cas::digest(job.repo.as_bytes())[..8]
-        );
+        let repo = repo_dir(&job.repo);
         let dir = self
             .data_dir
             .join("homes")

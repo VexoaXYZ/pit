@@ -4765,3 +4765,95 @@ async fn webhooks_do_not_adopt_api_registered_repos_on_a_shared_server() {
         .unwrap();
     assert!(named.name.starts_with("acme/api-"), "{}", named.name);
 }
+
+/// The trusted cache has one namespace for every repo. On a shared server a
+/// repo registered through the API still gets trusted runs (here: its
+/// schedule), but they write its own results, not the shared trusted ones
+/// a GitHub repo's main reads. Without a token, nothing changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_registered_repos_never_write_the_shared_trusted_cache() {
+    for token in [Some("tok"), None] {
+        let data = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = pit::server::App::with_github(
+            &data.path().join("server"),
+            token.map(String::from),
+            base.clone(),
+            None,
+        )
+        .unwrap();
+        tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+        tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+            server: base.clone(),
+            token: token.map(String::from),
+            name: Some("w".into()),
+            data_dir: data.path().join("worker"),
+            slots: 2,
+            parallelism: 2,
+            workspace_max_bytes: 0,
+            worker_token: None,
+            secrets_file: None,
+        }));
+        let client = Client::new(&base, token.map(String::from)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let root = data.path().canonicalize().unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        sh(&root, "git init -q --bare -b main origin.git");
+        write(
+            &work,
+            "pit.config.json",
+            &serde_json::json!({
+                "tasks": { "build": { "run": "echo built" } },
+                "schedules": { "nightly": { "cron": "17 3 * * *" } },
+            })
+            .to_string(),
+        );
+        sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+        // Registers the repo through the API (no GitHub webhook).
+        let sub = pit::cli::submit(
+            &client,
+            &work,
+            vec!["nope-not-a-task".into()],
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let _ = pit::cli::wait(&client, &sub.run_id, |_| {}).await;
+        let repo = app.db.repos().unwrap()[0].name.clone();
+        let started: serde_json::Value = client
+            .post(
+                "/api/schedules/run",
+                &serde_json::json!({ "name": "nightly", "repo": repo }),
+            )
+            .await
+            .unwrap();
+        let v = pit::cli::wait(&client, started["id"].as_str().unwrap(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(v.status, Status::Passed, "{v:?}");
+        let key = v.groups[0].tasks[0].action_key.clone().expect("a key");
+        let trusted_entry = app.db.cache_find(&key, true).unwrap();
+        match token {
+            Some(_) => {
+                assert_eq!(trusted_entry, None, "wrote the shared trusted cache");
+                assert_eq!(
+                    app.db.cache_find(&key, false).unwrap(),
+                    Some(format!("u:{key}"))
+                );
+            }
+            None => assert_eq!(trusted_entry, Some(key)),
+        }
+    }
+}
+
+#[test]
+fn repos_whose_names_fold_together_get_separate_workspaces() {
+    assert_ne!(
+        pit::worker::repo_dir_for_test("acme/web"),
+        pit::worker::repo_dir_for_test("acme_web")
+    );
+    assert!(pit::worker::repo_dir_for_test("acme/web").starts_with("acme_web-"));
+}
