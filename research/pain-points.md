@@ -5241,3 +5241,62 @@ It checks for exactly "stopped 1" and fails without the fix. It passed 3/3 after
 - **Build daemons.** Kept warm before, they're now stopped after every task unless started with
   `PIT_TRACKING_ID=`. Faster builds that relied on them need that one change.
 - **The escape hatch.** A task that unsets the variable keeps its daemon, as on GitHub.
+
+## P83. Required checks named by shard break when the shard count changes
+
+**The pain.** Branch protection requires checks by exact name. GitHub matrix jobs report one check
+per entry (`test (1)`, `build (ubuntu-latest)`), so changing the matrix renames them. "Change the
+matrix and the check names change; the required list does not … every PR blocks on a check that
+cannot exist. No error, no warning": "Expected — Waiting for status to be reported"
+([community #26698](https://github.com/orgs/community/discussions/26698),
+[#30724](https://github.com/orgs/community/discussions/30724), where a GitHub staff reply
+explains the rename,
+[#130684](https://github.com/orgs/community/discussions/130684),
+[devopsinterviewkb](https://devopsinterviewkb.com/questions/github/branch-protection/required-status-check-stuck-expected-forever)).
+The usual fix is a hand-written aggregator job with a fixed name, as in
+[IN-CORE#58](https://github.com/IN-CORE/IN-CORE/issues/58): "Add CI aggregator jobs so required
+checks survive matrix changes".
+
+**Before.** A Pit task with `shards: N` becomes groups `ci#1` … `ci#N`, each with its own check
+(`pit / ci#1` …). A rule requiring them breaks the same way when `shards` changes, and there was
+nothing stable to require instead.
+
+**Fix.** A sharded group also gets one check under its own name, `pit / ci`.
+- **What it reports.** Pending while any shard runs, passed only when every shard passed, else
+  the worst shard status, with "<n> of <m> shards passed".
+- **Left out.** When the group is left out of a run (`on`), it reports skipped, which counts as
+  passing, so a required check doesn't hang.
+- **App mode.** It keeps one check run per run and updates it, with Re-run behaving like a
+  shard's.
+- **Group names.** `#` is now rejected in group names, since it names shards; `pit import` keeps
+  it out.
+
+**Proof.** The e2e test `sharded_groups_get_one_check_with_a_stable_name` (signed webhooks, fake
+statuses API) checks two cases, and fails on the old code at "no final status for pit / ci":
+- a push of a 2-shard group gets `pit / ci#1`, `pit / ci#2` and `pit / ci` = success, "2 of 2
+  shards passed";
+- a PR run on a commit whose group is `on: ["push"]` gets `pit / ci` = success.
+
+Unit tests cover the `#` rule and the atomic "keep the larger" store. App mode and the race below
+have no automated test.
+
+**Review.** Four independent rounds; each round's findings are fixed:
+1. **Round 1** found no way to wrongly pass: every run plans all shards, and reruns plan all
+   groups. It did find that the check wasn't posted when every shard was left out (a hang), and
+   that App mode posted a new check run per change.
+2. **Round 2** found the race: a left-out copy posted after the real run's check could stay the
+   newest, so a required check could pass while the real run failed. The combined check now uses
+   the per-group code's protection: the real run reposts, and in App mode posts anew. It also
+   caught a clippy error I'd committed: my command piped clippy into `tail`, which hid the
+   failure. That was fixed before anything was pushed.
+3. **Round 3** found that those reposts ran outside the other run's lock and could race its own
+   report. This applied to the existing per-group code too. Reposts now go through that run's
+   normal, locked reporting, in a task of their own.
+4. **Round 4: APPROVE.** Its nit is fixed too: the newest left-out id is now stored with one
+   atomic "keep the larger" upsert.
+
+**Verdict: SOLVED.** Limits:
+- **Selection runs.** A run that selects only a sharded group's unsharded tasks (a schedule with
+  `tasks`) plans a plain `ci` group, whose check shares the combined check's name.
+- **Leftover rows.** The stored check-run ids outlive pruned runs, like the existing `annotated`
+  key.

@@ -677,12 +677,8 @@ impl GitHub {
                             app.db.kv_put("shard-check", &key, &id.to_string())?;
                             // The newest left-out copy, for real runs to beat.
                             // Only ever the highest: GitHub takes the newest.
-                            let stored = app
-                                .db
-                                .kv_get("shard-check", copies_key)?
-                                .and_then(|v| v.parse::<u64>().ok());
-                            if left_out && stored.is_none_or(|s| id > s) {
-                                app.db.kv_put("shard-check", copies_key, &id.to_string())?;
+                            if left_out {
+                                app.db.kv_put_max("shard-check", copies_key, id)?;
                             }
                         }
                     }

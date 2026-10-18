@@ -2175,6 +2175,18 @@ impl Db {
         Ok(())
     }
 
+    /// Stores a number under a key unless a larger one is there, in one
+    /// statement, so two writers at once can't leave the smaller.
+    pub fn kv_put_max(&self, ns: &str, key: &str, value: u64) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO kv (ns, key, digest, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(ns, key) DO UPDATE SET digest = excluded.digest
+             WHERE CAST(excluded.digest AS INTEGER) > CAST(kv.digest AS INTEGER)",
+            params![ns, key, value.to_string(), now_ms()],
+        )?;
+        Ok(())
+    }
+
     pub fn stats(&self) -> Result<serde_json::Value> {
         let c = self.conn.lock();
         let count = |sql: &str| -> rusqlite::Result<i64> { c.query_row(sql, [], |r| r.get(0)) };
@@ -3436,6 +3448,22 @@ mod stats_tests {
         assert!(db.run(&old).is_err());
         assert!(db.run(&recent).is_ok());
         assert_eq!(db.prune_runs(5_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn kv_put_max_keeps_the_larger() {
+        let db = Db::memory().unwrap();
+        db.kv_put_max("shard-check", "k", 105).unwrap();
+        db.kv_put_max("shard-check", "k", 104).unwrap();
+        assert_eq!(
+            db.kv_get("shard-check", "k").unwrap().as_deref(),
+            Some("105")
+        );
+        db.kv_put_max("shard-check", "k", 1000).unwrap();
+        assert_eq!(
+            db.kv_get("shard-check", "k").unwrap().as_deref(),
+            Some("1000")
+        );
     }
 
     #[test]
