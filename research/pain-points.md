@@ -5580,8 +5580,8 @@ per-attempt reset it does.
   another's; fixed.
 - **Round 3: APPROVE.**
 
-**Verdict: SOLVED** for tools that use `TMPDIR` (`mktemp`, `os.tmpdir()`, Python's
-`tempfile`, Go's `os.TempDir`). Limits:
+**Verdict: SOLVED** for tools that put their files under `$TMPDIR` (Jest, as quoted above).
+Limits:
 - **Hardcoded paths.** A tool that writes to `/tmp` by name still shares it; only a mount
   namespace would stop that, and host tasks don't get one.
 - **Steps share it.** Tasks of one job don't share a temp dir, unlike steps sharing
