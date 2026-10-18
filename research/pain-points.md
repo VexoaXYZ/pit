@@ -4330,3 +4330,60 @@ Limits:
   pull request builds.
 - On a tokenless server the split protects nothing, since anyone can leave the token out.
 - `PIT_CACHE_URL` is the worker's server address, so a container task can't reach a loopback one.
+
+## P68. One big run holds every worker; the small run behind it waits (no fairness)
+
+**The pain.** On a fixed pool of self-hosted runners, a matrix or fan-out takes every free runner
+in waves, and everything queued after it waits. GitHub doesn't promise any order for
+self-hosted jobs: it hands out whatever matching job it picks
+([community #162492](https://github.com/orgs/community/discussions/162492)).
+- "A 16-way test matrix on a pool of 4 self-hosted runners executes in 4 waves," and adding
+  parallel jobs to a fixed pool "only makes more jobs eligible to be claimed by the same few
+  claimers" ([WarpBuild](https://www.warpbuild.com/guides/github-actions-queue-times),
+  [shanechang.com](https://shanechang.com/p/why-self-hosted-ci-runners-dont-scale/)).
+- The usual workarounds are hand-tuned `max-parallel`, separate runner groups, or more machines.
+
+Pit's own P50 recorded the same gap with many coding agents at once: "first come, first served,
+with no fairness between agents."
+
+**Reproduction** (`/tmp/painhunt/p68`, 2 slots):
+- run A fans out into 8 groups of `sleep 4`;
+- a second later, run B, another agent's one-group `sleep 1`, is queued.
+
+Claims went by priority class, then oldest group, so B waited for all 8 of A's groups:
+```
+run B (1 group, 1s of work) took 16855 ms
+```
+
+**Fix.** Within a priority class, the next free worker takes a group from the run with the fewest
+groups running right now, then the oldest group. A run that fans out shares workers with the runs
+after it instead of holding them all.
+- **Merge queue runs keep strict oldest-first.** A lane's candidates (`tip+A`, `tip+A+B`, …) land
+  in order, so the oldest should finish, and fail, first. The review found this case.
+- **The priority classes are unchanged:** merge queue, then trusted runs, then the rest.
+- **No new starvation.** A started big run never drops to zero slots: when it has none running,
+  its older groups win the tie. Under a steady stream of small runs it keeps one slot.
+- **Indexed.** The count is backed by a new `(run_id, status)` index.
+
+**After:**
+```
+run B (1 group, 1s of work) took 4363 ms
+run A (8 groups x 4s on 2 slots) took 18137 ms
+```
+The unit test `a_run_that_fans_out_shares_workers_with_later_runs` checks:
+- a later one-group run goes before the big run's next group;
+- a merge queue run still goes before both;
+- a queue run's second group goes before a later queue run's first.
+
+It fails without the fairness term, and its queue assertion fails without the queue exemption.
+
+**Review.** Two independent rounds:
+1. **Round 1** found the fairness term also interleaved a merge queue lane's candidates. Queue
+   runs now stay oldest first. Its two nits are fixed: a stale doc comment, and a missing index.
+2. **Round 2: APPROVE.** A `rowid` tiebreak was added for groups created in the same millisecond.
+   Declined: dropping the now-redundant `groups_run` index.
+
+**Verdict: SOLVED** for fairness between runs. Limits:
+- Fairness is per run. Five runs from one agent count as five, so per-agent or per-repo shares
+  are not modelled.
+- A run's long macOS group counts against its Linux groups.

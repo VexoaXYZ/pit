@@ -1032,7 +1032,7 @@ impl Db {
                  ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
                    CASE WHEN runs.trigger = 'queue' THEN 0 ELSE (SELECT COUNT(*) FROM groups_ busy
                      WHERE busy.run_id = groups_.run_id AND busy.status = 'running') END,
-                   groups_.created_at",
+                   groups_.created_at, groups_.rowid",
             )?;
             let mut rows = st.query_map(params![worker.os, now], |r| {
                 Ok((
