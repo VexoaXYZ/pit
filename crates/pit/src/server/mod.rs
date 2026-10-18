@@ -92,10 +92,13 @@ impl App {
     ) -> Result<Arc<App>> {
         std::fs::create_dir_all(data_dir)?;
         let db = Db::open(&data_dir.join("pit.db"))?;
-        if token.is_some() && db.demote_shared_trusted_results_once()? {
+        if token.is_none() {
+            db.forget_shared_trusted_demotion()?;
+        } else if db.demote_shared_trusted_results_once()? {
             tracing::info!(
-                "trusted cache results from before per-repo trust were kept for untrusted \
-                 runs only; each repo's next trusted run rebuilds them"
+                "trusted cache results from before per-repo trust (or from a time without \
+                 an API token) were kept for untrusted runs only; each repo's next trusted \
+                 run rebuilds them"
             );
         }
         let cas = Cas::open(data_dir.join("cas"))?;

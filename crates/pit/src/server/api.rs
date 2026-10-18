@@ -819,6 +819,16 @@ async fn claim(
 /// (the run was cancelled or requeued) is refused rather than treated as
 /// untrusted, which would let a trusted job read untrusted results.
 ///
+/// Action keys are digests. Anything else (`u:…`, `r:…`) would name a row
+/// of another scope directly.
+fn action_key(key: &str) -> ApiResult<()> {
+    if crate::cas::is_digest(key) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{key:?} is not an action key").into())
+    }
+}
+
 /// See `App::cache_scope`.
 fn cache_trust(app: &App, headers: &HeaderMap) -> ApiResult<super::db::CacheScope> {
     match lease(headers) {
@@ -838,6 +848,7 @@ async fn cache_get(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<CacheEntry>> {
+    action_key(&key)?;
     let scope = cache_trust(&app, &headers)?;
     app.db
         .cache_find(&key, &scope)?
@@ -875,6 +886,7 @@ async fn cache_put(
             );
         }
     }
+    action_key(&key)?;
     let scope = cache_trust(&app, &headers)?;
     let stored = app.db.cache_put(&key, &scope, &entry)?;
     // Whoever was waiting on this key finds the result now.
@@ -1090,6 +1102,7 @@ async fn cache_claim(
     headers: HeaderMap,
     Json(body): Json<ClaimBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    action_key(&key)?;
     let scope = cache_trust(&app, &headers)?;
     // The row it would be stored under: one claim per scope.
     let slot = scope.write_key(&key);

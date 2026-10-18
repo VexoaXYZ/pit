@@ -121,12 +121,12 @@ CREATE TABLE IF NOT EXISTS cache (
   last_hit_at INTEGER
 );
 
--- Key-value index into the CAS for the Turborepo and Bazel cache protocols.
--- One-time steps already done (`Db::once`).
+-- One-time steps already done (see `demote_shared_trusted_results_once`).
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY
 );
 
+-- Key-value index into the CAS for the Turborepo and Bazel cache protocols.
 CREATE TABLE IF NOT EXISTS kv (
   ns TEXT NOT NULL,
   key TEXT NOT NULL,
@@ -1674,8 +1674,6 @@ impl Db {
         Ok(stored)
     }
 
-    /// The row key a run may use for an action key: trusted runs only see
-    /// trusted results, untrusted runs see both (trusted first).
     pub fn set_run_no_secrets(&self, id: &str) -> Result<()> {
         self.conn
             .lock()
@@ -1808,6 +1806,8 @@ impl Db {
         Ok(())
     }
 
+    /// The row a run of this scope may use for an action key, most trusted
+    /// first (see `CacheScope::read_keys`).
     pub fn cache_find(&self, key: &str, scope: &CacheScope) -> Result<Option<String>> {
         let c = self.conn.lock();
         for k in &scope.read_keys(key) {
@@ -2410,19 +2410,30 @@ impl Db {
             return Ok(false);
         }
         // `OR REPLACE`: an untrusted result under the same key gives way;
-        // both are untrusted now.
+        // both are untrusted now. `r:` rows included: none existed before
+        // this step, so any is one a caller named directly.
         tx.execute(
             "UPDATE OR REPLACE cache SET action_key = 'u:' || action_key
-             WHERE action_key NOT LIKE 'u:%' AND action_key NOT LIKE 'r:%'",
+             WHERE substr(action_key, 1, 2) <> 'u:'",
             [],
         )?;
         tx.execute(
             "UPDATE kv SET digest = 'u:' || digest
-             WHERE ns = 'last' AND digest NOT LIKE 'u:%' AND digest NOT LIKE 'r:%'",
+             WHERE ns = 'last' AND substr(digest, 1, 2) <> 'u:'",
             [],
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Started without an API token: whatever trusted runs store now is
+    /// demoted again if the server is shared later.
+    pub fn forget_shared_trusted_demotion(&self) -> Result<()> {
+        self.conn.lock().execute(
+            "DELETE FROM meta WHERE key = 'p66-shared-trusted-demoted'",
+            [],
+        )?;
+        Ok(())
     }
 
     /// Claims a schedule slot. False if this minute already fired.
@@ -3079,7 +3090,14 @@ mod stats_tests {
         db.cache_put("b", &shared, &entry).unwrap();
         db.cache_put("b", &CacheScope::UNTRUSTED, &entry).unwrap();
         db.kv_put("last", "scope", "a").unwrap();
+        // Planted before per-repo namespaces existed, by naming the row.
+        db.cache_put("r:repo_z:d", &shared, &entry).unwrap();
         assert!(db.demote_shared_trusted_results_once().unwrap());
+        let own_z = CacheScope {
+            trusted: true,
+            repo: Some("repo_z".into()),
+        };
+        assert_eq!(db.cache_find("d", &own_z).unwrap(), None);
         assert_eq!(db.cache_find("a", &shared).unwrap(), None);
         assert_eq!(db.cache_find("b", &shared).unwrap(), None);
         assert_eq!(
@@ -3093,6 +3111,10 @@ mod stats_tests {
         db.cache_put("c", &shared, &entry).unwrap();
         assert!(!db.demote_shared_trusted_results_once().unwrap());
         assert_eq!(db.cache_find("c", &shared).unwrap().as_deref(), Some("c"));
+        // A tokenless spell, then shared again: demoted again.
+        db.forget_shared_trusted_demotion().unwrap();
+        assert!(db.demote_shared_trusted_results_once().unwrap());
+        assert_eq!(db.cache_find("c", &shared).unwrap(), None);
     }
 
     #[test]

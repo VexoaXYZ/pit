@@ -4864,3 +4864,25 @@ fn repos_whose_names_fold_together_get_separate_workspaces() {
     );
     assert!(pit::worker::repo_dir_for_test("acme/web").starts_with("acme_web-"));
 }
+
+/// Cache routes take action keys (digests) only: a prefixed key would name
+/// another scope's row directly (`u:` untrusted, `r:<repo>:` a repo's own).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_routes_refuse_keys_that_are_not_digests() {
+    let pit = start().await;
+    let d = "0".repeat(64);
+    for key in [format!("u:{d}"), format!("r:repo_abc:{d}")] {
+        let err = pit
+            .client
+            .get::<serde_json::Value>(&format!("/api/cache/{key}"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not an action key"), "{err:#}");
+    }
+    let err = pit
+        .client
+        .get::<serde_json::Value>(&format!("/api/cache/{d}"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("404"), "{err:#}");
+}
