@@ -3685,3 +3685,56 @@ cleaned up. Limits:
 - They're per worker, not shared across workers.
 - State in `$HOME` can leak between runs of the same pool, as warm workspaces can. `pit verify`
   is the check.
+
+## P60. GitHub's secondary rate limits: CI bots blocked from posting statuses
+
+**The pain.** GitHub limits content creation to about 80 requests a minute and 500 an hour, apart
+from the primary quota
+([REST rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api),
+[troubleshooting](https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api)).
+Past that, writes fail with "You have exceeded a secondary rate limit and have been temporarily
+blocked from content creation", even with thousands of primary requests left
+([community #32120](https://github.com/orgs/community/discussions/32120),
+[#60208](https://github.com/orgs/community/discussions/60208)).
+
+Tools keep adding the retry they lacked:
+- [gca#12](https://github.com/jacksonwade/gca/pull/12) and
+  [BuildIT#136](https://github.com/tanmayiift/BuildIT/pull/136): wait out `Retry-After`, or 60s
+  when GitHub only says so in the message;
+- [Dev Proxy](https://learn.microsoft.com/en-us/microsoft-cloud/dev/dev-proxy/how-to/test-github-api-rate-limit-handling),
+  [lunar.dev](https://www.lunar.dev/post/a-developers-guide-managing-rate-limits-for-the-github-api),
+  [fast.io](https://fast.io/resources/github-api-rate-limiting-strategies/).
+
+A CI system posting checks is exactly such a writer.
+
+**Reproduction.** e2e `github_reporting_posts_each_change_once`: a PR run of 20 groups against a
+mock GitHub (token mode) that counts `POST /statuses`. Before, Pit re-posted every group's status
+on every claim and every group finish: **820 calls** for one run, about 2N² + 2N. That is past the
+hourly limit in a single run. A refused call also aborted the rest of that report, and nothing
+tried again: a final "passed" could be lost and the check left "pending".
+
+**Fix.**
+- **Each group's check is posted only when what GitHub would show changes.** For a commit status
+  that's its state and description; for a check run, its whole output. The last state posted is
+  remembered per group, and one report of a run runs at a time, so concurrent claims can't both
+  post the same thing.
+- **P56's reposts still happen.** A left-out copy's post (counted per commit and group) and a
+  newer left-out check run (App auth) change the real group's key, so it posts again.
+- **Rate limits are retried.** A 403 or 429 carrying `Retry-After`, or saying "rate limit", now
+  schedules the run's report again in the background after that wait (60s without one, at most
+  5 minutes), once per run, with the latest state. Nothing waits in the request that triggered
+  it.
+
+**Measured.**
+- The same 20-group run now posts **60–62** statuses (three runs: 62, 61, 60), about 3 per group:
+  queued, running, done.
+- e2e `rate_limited_reports_are_retried`: the mock refuses the first 8 posts with 403 and
+  `Retry-After: 1`. All three groups still end at their final status (`success`, `success`,
+  `failure`). With the retry disabled, all three final statuses were lost.
+- The P56 race tests still pass.
+
+**Verdict: SOLVED** for Pit's own reporting. Limits:
+- The memory of what was posted is in-process: after a server restart, the first report of a run
+  posts every group once more.
+- There's no global request budget across runs, so many large runs at once can still meet the
+  limit. They then wait and retry rather than lose checks.

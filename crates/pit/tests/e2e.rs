@@ -4106,3 +4106,242 @@ async fn first_log(pit: &Pit, view: &RunView) -> String {
         .await
         .unwrap()
 }
+
+/// Reporting a run posts each group's status only when it changed: queued,
+/// running, done. Re-posting every group on every event would be about 2N²
+/// calls for N groups, and GitHub's secondary rate limits stop that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn github_reporting_posts_each_change_once() {
+    use axum::routing::post;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    let mock = axum::Router::new().route(
+        "/repos/acme/many/statuses/{sha}",
+        post(move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(serde_json::json!({}))
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await });
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github = pit::server::github::GitHub::with_token(&mock_url, "t", None).unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("many".into()),
+        data_dir: data.path().join("worker"),
+        slots: 4,
+        parallelism: 1,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let repo = tempfile::tempdir().unwrap();
+    let groups: serde_json::Map<String, serde_json::Value> = (0..20)
+        .map(|i| {
+            (
+                format!("g{i:02}"),
+                serde_json::json!({ "tasks": { "t": { "run": "true", "cache": false } } }),
+            )
+        })
+        .collect();
+    write(
+        repo.path(),
+        "pit.config.json",
+        &serde_json::json!({ "groups": groups }).to_string(),
+    );
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    app.db
+        .upsert_repo(
+            "acme/many",
+            Some(&repo.path().to_string_lossy()),
+            Some("acme/many"),
+        )
+        .unwrap();
+    let id = app
+        .create_run(
+            CreateRun {
+                repo: "acme/many".into(),
+                url: None,
+                sha,
+                overlay: None,
+                tasks: vec![],
+                trigger: Some("pr".into()),
+                git_ref: Some("pull/1".into()),
+                no_cache: false,
+                fresh: false,
+                debug: false,
+                counts_as: None,
+                no_secrets: false,
+                trusted: false,
+            },
+            Some(1),
+        )
+        .await
+        .unwrap();
+    let client = Client::new(&base, None).unwrap();
+    let view = tokio::time::timeout(
+        Duration::from_secs(120),
+        pit::cli::wait(&client, &id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(view.status, Status::Passed);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let n = calls.load(std::sync::atomic::Ordering::SeqCst);
+    eprintln!("status calls for 20 groups: {n}");
+    // About three changes per group (queued, running, passed), not O(N²):
+    // re-posting every group on every event was 820 calls here.
+    assert!(n <= 20 * 4, "{n} calls");
+}
+
+/// A secondary rate limit from GitHub (403 with Retry-After) does not lose
+/// a check: the run is reported again after the wait, and every group ends
+/// with its final status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rate_limited_reports_are_retried() {
+    use axum::routing::post;
+    type Seen = std::sync::Arc<parking_lot::Mutex<Vec<serde_json::Value>>>;
+    let seen: Seen = Default::default();
+    let refused = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (s, r) = (seen.clone(), refused.clone());
+    let mock = axum::Router::new().route(
+        "/repos/acme/limited/statuses/{sha}",
+        post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+            let (s, r) = (s.clone(), r.clone());
+            async move {
+                // The first eight requests hit the limit.
+                if r.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 8 {
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        [("retry-after", "1")],
+                        "You have exceeded a secondary rate limit",
+                    )
+                        .into_response();
+                }
+                s.lock().push(b);
+                axum::Json(serde_json::json!({})).into_response()
+            }
+        }),
+    );
+    use axum::response::IntoResponse;
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await });
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github = pit::server::github::GitHub::with_token(&mock_url, "t", None).unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("limited".into()),
+        data_dir: data.path().join("worker"),
+        slots: 2,
+        parallelism: 1,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let repo = tempfile::tempdir().unwrap();
+    let config = serde_json::json!({ "groups": {
+        "a": { "tasks": { "t": { "run": "true", "cache": false } } },
+        "b": { "tasks": { "t": { "run": "true", "cache": false } } },
+        "c": { "tasks": { "t": { "run": "exit 1", "cache": false } } },
+    } });
+    write(repo.path(), "pit.config.json", &config.to_string());
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    app.db
+        .upsert_repo(
+            "acme/limited",
+            Some(&repo.path().to_string_lossy()),
+            Some("acme/limited"),
+        )
+        .unwrap();
+    let id = app
+        .create_run(
+            CreateRun {
+                repo: "acme/limited".into(),
+                url: None,
+                sha,
+                overlay: None,
+                tasks: vec![],
+                trigger: Some("pr".into()),
+                git_ref: Some("pull/1".into()),
+                no_cache: false,
+                fresh: false,
+                debug: false,
+                counts_as: None,
+                no_secrets: false,
+                trusted: false,
+            },
+            Some(1),
+        )
+        .await
+        .unwrap();
+    let client = Client::new(&base, None).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&client, &id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let last = |ctx: &str| {
+        seen.lock()
+            .iter()
+            .rev()
+            .find(|b| b["context"] == ctx)
+            .map(|b| b["state"].as_str().unwrap_or_default().to_string())
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while last("pit / a").as_deref() != Some("success")
+            || last("pit / b").as_deref() != Some("success")
+            || last("pit / c").as_deref() != Some("failure")
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "final statuses were lost: a={:?} b={:?} c={:?}",
+            last("pit / a"),
+            last("pit / b"),
+            last("pit / c")
+        )
+    });
+    assert!(refused.load(std::sync::atomic::Ordering::SeqCst) >= 8);
+}

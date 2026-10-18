@@ -36,6 +36,18 @@ enum Auth {
     Token(String),
 }
 
+/// GitHub asked to wait this many seconds (a secondary rate limit).
+#[derive(Debug)]
+struct RateLimited(u64);
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GitHub rate limit: retry in {}s", self.0)
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
 pub struct GitHub {
     api: String,
     auth: Auth,
@@ -43,6 +55,18 @@ pub struct GitHub {
     http: reqwest::Client,
     /// Installation tokens by repo full name, with expiry (ms).
     tokens: Mutex<std::collections::HashMap<String, (String, i64)>>,
+    /// What each group's check last said, so a report that would post the
+    /// same again is skipped: re-posting every group on every event is
+    /// O(groups²) calls per run, and GitHub's secondary rate limits stop it.
+    reported: Mutex<std::collections::HashMap<String, u64>>,
+    /// Left-out copies (`on`) posted per commit and group name: a real
+    /// group's check must be posted again after one.
+    left_out_posts: Mutex<std::collections::HashMap<String, u64>>,
+    /// One report of a run at a time (claims report concurrently), so two
+    /// reports cannot both see a stale `reported` and post the same twice.
+    run_locks: Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Runs with a report waiting out a rate limit.
+    retrying: Mutex<std::collections::HashSet<String>>,
 }
 
 impl GitHub {
@@ -78,6 +102,10 @@ impl GitHub {
                 .user_agent("pit-ci")
                 .build()?,
             tokens: Default::default(),
+            reported: Default::default(),
+            left_out_posts: Default::default(),
+            run_locks: Default::default(),
+            retrying: Default::default(),
         }))
     }
 
@@ -95,6 +123,10 @@ impl GitHub {
                 .user_agent("pit-ci")
                 .build()?,
             tokens: Default::default(),
+            reported: Default::default(),
+            left_out_posts: Default::default(),
+            run_locks: Default::default(),
+            retrying: Default::default(),
         })
     }
 
@@ -109,6 +141,10 @@ impl GitHub {
                 .user_agent("pit-ci")
                 .build()?,
             tokens: Default::default(),
+            reported: Default::default(),
+            left_out_posts: Default::default(),
+            run_locks: Default::default(),
+            retrying: Default::default(),
         })
     }
 
@@ -186,7 +222,19 @@ impl GitHub {
             .send()
             .await?;
         let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
         let text = resp.text().await.unwrap_or_default();
+        // GitHub's secondary limits (80 content-creating requests a minute):
+        // a 403 or 429 that says so, or carries Retry-After.
+        let limited = matches!(status.as_u16(), 403 | 429)
+            && (retry_after.is_some() || text.to_ascii_lowercase().contains("rate limit"));
+        if limited {
+            return Err(RateLimited(retry_after.unwrap_or(60)).into());
+        }
         if !status.is_success() {
             bail!("GitHub {path} returned {status}: {text}");
         }
@@ -214,8 +262,52 @@ impl GitHub {
 
     /// Mirrors a run's groups to GitHub. Errors are logged, never fatal.
     pub async fn report_run(&self, app: &Arc<App>, run_id: &str) {
-        if let Err(e) = self.try_report_run(app, run_id).await {
-            tracing::warn!("reporting {run_id} to GitHub failed: {e:#}");
+        if let Some(wait) = self.report_once(app, run_id).await {
+            // Rate limited: report again later (the latest state, whatever it
+            // is by then), once per run, without holding up the caller.
+            if !self.retrying.lock().insert(run_id.to_string()) {
+                return;
+            }
+            let (app, run_id) = (app.clone(), run_id.to_string());
+            tokio::spawn(async move {
+                let mut wait = wait;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(wait.clamp(1, 300))).await;
+                    let Some(gh) = &app.github else { return };
+                    match gh.report_once(&app, &run_id).await {
+                        Some(again) => wait = again,
+                        None => {
+                            gh.retrying.lock().remove(&run_id);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// One report of the run; `Some(seconds)` if GitHub asked to wait.
+    async fn report_once(&self, app: &Arc<App>, run_id: &str) -> Option<u64> {
+        let lock = {
+            let mut locks = self.run_locks.lock();
+            if locks.len() > 10_000 {
+                locks.retain(|_, l| std::sync::Arc::strong_count(l) > 1);
+            }
+            locks.entry(run_id.to_string()).or_default().clone()
+        };
+        let _one_at_a_time = lock.lock().await;
+        match self.try_report_run(app, run_id).await {
+            Ok(()) => None,
+            Err(e) => match e.downcast_ref::<RateLimited>() {
+                Some(RateLimited(wait)) => {
+                    tracing::warn!("GitHub rate limit reporting {run_id}; retrying in {wait}s");
+                    Some(*wait)
+                }
+                None => {
+                    tracing::warn!("reporting {run_id} to GitHub failed: {e:#}");
+                    None
+                }
+            },
         }
     }
 
@@ -268,6 +360,43 @@ impl GitHub {
             } else {
                 vec![]
             };
+            let copies_key = format!("{}\0{}\0{}", run.repo_id, run.sha, g.name);
+            let copies = self
+                .left_out_posts
+                .lock()
+                .get(&copies_key)
+                .copied()
+                .unwrap_or(0);
+            // A newer left-out check run (App auth) must be posted over.
+            let newest_copy = if left_out {
+                None
+            } else {
+                app.db
+                    .newest_left_out_check(&run.repo_id, &run.sha, &g.name)?
+            };
+            let said = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                // What GitHub is actually sent: a commit status carries the
+                // state and the summary's first line only.
+                let shown = match self.auth {
+                    Auth::Token(_) => summary.lines().next().unwrap_or_default(),
+                    Auth::App { .. } => summary.as_str(),
+                };
+                (
+                    status.as_str(),
+                    shown,
+                    left_out,
+                    annotations.len(),
+                    copies,
+                    newest_copy,
+                )
+                    .hash(&mut h);
+                h.finish()
+            };
+            if self.reported.lock().get(&g.id) == Some(&said) {
+                continue;
+            }
             self.report_one(
                 app,
                 &full,
@@ -280,6 +409,16 @@ impl GitHub {
                 &annotations,
             )
             .await?;
+            {
+                let mut reported = self.reported.lock();
+                if reported.len() > 50_000 {
+                    reported.clear();
+                }
+                reported.insert(g.id.clone(), said);
+            }
+            if left_out {
+                *self.left_out_posts.lock().entry(copies_key).or_default() += 1;
+            }
             // A run that really runs the group may have appeared while this
             // left-out copy was being posted: report it again, so its check
             // is the newest (it posts a new check run over this one).
@@ -970,6 +1109,10 @@ mod tests {
             webhook_secret: Some("It's a Secret to Everybody".into()),
             http: reqwest::Client::new(),
             tokens: Default::default(),
+            reported: Default::default(),
+            left_out_posts: Default::default(),
+            run_locks: Default::default(),
+            retrying: Default::default(),
         };
         // Example from GitHub's webhook documentation.
         let sig = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
