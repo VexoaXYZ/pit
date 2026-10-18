@@ -47,6 +47,38 @@ pub struct Workspace {
     pub last_used: SystemTime,
 }
 
+/// The containers' `$HOME` directories (`homes/<repo>/<pool>`), with when
+/// each was last used.
+pub fn scan_homes(root: &Path) -> Vec<Workspace> {
+    let mut found = Vec::new();
+    let Ok(repos) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for repo in repos
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+    {
+        let Ok(pools) = std::fs::read_dir(repo.path()) else {
+            continue;
+        };
+        for pool in pools.flatten() {
+            let name = pool.file_name();
+            if name.to_string_lossy().starts_with('.')
+                || !pool.file_type().is_ok_and(|t| t.is_dir())
+            {
+                continue;
+            }
+            let path = pool.path();
+            found.push(Workspace {
+                bytes: dir_size(&path),
+                last_used: last_used(&path),
+                path,
+            });
+        }
+    }
+    found
+}
+
 /// Every workspace under `root`: a directory with a `.git`, found at most
 /// three levels down (`<repo>/<group>/<n>`, or older layouts above it).
 pub fn scan(root: &Path) -> Vec<Workspace> {
@@ -156,6 +188,23 @@ mod tests {
             bytes: gb << 30,
             last_used: SystemTime::now() - Duration::from_secs(days_ago * 24 * 3600),
         }
+    }
+
+    #[test]
+    fn container_homes_are_found_and_aged() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("acme_web").join("untrusted");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("big"), vec![0u8; 8192]).unwrap();
+        touch_used(&home);
+        let found = scan_homes(root.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, home);
+        assert!(found[0].bytes >= 8192);
+        // Over budget and idle: chosen; used recently (busy): kept.
+        let now = SystemTime::now() + STALE_AFTER;
+        assert_eq!(plan(&found, |_| false, 1, now), [home.clone()]);
+        assert!(plan(&found, |_| true, 1, now).is_empty());
     }
 
     #[test]

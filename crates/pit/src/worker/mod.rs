@@ -480,6 +480,39 @@ impl Worker {
                 (total - freed) as f64 / 1e9
             );
         }
+        // Containers' `$HOME`s (tool caches): unused for two weeks, or the
+        // least recently used past what the workspaces left of the budget.
+        // Never one used in the last day: a running job may have it mounted.
+        let homes = disk::scan_homes(&self.data_dir.join("homes"));
+        let left = if self.workspace_max_bytes == 0 {
+            0
+        } else {
+            self.workspace_max_bytes
+                .saturating_sub(total - freed)
+                .max(1)
+        };
+        let recent = |p: &Path| {
+            homes.iter().any(|h| {
+                h.path == p
+                    && now
+                        .duration_since(h.last_used)
+                        .is_ok_and(|age| age < Duration::from_secs(86_400))
+            })
+        };
+        for path in disk::plan(&homes, recent, left, now) {
+            let bytes = homes
+                .iter()
+                .find(|h| h.path == path)
+                .map(|h| h.bytes)
+                .unwrap_or_default();
+            tracing::info!(
+                "removed container home {} ({:.1} GB)",
+                path.display(),
+                bytes as f64 / 1e9
+            );
+            let _ = std::fs::remove_dir_all(&path);
+            disk::remove_meta(&path);
+        }
         Ok(())
     }
 
@@ -1761,6 +1794,7 @@ impl Worker {
             .join(safe_name(&job.repo))
             .join(pool);
         std::fs::create_dir_all(&dir)?;
+        disk::touch_used(&dir);
         Ok(Some(dir))
     }
 }

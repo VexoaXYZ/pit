@@ -3672,9 +3672,16 @@ The rest of the time is npm resolving metadata over the network; `--prefer-offli
   - a `--fresh` run doesn't see it;
   - a trusted run of main starts with its own empty home.
 
-**Verdict: PARTIAL.** Container tool caches now persist per worker and trust pool. Limits:
-- The homes are not covered by workspace GC or `--workspace-max-gb`, so they grow until removed by
-  hand (8.4 MB here).
+**Cleanup** (added in the next commit). The workspace GC now covers homes too:
+- a home unused for 14 days is removed;
+- past `--workspace-max-gb` (what the workspaces leave of it), the least recently used homes go
+  first, but never one used in the last day, since a running job may have it mounted;
+- each home is touched when a job uses it.
+
+A unit test checks that homes are found, sized, aged, and kept while recent.
+
+**Verdict: PARTIAL.** Container tool caches now persist per worker, repo and trust pool, and are
+cleaned up. Limits:
 - They're per worker, not shared across workers.
 - State in `$HOME` can leak between runs of the same pool, as warm workspaces can. `pit verify`
   is the check.

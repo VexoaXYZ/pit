@@ -91,7 +91,7 @@ export default {
 | `secrets` | Secrets the task needs, by name: from the worker's `--secrets-file` (or its environment), masked in logs (plain, base64, double base64), not in the cache key. Never given to fork pull requests. |
 | `cache` | `"remote"` (default, shared by all workers), `"workspace"` (per warm workspace, for installs), or `false`. |
 | `backend` | `"host"` (default), `"sandbox"` (Linux PID, IPC, UTS and optional network namespaces), `"docker"`. |
-| `image` | Container image; implies `backend: "docker"`. The container's `$HOME` is `/pit-home`, a directory the worker keeps between runs (per repo: one for trusted runs, one for the rest), so `~/.npm`, `~/.cache/pip`, `~/.cargo` and Go's module cache stay warm. Fork and `--fresh` runs get an empty `/tmp` instead. |
+| `image` | Container image; implies `backend: "docker"`. The container's `$HOME` is `/pit-home`, a directory the worker keeps between runs (per repo: one for trusted runs, one for the rest), so `~/.npm`, `~/.cache/pip`, `~/.cargo` and Go's module cache stay warm. Fork and `--fresh` runs get an empty `/tmp` instead. Homes unused for two weeks are removed, and they count toward `--workspace-max-gb`. |
 | `network` | `false` cuts network access in `sandbox` and `docker`. |
 | `memory` | Memory limit for `docker` tasks, without swap (`"2g"`, `"512m"`): a local run hits the ceiling a small CI runner has. Any task killed by a signal says which, whether the kernel's OOM killer ran meanwhile, and the most memory its processes were seen using (Linux, sampled; not inside containers), instead of "exit 137". |
 | `timeout` | Seconds; default 3600, `0` for no limit. The whole process group is killed. |
