@@ -341,6 +341,15 @@ builds reaches a same-repo pull request, and it records no shard timings. "Re-ru
 keeps all of this, and a fork queued with `pit:merge` is queued at the labeled commit: a later
 push drops it from the queue instead of testing the new code with the queue's trust.
 
+The same container evaluates more than forks' configs. On a server started with an API token
+(`PIT_TOKEN`), a `pit.config.ts` is evaluated on the server only for a trusted run (default
+branch, merge queue, schedule) of a repo the GitHub webhook registered. Everything else runs in
+the container: `pit run` and other API runs, uploaded overlays, and schedules and queues of
+repos registered through the API. Any API token holder can send any of those, and a config
+evaluated on the server could read the server's files. So a shared server needs Docker on it for
+those `.ts` configs; `pit.config.json` needs nothing. A local `pit up` without a token
+evaluates on the host as before: its one user already runs the server.
+
 **Secrets on workers.** Every task inherits the worker's environment (minus `PIT_*`), so a
 token exported there can be read by any task, declared or not. Put secrets in
 `pit worker --secrets-file FILE` (`KEY=VALUE` lines, `PIT_SECRETS_FILE`) instead: those values

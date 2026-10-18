@@ -165,6 +165,17 @@ impl App {
             .clone()
     }
 
+    /// Whether a repo's `pit.config.ts` must be evaluated in the sandbox
+    /// rather than on the server. On a shared server (one with an API token),
+    /// only a trusted run of a repo registered by the GitHub webhook is
+    /// evaluated here: anyone with the API token can register a repo or send
+    /// an overlay, and a config evaluated on the server can read anything
+    /// the server can (its OIDC signing key, the GitHub App's key). A local
+    /// `pit up` without a token has one user, who already runs the server.
+    pub fn config_sandboxed(&self, repo: &db::Repo, trusted: bool) -> bool {
+        self.token.is_some() && !(trusted && repo.github.is_some())
+    }
+
     /// Loads the config for a commit, preferring a version from the overlay.
     pub async fn load_config(
         &self,
@@ -421,7 +432,13 @@ impl App {
             .map(|d| self.load_overlay(d))
             .transpose()?;
         let config = self
-            .load_config(&mirror, &req.sha, overlay.as_ref(), req.no_secrets)
+            .load_config(
+                &mirror,
+                &req.sha,
+                overlay.as_ref(),
+                // `trusted` as `create_run` stored it (never with an overlay).
+                req.no_secrets || self.config_sandboxed(repo, req.trusted && req.overlay.is_none()),
+            )
             .await?;
         let t_config = t0.elapsed();
         // `on`: which groups this kind of run includes. Tasks named on the
@@ -881,6 +898,42 @@ pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) ->
     tracing::info!("pit server listening on {}", app.public_url);
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod config_sandbox_tests {
+    use super::*;
+
+    #[test]
+    fn shared_servers_evaluate_only_trusted_github_configs_on_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = |github: Option<&str>| db::Repo {
+            id: "r".into(),
+            name: "r".into(),
+            url: "u".into(),
+            github: github.map(String::from),
+        };
+        let (gh, local) = (repo(Some("acme/web")), repo(None));
+        let shared = App::with_github(
+            &dir.path().join("a"),
+            Some("tok".into()),
+            "http://x".into(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !shared.config_sandboxed(&gh, true),
+            "main of a webhook repo"
+        );
+        assert!(shared.config_sandboxed(&gh, false), "an API run or overlay");
+        assert!(
+            shared.config_sandboxed(&local, true),
+            "a repo any API caller registered"
+        );
+        // `pit up` without a token: its one user already runs the server.
+        let solo = App::with_github(&dir.path().join("b"), None, "http://x".into(), None).unwrap();
+        assert!(!solo.config_sandboxed(&local, false));
+    }
 }
 
 #[cfg(test)]

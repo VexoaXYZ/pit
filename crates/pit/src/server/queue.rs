@@ -678,7 +678,12 @@ impl Queue<'_> {
             let changed = git::changed_files(&self.mirror, &self.tip, &merged).await?;
             let config = match self
                 .app
-                .load_config(&self.mirror, &merged, None, false)
+                .load_config(
+                    &self.mirror,
+                    &merged,
+                    None,
+                    self.app.config_sandboxed(self.repo, true),
+                )
                 .await
             {
                 Ok(c) => c,
