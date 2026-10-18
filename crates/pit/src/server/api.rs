@@ -819,16 +819,12 @@ async fn claim(
 /// (the run was cancelled or requeued) is refused rather than treated as
 /// untrusted, which would let a trusted job read untrusted results.
 ///
-/// The trusted namespace is shared by every repo (keys hold no repo), so on
-/// a shared server only GitHub repos' trusted runs write it: a repo anyone
-/// with the API token can register gets trusted runs on its own default
-/// branch, and could otherwise plant a result under a key another repo's
-/// main computes. Its runs read trusted results and write their own.
-fn cache_trust(app: &App, headers: &HeaderMap) -> ApiResult<bool> {
+/// See `App::cache_scope`.
+fn cache_trust(app: &App, headers: &HeaderMap) -> ApiResult<super::db::CacheScope> {
     match lease(headers) {
-        None => Ok(false),
+        None => Ok(super::db::CacheScope::UNTRUSTED),
         Some(l) => match app.db.lease_trust(l)? {
-            Some((trusted, github)) => Ok(trusted && (github || app.token.is_none())),
+            Some((trusted, repo, github)) => Ok(app.cache_scope(&repo, github, trusted)),
             None => Err(ApiError(
                 StatusCode::CONFLICT,
                 anyhow::anyhow!("this job's lease is no longer live"),
@@ -842,9 +838,9 @@ async fn cache_get(
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<CacheEntry>> {
-    let trusted = cache_trust(&app, &headers)?;
+    let scope = cache_trust(&app, &headers)?;
     app.db
-        .cache_find(&key, trusted)?
+        .cache_find(&key, &scope)?
         .map(|stored| app.db.cache_get(&stored))
         .transpose()?
         .flatten()
@@ -879,12 +875,10 @@ async fn cache_put(
             );
         }
     }
-    let trusted = cache_trust(&app, &headers)?;
-    let stored = app.db.cache_put(&key, trusted, &entry)?;
+    let scope = cache_trust(&app, &headers)?;
+    let stored = app.db.cache_put(&key, &scope, &entry)?;
     // Whoever was waiting on this key finds the result now.
-    app.inflight
-        .lock()
-        .remove(&format!("{}:{key}", u8::from(trusted)));
+    app.inflight.lock().remove(&stored);
     if let Some(scope) = q.scope.filter(|s| crate::cas::is_digest(s)) {
         app.db.kv_put("last", &scope, &stored)?;
     }
@@ -1096,12 +1090,13 @@ async fn cache_claim(
     headers: HeaderMap,
     Json(body): Json<ClaimBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let trusted = cache_trust(&app, &headers)?;
-    let slot = format!("{}:{key}", u8::from(trusted));
+    let scope = cache_trust(&app, &headers)?;
+    // The row it would be stored under: one claim per scope.
+    let slot = scope.write_key(&key);
     // Check and claim under one guard, so two claims cannot both win.
     let mut inflight = app.inflight.lock();
     // The result may have landed since the caller looked: go get it.
-    if app.db.cache_find(&key, trusted)?.is_some() {
+    if app.db.cache_find(&key, &scope)?.is_some() {
         return Ok(Json(serde_json::json!({ "wait": true })));
     }
     if let Some(holder) = inflight.get(&slot).filter(|h| **h != body.task) {

@@ -122,6 +122,11 @@ CREATE TABLE IF NOT EXISTS cache (
 );
 
 -- Key-value index into the CAS for the Turborepo and Bazel cache protocols.
+-- One-time steps already done (`Db::once`).
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS kv (
   ns TEXT NOT NULL,
   key TEXT NOT NULL,
@@ -392,6 +397,46 @@ fn migrate(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Which cached results a run may read, and where its own go (P20, P66).
+/// Trusted results are shared by every repo, since keys hold no repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheScope {
+    pub trusted: bool,
+    /// For a repo whose trusted runs may not write the shared trusted
+    /// results (see `App::cache_scope`): its own trusted namespace, which
+    /// its runs read and its trusted runs write.
+    pub repo: Option<String>,
+}
+
+impl CacheScope {
+    pub const UNTRUSTED: CacheScope = CacheScope {
+        trusted: false,
+        repo: None,
+    };
+
+    /// The row key a result of this scope is stored under.
+    pub fn write_key(&self, key: &str) -> String {
+        match (self.trusted, &self.repo) {
+            (true, None) => key.to_string(),
+            (true, Some(r)) => format!("r:{r}:{key}"),
+            (false, _) => format!("u:{key}"),
+        }
+    }
+
+    /// The row keys it may read, most trusted first. A trusted run never
+    /// reads untrusted results; a repo's own namespace is read only by it.
+    fn read_keys(&self, key: &str) -> Vec<String> {
+        let mut keys = vec![key.to_string()];
+        if let Some(r) = &self.repo {
+            keys.push(format!("r:{r}:{key}"));
+        }
+        if !self.trusted {
+            keys.push(format!("u:{key}"));
+        }
+        keys
+    }
 }
 
 /// SQL condition: the task's group is running under the lease in `?4`.
@@ -1618,14 +1663,10 @@ impl Db {
         Ok(entry.and_then(|e| serde_json::from_str(&e).ok()))
     }
 
-    /// Stores a result and returns the row key it went under: the action key
-    /// for trusted runs, `u:<key>` for untrusted ones.
-    pub fn cache_put(&self, key: &str, trusted: bool, entry: &CacheEntry) -> Result<String> {
-        let stored = if trusted {
-            key.to_string()
-        } else {
-            format!("u:{key}")
-        };
+    /// Stores a result and returns the row key it went under (see
+    /// `CacheScope::write_key`).
+    pub fn cache_put(&self, key: &str, scope: &CacheScope, entry: &CacheEntry) -> Result<String> {
+        let stored = scope.write_key(key);
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO cache (action_key, entry, created_at) VALUES (?1, ?2, ?3)",
             params![stored, serde_json::to_string(entry)?, now_ms()],
@@ -1767,15 +1808,13 @@ impl Db {
         Ok(())
     }
 
-    pub fn cache_find(&self, key: &str, trusted: bool) -> Result<Option<String>> {
+    pub fn cache_find(&self, key: &str, scope: &CacheScope) -> Result<Option<String>> {
         let c = self.conn.lock();
-        let untrusted = format!("u:{key}");
-        let candidates: &[&str] = if trusted { &[key] } else { &[key, &untrusted] };
-        for k in candidates {
+        for k in &scope.read_keys(key) {
             if c.prepare_cached("SELECT 1 FROM cache WHERE action_key = ?1")?
                 .exists(params![k])?
             {
-                return Ok(Some(k.to_string()));
+                return Ok(Some(k.clone()));
             }
         }
         Ok(None)
@@ -1871,21 +1910,26 @@ impl Db {
             .optional()?)
     }
 
-    /// Whether the group holding this live lease belongs to a trusted run;
+    /// The trust and repo of the run whose group holds this live lease:
+    /// `(trusted, repo id, whether the repo came from the GitHub webhook)`;
     /// `None` if no running group holds it.
-    /// Whether a live lease's run is trusted, and whether its repo came from
-    /// the GitHub webhook: `(trusted, github)`.
-    pub fn lease_trust(&self, lease: &str) -> Result<Option<(bool, bool)>> {
+    pub fn lease_trust(&self, lease: &str) -> Result<Option<(bool, String, bool)>> {
         Ok(self
             .conn
             .lock()
             .query_row(
-                "SELECT runs.trusted, repos.github IS NOT NULL FROM groups_
+                "SELECT runs.trusted, repos.id, repos.github IS NOT NULL FROM groups_
                  JOIN runs ON runs.id = groups_.run_id
                  JOIN repos ON repos.id = runs.repo_id
                  WHERE groups_.lease = ?1 AND groups_.status = 'running'",
                 params![lease],
-                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? != 0,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                    ))
+                },
             )
             .optional()?)
     }
@@ -2349,6 +2393,36 @@ impl Db {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?)
+    }
+
+    /// On a shared server, results that trusted runs stored before each
+    /// repo got its own trusted namespace (P66) may have come from a repo
+    /// anyone with the API token registered. Keep them, but only for
+    /// untrusted runs, once. Costs every repo one cold trusted run.
+    pub fn demote_shared_trusted_results_once(&self) -> Result<bool> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let done = tx.execute(
+            "INSERT OR IGNORE INTO meta (key) VALUES ('p66-shared-trusted-demoted')",
+            [],
+        )? == 0;
+        if done {
+            return Ok(false);
+        }
+        // `OR REPLACE`: an untrusted result under the same key gives way;
+        // both are untrusted now.
+        tx.execute(
+            "UPDATE OR REPLACE cache SET action_key = 'u:' || action_key
+             WHERE action_key NOT LIKE 'u:%' AND action_key NOT LIKE 'r:%'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE kv SET digest = 'u:' || digest
+             WHERE ns = 'last' AND digest NOT LIKE 'u:%' AND digest NOT LIKE 'r:%'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Claims a schedule slot. False if this minute already fired.
@@ -2921,16 +2995,104 @@ mod stats_tests {
             duration_ms: ms,
             inputs: None,
         };
+        let trusted = CacheScope {
+            trusted: true,
+            repo: None,
+        };
         // A branch caches a result under the key main will compute.
-        assert_eq!(db.cache_put("k", false, &entry(1)).unwrap(), "u:k");
-        assert_eq!(db.cache_find("k", true).unwrap(), None);
-        assert_eq!(db.cache_find("k", false).unwrap().as_deref(), Some("u:k"));
+        assert_eq!(
+            db.cache_put("k", &CacheScope::UNTRUSTED, &entry(1))
+                .unwrap(),
+            "u:k"
+        );
+        assert_eq!(db.cache_find("k", &trusted).unwrap(), None);
+        assert_eq!(
+            db.cache_find("k", &CacheScope::UNTRUSTED)
+                .unwrap()
+                .as_deref(),
+            Some("u:k")
+        );
         // Main's own result is shared with everyone and preferred.
-        assert_eq!(db.cache_put("k", true, &entry(2)).unwrap(), "k");
-        assert_eq!(db.cache_find("k", true).unwrap().as_deref(), Some("k"));
-        assert_eq!(db.cache_find("k", false).unwrap().as_deref(), Some("k"));
+        assert_eq!(db.cache_put("k", &trusted, &entry(2)).unwrap(), "k");
+        assert_eq!(db.cache_find("k", &trusted).unwrap().as_deref(), Some("k"));
+        assert_eq!(
+            db.cache_find("k", &CacheScope::UNTRUSTED)
+                .unwrap()
+                .as_deref(),
+            Some("k")
+        );
         // A lease no running group holds proves nothing.
         assert_eq!(db.lease_trust("forged").unwrap(), None);
+
+        // A repo with its own trusted namespace (P66): its trusted runs
+        // write there, and read the shared trusted results but never a
+        // branch's; nobody else reads its namespace.
+        let own = |trusted| CacheScope {
+            trusted,
+            repo: Some("repo_a".into()),
+        };
+        assert_eq!(
+            db.cache_put("j", &CacheScope::UNTRUSTED, &entry(1))
+                .unwrap(),
+            "u:j"
+        );
+        assert_eq!(db.cache_find("j", &own(true)).unwrap(), None);
+        assert_eq!(
+            db.cache_put("j", &own(true), &entry(2)).unwrap(),
+            "r:repo_a:j"
+        );
+        assert_eq!(
+            db.cache_find("j", &own(true)).unwrap().as_deref(),
+            Some("r:repo_a:j")
+        );
+        assert_eq!(
+            db.cache_find("j", &own(false)).unwrap().as_deref(),
+            Some("r:repo_a:j")
+        );
+        assert_eq!(db.cache_find("j", &trusted).unwrap(), None);
+        assert_eq!(
+            db.cache_find("j", &CacheScope::UNTRUSTED)
+                .unwrap()
+                .as_deref(),
+            Some("u:j")
+        );
+        assert_eq!(
+            db.cache_find("k", &own(true)).unwrap().as_deref(),
+            Some("k")
+        );
+    }
+
+    #[test]
+    fn shared_trusted_results_are_demoted_once() {
+        let db = Db::memory().unwrap();
+        let entry = CacheEntry {
+            log_digest: None,
+            outputs: vec![],
+            duration_ms: 1,
+            inputs: None,
+        };
+        let shared = CacheScope {
+            trusted: true,
+            repo: None,
+        };
+        db.cache_put("a", &shared, &entry).unwrap();
+        db.cache_put("b", &shared, &entry).unwrap();
+        db.cache_put("b", &CacheScope::UNTRUSTED, &entry).unwrap();
+        db.kv_put("last", "scope", "a").unwrap();
+        assert!(db.demote_shared_trusted_results_once().unwrap());
+        assert_eq!(db.cache_find("a", &shared).unwrap(), None);
+        assert_eq!(db.cache_find("b", &shared).unwrap(), None);
+        assert_eq!(
+            db.cache_find("a", &CacheScope::UNTRUSTED)
+                .unwrap()
+                .as_deref(),
+            Some("u:a")
+        );
+        assert_eq!(db.kv_get("last", "scope").unwrap().as_deref(), Some("u:a"));
+        // Once: results stored after it stay trusted.
+        db.cache_put("c", &shared, &entry).unwrap();
+        assert!(!db.demote_shared_trusted_results_once().unwrap());
+        assert_eq!(db.cache_find("c", &shared).unwrap().as_deref(), Some("c"));
     }
 
     #[test]
@@ -2938,7 +3100,10 @@ mod stats_tests {
         let db = Db::memory().unwrap();
         db.cache_put(
             "k",
-            true,
+            &CacheScope {
+                trusted: true,
+                repo: None,
+            },
             &CacheEntry {
                 log_digest: None,
                 outputs: vec![],

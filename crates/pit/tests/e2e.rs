@@ -4835,13 +4835,20 @@ async fn api_registered_repos_never_write_the_shared_trusted_cache() {
             .unwrap();
         assert_eq!(v.status, Status::Passed, "{v:?}");
         let key = v.groups[0].tasks[0].action_key.clone().expect("a key");
-        let trusted_entry = app.db.cache_find(&key, true).unwrap();
+        let shared = pit::server::db::CacheScope {
+            trusted: true,
+            repo: None,
+        };
+        let trusted_entry = app.db.cache_find(&key, &shared).unwrap();
         match token {
             Some(_) => {
                 assert_eq!(trusted_entry, None, "wrote the shared trusted cache");
+                // Its own trusted namespace, which its next runs read.
+                let repo_id = app.db.repos().unwrap()[0].id.clone();
+                let own = app.cache_scope(&repo_id, false, true);
                 assert_eq!(
-                    app.db.cache_find(&key, false).unwrap(),
-                    Some(format!("u:{key}"))
+                    app.db.cache_find(&key, &own).unwrap(),
+                    Some(format!("r:{repo_id}:{key}"))
                 );
             }
             None => assert_eq!(trusted_entry, Some(key)),

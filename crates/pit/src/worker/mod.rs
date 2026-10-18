@@ -268,13 +268,16 @@ impl Shutdown {
 
 /// A repo's directory name: readable, plus a hash of the full name, because
 /// `safe_name` folds names together (`acme/web`, `acme:web` and `acme_web`
-/// are all `acme_web`) and two repos must never share a warm workspace or a
-/// container home: one would inherit the other's `node_modules`.
+/// are all `acme_web`) and two repos must never share a warm workspace, a
+/// container home or a mirror: one would inherit the other's
+/// `node_modules`, or fetch from the other's URL.
 fn repo_dir(repo: &str) -> String {
     format!(
         "{}-{}",
         safe_name(repo),
-        &crate::cas::digest(repo.as_bytes())[..8]
+        // 128 bits: names are anyone's choice, and a chosen collision would
+        // share a trusted workspace again.
+        &crate::cas::digest(repo.as_bytes())[..32]
     )
 }
 
@@ -739,7 +742,7 @@ impl Worker {
         let mirror = self
             .data_dir
             .join("mirrors")
-            .join(format!("{}.git", safe_name(&job.repo)));
+            .join(format!("{}.git", repo_dir(&job.repo)));
         // Git LFS: the mirror fetches the commit's large files, once per
         // worker, and every workspace reads them from there. Each checkout
         // would otherwise download its own copy (CI checkouts are what use

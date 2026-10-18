@@ -307,6 +307,21 @@ workers: claiming jobs then needs it, so holders of the API token cannot act as 
 does not stop a task on the `host` backend from writing elsewhere on the worker: run
 untrusted code with `sandbox` or `docker`. The Turborepo and Bazel caches are not split yet.
 
+Trusted results are shared by every repo on the server (a key holds no repo). On a server with
+an API token, only repos the GitHub webhook registered write them. A repo registered through
+the API (anyone with the token can) still has trusted runs on its own default branch, but they
+write that repo's own trusted results. Its runs read those plus the shared ones; nothing else
+reads them, and its trusted runs still never read a branch's. Warm workspaces, container homes
+and worker mirrors are per repo, with a hash of the full name, so `acme/web` and `acme_web`
+never share one.
+
+Upgrading a shared server to this version does three things once:
+- Trusted results stored before are demoted to untrusted, so every repo's next trusted run
+  rebuilds them.
+- Every warm workspace and worker mirror starts cold.
+- The old directories stay until the workspace GC removes them (14 days unused, or sooner past
+  `--workspace-max-gb`).
+
 ## GitHub
 
 Point a GitHub App (or a token) and a webhook at the server:

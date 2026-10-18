@@ -92,6 +92,12 @@ impl App {
     ) -> Result<Arc<App>> {
         std::fs::create_dir_all(data_dir)?;
         let db = Db::open(&data_dir.join("pit.db"))?;
+        if token.is_some() && db.demote_shared_trusted_results_once()? {
+            tracing::info!(
+                "trusted cache results from before per-repo trust were kept for untrusted \
+                 runs only; each repo's next trusted run rebuilds them"
+            );
+        }
         let cas = Cas::open(data_dir.join("cas"))?;
         let (events, _) = broadcast::channel(4096);
         Ok(Arc::new(App {
@@ -174,6 +180,17 @@ impl App {
     /// `pit up` without a token has one user, who already runs the server.
     pub fn config_sandboxed(&self, repo: &db::Repo, trusted: bool) -> bool {
         self.token.is_some() && !(trusted && repo.github.is_some())
+    }
+
+    /// Where a run's cached results go and which it may read. On a shared
+    /// server a repo registered through the API (anyone with the token can)
+    /// still gets trusted runs on its own default branch, so they write the
+    /// repo's own trusted namespace, never the one every repo's main reads.
+    pub fn cache_scope(&self, repo_id: &str, github: bool, trusted: bool) -> db::CacheScope {
+        db::CacheScope {
+            trusted,
+            repo: (self.token.is_some() && !github).then(|| repo_id.to_string()),
+        }
     }
 
     /// Loads the config for a commit, preferring a version from the overlay.
@@ -467,6 +484,7 @@ impl App {
             return Ok(()); // Cancelled while planning.
         }
         let trusted = run.trusted;
+        let scope = self.cache_scope(&repo.id, repo.github.is_some(), trusted);
         if groups.is_empty() {
             self.db
                 .set_run_status(run_id, Status::Passed, Some("no tasks to run"))?;
@@ -516,7 +534,7 @@ impl App {
             }
             if let Some(results) = files
                 .as_deref()
-                .map(|f| resolve::resolve(self, g, f, trusted))
+                .map(|f| resolve::resolve(self, g, f, &scope))
                 .transpose()?
                 .flatten()
             {

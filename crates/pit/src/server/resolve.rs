@@ -54,7 +54,7 @@ pub fn resolve(
     app: &App,
     group: &PlannedGroup,
     files: &[(String, String)],
-    trusted: bool,
+    scope: &super::db::CacheScope,
 ) -> Result<Option<Vec<TaskResult>>> {
     // An `any` group's keys depend on the OS of the worker that would run it;
     // try the server's own, which is what a single-OS fleet uses.
@@ -86,7 +86,7 @@ pub fn resolve(
             CacheMode::Off => return Ok(None),
             CacheMode::Remote => match app
                 .db
-                .cache_find(&key, trusted)?
+                .cache_find(&key, scope)?
                 .map(|row| Ok::<_, anyhow::Error>((app.db.cache_peek(&row)?, row)))
                 .transpose()?
             {
