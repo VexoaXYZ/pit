@@ -3627,3 +3627,53 @@ Ties within a millisecond are broken by row order.
 **Verdict: SOLVED.** Pit had "no limit, no cancellations" but not ordering, and default branches
 not named main were superseded. Both are fixed. Limit: while a locked group waits behind an older
 one, its waiting message doesn't name that run.
+
+## P59. Container jobs re-download every dependency on every run
+
+**The pain.** Inside a container job, `$HOME` is a temp folder the runner cleans between jobs, so
+`~/.npm`, `~/.cache/pip` and `~/.cargo` start empty each time. `actions/cache` on self-hosted
+runners still round-trips through GitHub, and job images are pulled before any cache step could
+run.
+
+Sources: [community #18549](https://github.com/orgs/community/discussions/18549),
+[#47550](https://github.com/orgs/community/discussions/47550),
+[froghat](https://froghat.ca/2023/03/github-runner-cache/) (bind-mount something that outlives the
+tmpfs), [OneUptime](https://oneuptime.com/blog/post/2025-12-20-self-hosted-runners-github-actions/view)
+(`npm config set cache /opt/cache/npm`), [local-cache action](https://github.com/marketplace/actions/local-cache-on-self-hosted-runner),
+[tenki](https://tenki.cloud/blog/github-actions-cache-strategy),
+[matthewswong](https://www.matthewswong.com/en/blog/github-actions-runners/),
+[Medium](https://medium.com/@rohitverma27305/zero-billing-github-actions-with-self-hosted-runners-f9a1e9418d18),
+[quickstarkdemo/github-runner](https://github.com/quickstarkdemo/github-runner).
+
+**Reproduction.** A `node:22-alpine` task runs `npm install lodash express` into `/tmp/app`, so
+nothing lands in the warm workspace, and reports whether `~/.npm` had a cache. Before, Pit's
+containers got `HOME=/tmp` in a container removed after the task:
+
+| | run 1 | run 2 | run 3 |
+| --- | --- | --- | --- |
+| before | cold, 5.7s | cold, 6.2s | cold, 8.0s |
+| after | cold, 6.0s | warm, 3.3s | warm, 4.5s |
+| after, `--fresh` | cold, 6.9s | | |
+
+**Fix.**
+- A container's `$HOME` is now `/pit-home`, bind-mounted from a worker directory
+  (`homes/trusted`, `homes/untrusted`), so tool caches persist.
+- It's split by trust pool like warm workspaces (P20), so a branch can't leave a poisoned npm
+  cache for main.
+- Fork runs and `--fresh` (and `pit verify`) get the old empty `/tmp`.
+
+The rest of the time is npm resolving metadata over the network; `--prefer-offline` would cut more.
+
+**Measured.**
+- The table above: three runs plus a `--fresh` one, on the same commit.
+- e2e `container_homes_persist_per_trust_pool` (Linux with Docker):
+  - a marker in `$HOME` is missing on the first run and found on the second;
+  - a `--fresh` run doesn't see it;
+  - a trusted run of main starts with its own empty home.
+
+**Verdict: PARTIAL.** Container tool caches now persist per worker and trust pool. Limits:
+- The homes are not covered by workspace GC or `--workspace-max-gb`, so they grow until removed by
+  hand (8.4 MB here).
+- They're per worker, not shared across workers.
+- State in `$HOME` can leak between runs of the same pool, as warm workspaces can. `pit verify`
+  is the check.

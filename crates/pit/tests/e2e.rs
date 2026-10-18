@@ -4030,3 +4030,66 @@ async fn summaries_live_outside_the_workspace() {
         assert!(md.starts_with("node v22"), "{md:?}");
     }
 }
+
+/// A `docker` task's `$HOME` survives between runs (tool caches stay warm),
+/// one per trust pool; a `--fresh` run gets an empty one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn container_homes_persist_per_trust_pool() {
+    if !(cfg!(target_os = "linux")
+        && pit::worker::exec::detect_backends()
+            .await
+            .contains(&Backend::Docker))
+    {
+        eprintln!("skipped: no Linux docker");
+        return;
+    }
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b main origin.git");
+    let config = serde_json::json!({ "tasks": { "t": {
+        "image": "node:22-alpine",
+        "run": "if [ -f $HOME/cache-marker ]; then echo warm; else echo cold; touch $HOME/cache-marker; fi",
+        "cache": false,
+    } } });
+    write(&work, "pit.config.json", &config.to_string());
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    let first = run_with_timeout(&pit, &work, Duration::from_secs(240)).await;
+    assert!(first_log(&pit, &first).await.contains("cold"));
+    let second = run(&pit, &work).await;
+    assert!(
+        first_log(&pit, &second).await.contains("warm"),
+        "the home did not persist"
+    );
+    let fresh = run_with(
+        &pit,
+        &work,
+        pit::cli::RunOpts {
+            fresh: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        first_log(&pit, &fresh).await.contains("cold"),
+        "a fresh run reused the home"
+    );
+    // A trusted run (main) has a home of its own: the branch's is not shared.
+    let sha = sh(&work, "git rev-parse HEAD").trim().to_string();
+    let url = tmp.path().join("origin.git").to_string_lossy().to_string();
+    let main = run_ref(&pit, &url, sha, "main", true).await;
+    assert!(
+        first_log(&pit, &main).await.contains("cold"),
+        "trusted runs shared the untrusted home"
+    );
+}
+
+/// The log of a run's first task.
+async fn first_log(pit: &Pit, view: &RunView) -> String {
+    let task = &view.groups[0].tasks[0].id;
+    pit.client
+        .get_text(&format!("/api/tasks/{task}/log"))
+        .await
+        .unwrap()
+}

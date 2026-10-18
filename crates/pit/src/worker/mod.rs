@@ -1318,6 +1318,7 @@ impl Worker {
             minimal: job.no_secrets,
             docker_network: services.as_ref().map(|s| s.network.clone()),
             summary_dir: Some(summary_dir.clone()),
+            docker_home: self.docker_home(job)?,
         };
         // Secrets never reach the server's logs, live or stored.
         let masker = Arc::new(mask::Masker::new(secret_values));
@@ -1744,6 +1745,21 @@ mod submodule_tests {
     }
 }
 
+impl Worker {
+    /// The `$HOME` a job's `docker` tasks keep between runs: one per trust
+    /// pool, like warm workspaces (P20), so a branch cannot leave a poisoned
+    /// tool cache for main. A fork's run, or a `--fresh` one, gets none.
+    fn docker_home(&self, job: &Job) -> Result<Option<PathBuf>> {
+        if job.no_secrets || job.fresh {
+            return Ok(None);
+        }
+        let pool = if job.trusted { "trusted" } else { "untrusted" };
+        let dir = self.data_dir.join("homes").join(pool);
+        std::fs::create_dir_all(&dir)?;
+        Ok(Some(dir))
+    }
+}
+
 type ServiceSlot = Arc<tokio::sync::OnceCell<std::result::Result<Arc<services::Running>, String>>>;
 
 /// A random id kept in the data dir, made on first start.
@@ -1853,6 +1869,7 @@ impl Worker {
                 minimal: job.no_secrets,
                 docker_network: None,
                 summary_dir: None,
+                docker_home: None,
             };
             let exec::TaskCommand {
                 cmd: mut command,

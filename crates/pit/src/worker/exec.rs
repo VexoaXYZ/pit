@@ -102,7 +102,14 @@ pub struct EnvPolicy {
     /// A worker-owned directory a `docker` task sees at `SUMMARY_MOUNT`
     /// (`$PIT_SUMMARY` lives there, outside the workspace).
     pub summary_dir: Option<std::path::PathBuf>,
+    /// A worker-owned directory a `docker` task gets as `$HOME`
+    /// (`HOME_MOUNT`), so tool caches (`~/.npm`, `~/.cache/pip`, `~/.cargo`)
+    /// survive between runs. `None`: a throwaway `/tmp`.
+    pub docker_home: Option<std::path::PathBuf>,
 }
+
+/// Where a container sees `EnvPolicy::docker_home`.
+pub const HOME_MOUNT: &str = "/pit-home";
 
 /// Where a container sees `EnvPolicy::summary_dir`.
 pub const SUMMARY_MOUNT: &str = "/pit-summary";
@@ -221,7 +228,15 @@ pub fn command_with(
                 use std::os::unix::fs::MetadataExt;
                 a.extend(["--user".into(), format!("{}:{}", meta.uid(), meta.gid())]);
                 // That user has no home in the image; tools need a writable one.
-                a.extend(["-e".into(), "HOME=/tmp".into()]);
+                match &policy.docker_home {
+                    Some(home) => a.extend([
+                        "-v".into(),
+                        format!("{}:{HOME_MOUNT}", home.display()),
+                        "-e".into(),
+                        format!("HOME={HOME_MOUNT}"),
+                    ]),
+                    None => a.extend(["-e".into(), "HOME=/tmp".into()]),
+                }
             }
             container = Some(name);
             // By name only: the docker client passes values from its own
