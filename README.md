@@ -345,6 +345,12 @@ member or collaborator reruns the commit Pit last ran for it, with the same rest
 stays a fork's). Passed tasks come back from the cache, so only what failed runs again. It works
 with a plain token too, where checks have no Re-run button.
 
+**Skipping.** A pushed commit (or a pull request's head commit) whose message has `[skip ci]`,
+`[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]` or `[skip pit]` gets no run, as on
+GitHub: a release bot's version bump doesn't run CI again. As on GitHub, nothing is reported for
+it, so a required check waits rather than passes; three words in a commit message don't get a
+change past CI. The merge queue, schedules, reruns and `pit run` always run.
+
 **Drafts.** Draft pull requests run like any other by default. With `drafts: false` in the
 config, a draft's pushes get no run and post no checks. GitHub can't merge a draft, so required
 checks just wait. Marking it ready for review (`ready_for_review`, which needs the

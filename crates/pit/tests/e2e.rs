@@ -5328,10 +5328,32 @@ async fn draft_pull_requests_run_when_marked_ready() {
     let data = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    // No GitHub API to report to: posting statuses fails, quietly.
+    // A fake GitHub API that records the statuses Pit posts.
+    let posted: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+        Default::default();
+    let rec = posted.clone();
+    let gh_api = axum::Router::new().route(
+        "/repos/{owner}/{repo}/statuses/{sha}",
+        axum::routing::post(
+            move |axum::extract::Path((_o, _r, sha)): axum::extract::Path<(
+                String,
+                String,
+                String,
+            )>,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let rec = rec.clone();
+                async move {
+                    rec.lock().unwrap().push((sha, body));
+                    axum::Json(serde_json::json!({ "id": 1 }))
+                }
+            },
+        ),
+    );
+    let gh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gh_url = format!("http://{}", gh_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(gh_listener, gh_api).await });
     let github =
-        pit::server::github::GitHub::with_token("http://127.0.0.1:9", "t", Some("s3cret".into()))
-            .unwrap();
+        pit::server::github::GitHub::with_token(&gh_url, "t", Some("s3cret".into())).unwrap();
     let app = pit::server::App::with_github(
         &data.path().join("server"),
         None,
@@ -5391,6 +5413,14 @@ async fn draft_pull_requests_run_when_marked_ready() {
     assert_eq!(v.status, Status::Skipped, "{v:?}");
     assert!(v.groups.is_empty(), "{v:?}");
     assert!(v.message.unwrap_or_default().contains("ready for review"));
+    // Skipped on purpose: no status at all (a failure would be a red X, a
+    // success could satisfy a required check).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        posted.lock().unwrap().iter().all(|(s, _)| s != &sha),
+        "{:?}",
+        posted.lock().unwrap()
+    );
     // Marked ready: it runs.
     let id = event("ready_for_review", false, &sha).await.expect("a run");
     let v = pit::cli::wait(&client, &id, |_| {}).await.unwrap();
@@ -5523,4 +5553,48 @@ async fn tasks_see_tags_including_new_ones() {
     let (status, text) = log(run(&pit, &work).await).await;
     assert_eq!(status, Status::Passed, "{text}");
     assert!(text.contains("v1.1.0"), "{text}");
+}
+
+/// `[skip ci]` in a pushed commit skips its push and pull request runs (and
+/// reports nothing, so required checks wait); `pit run` still runs it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn skip_ci_skips_pushes_but_not_pit_run() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    write(
+        &work,
+        "pit.config.json",
+        r#"{"tasks":{"test":{"run":"echo ran","cache":false}}}"#,
+    );
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    write(&work, "VERSION", "1.0.1\n");
+    sh(
+        &work,
+        "git add -A && git commit -qm 'chore(release): 1.0.1 [skip ci]' && git push -q origin main",
+    );
+    let sha = sh(&work, "git rev-parse HEAD").trim().to_string();
+    let url = root.join("origin.git").to_string_lossy().to_string();
+    let created: serde_json::Value = pit
+        .client
+        .post(
+            "/api/runs",
+            &serde_json::json!({ "repo": "rel", "url": url, "sha": sha, "trigger": "push", "ref": "main" }),
+        )
+        .await
+        .unwrap();
+    let v = pit::cli::wait(&pit.client, created["id"].as_str().unwrap(), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(v.status, Status::Skipped, "{v:?}");
+    assert!(v.groups.is_empty(), "{v:?}");
+    assert_eq!(
+        v.message.as_deref(),
+        Some("[skip ci] in the commit message")
+    );
+    // Asked for explicitly: it runs.
+    assert_eq!(run(&pit, &work).await.status, Status::Passed);
 }

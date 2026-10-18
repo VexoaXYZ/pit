@@ -443,6 +443,25 @@ impl App {
         let t0 = std::time::Instant::now();
         let mirror = self.ensure_commit(repo, &req.sha).await?;
         let t_commit = t0.elapsed();
+        // `[skip ci]` and friends in a pushed commit (a release bot's version
+        // bump), as GitHub reads them: the run is skipped and reports
+        // nothing, so a required check waits, as on GitHub, rather than
+        // passing; three words in a commit message must not get a change
+        // past CI. Never for the merge queue, schedules, reruns or `pit run`.
+        if matches!(req.trigger.as_deref(), Some("push" | "pr")) {
+            let message = crate::git::git(&mirror, &["log", "-1", "--format=%B", &req.sha])
+                .await
+                .unwrap_or_default();
+            if let Some(marker) = skip_marker(&message) {
+                self.db.set_run_status(
+                    run_id,
+                    Status::Skipped,
+                    Some(&format!("{marker} in the commit message")),
+                )?;
+                self.run_finished(run_id).await;
+                return Ok(());
+            }
+        }
         if let Some(base) = self.base_commit(&mirror, repo, &req.sha).await {
             self.db.set_run_base(run_id, &base)?;
         }
@@ -868,6 +887,21 @@ impl App {
     }
 }
 
+/// The skip marker in a commit message, if any: GitHub's, plus `[skip pit]`.
+/// Case-insensitive.
+fn skip_marker(message: &str) -> Option<&'static str> {
+    const MARKERS: &[&str] = &[
+        "[skip ci]",
+        "[ci skip]",
+        "[no ci]",
+        "[skip actions]",
+        "[actions skip]",
+        "[skip pit]",
+    ];
+    let lower = message.to_ascii_lowercase();
+    MARKERS.iter().copied().find(|m| lower.contains(m))
+}
+
 /// Finished runs are kept `PIT_HISTORY_DAYS` (default 90, `0` forever); their
 /// logs only 14 days anyway. Without this the database grows with every run.
 fn prune_history(app: &App) {
@@ -968,6 +1002,18 @@ pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) ->
 #[cfg(test)]
 mod config_sandbox_tests {
     use super::*;
+
+    #[test]
+    fn skip_markers_are_found_anywhere_any_case() {
+        assert_eq!(
+            skip_marker("chore(release): 1.0.1 [skip ci]"),
+            Some("[skip ci]")
+        );
+        assert_eq!(skip_marker("docs\n\n[CI SKIP]"), Some("[ci skip]"));
+        assert_eq!(skip_marker("bump [skip pit]"), Some("[skip pit]"));
+        assert_eq!(skip_marker("skip ci in prose, no brackets"), None);
+        assert_eq!(skip_marker("fix: [skip] tests"), None);
+    }
 
     #[test]
     fn shared_servers_evaluate_only_trusted_github_configs_on_the_host() {

@@ -346,6 +346,13 @@ impl GitHub {
         };
         let view = app.db.run_view(run_id)?;
         let details = format!("{}/runs/{run_id}", app.public_url);
+        // Skipped on purpose (`[skip ci]`, a draft with `drafts: false`):
+        // nothing, as GitHub posts nothing for a workflow it skips. A
+        // "skipped" or "failure" check would show a red X on a release bot's
+        // commit, and a passing one could satisfy a required check.
+        if view.groups.is_empty() && view.status == Status::Skipped {
+            return Ok(());
+        }
         if view.groups.is_empty() && view.status.is_done() {
             // Planning failed: one check explaining why.
             return self
