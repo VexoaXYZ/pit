@@ -3994,3 +3994,87 @@ in 107.7s.
   the old behaviour. Pipefail also fails `producer | head -1` when the producer is killed by
   SIGPIPE, as it does under GitHub's `shell: bash`.
 - Service health-check commands still run under plain `sh -c`; they are single probes.
+
+## P64. Scheduled jobs: no way to try one, and silence when one never runs
+
+**The pain.** To test a scheduled workflow on GitHub without waiting for its cron, the usual
+advice is to add a second trigger, `workflow_dispatch:`, and press "Run workflow"
+([cronuru](https://cronuru.com/guides/github-actions-scheduled-workflows),
+[cronjobpro](https://cronjobpro.com/blog/github-actions-scheduled-workflows),
+[oneuptime](https://oneuptime.com/blog/post/2025-12-20-scheduled-workflows-cron-github-actions/view)).
+Otherwise you set a `*/5` cron for a while and push to the default branch. When a schedule doesn't
+run, nothing says why: an invalid workflow just isn't listed, and on a non-default branch it never
+fires ([community #185355](https://github.com/orgs/community/discussions/185355),
+[dev.to](https://dev.to/krissv/monitoring-github-actions-scheduled-workflows-a-practical-guide-31h7)).
+
+**Before** (research/pain-hunt at P63). Pit's schedules (P26, P52) had neither:
+- There was no command or API to see them: `GET /api/schedules` returned 404, and `pit` had no
+  `schedules` command.
+- Testing one meant committing a `* * * * *` cron to the default branch and waiting.
+- A default-branch config that failed to load switched every schedule off. The only sign was a
+  `WARN` in the server log, repeated every 30 s, including for repos with no Pit config at all.
+
+**Fix.**
+- **`pit schedules`** (`GET /api/schedules`) lists every repo's schedules as the server reads
+  them, from the config at the default branch's tip:
+  - the next fire time, in the zone the cron is written in, with how far off it is;
+  - the last `schedule:<name>` run and its status;
+  - a config that doesn't load, as the reason none of that repo's schedules fire (exit 1).
+
+  Repos with no Pit config at all are left out. They no longer log a warning every tick either:
+  "no config" is cached per tip, like a config.
+- **`pit schedules run NAME [--repo R]`** (`POST /api/schedules/run`) starts a schedule now, as
+  its cron would: a trusted `schedule:NAME` run of the default branch's tip, with that config's
+  settings. Groups' `on: schedule` applies too. It doesn't use up the next slot.
+  - `--repo` fetches that repo first, so a schedule just pushed can be tried at once.
+  - Without `--repo`, nothing is fetched; fetching every repo took 49.7 s here.
+  - A name nobody declares says so and suggests `--repo`; a name in two repos asks which.
+
+**Measured** (`/tmp/painhunt/p64`, nightly at `17 3 * * *` Europe/London; `p64b`, whose tip's
+`pit.config.json` is broken):
+```
+p64 nightly · 17 3 * * * Europe/London · on main
+  next  2026-10-19 03:17 BST (in 21h 50m)
+  last  never ran
+p64b: schedules not read, so none will fire: reading the config at 80798ab…: parsing pit.config.json: EOF while parsing an object at line 2 column 0
+
+$ pit schedules run nightly
+started run_6ccc9a3bab38
+run_6ccc9a3bab38   passed   schedule:nightly main   p64@80990a7f   (log: audit on 80990a7f…)
+  last  run_6ccc9a3bab38 passed 2026-10-18 06:27 CEST (now)
+
+# a schedule committed a moment ago:
+$ pit schedules run hourly            → 400 … as last fetched; pushed it just now? --repo <name> fetches that repo first  (1.2s)
+$ pit schedules run hourly --repo p64 → started run_14b80df2daff  (0.25s)
+```
+- The e2e test `schedules_are_listed_and_can_run_now` covers:
+  - the listing, with the next fire time and the last run;
+  - a schedule just pushed: refused without `--repo`, run on the pushed tip with it;
+  - a manual run leaving the cron slot to fire;
+  - an unknown repo;
+  - a broken config, which is listed and also named when running.
+- The unit test `next_fire_follows_the_zone_and_looks_a_year_ahead` covers London summer and
+  winter time and a 29 February that is more than a year off.
+
+**Review.** An independent review found two shoulds:
+1. **A false claim in a doc comment**, "the caller picks only which schedule, never the code".
+   Picking the repo picks the code, and any API caller can register a repo (`pit run` does).
+   The comment and the README now say so. Any API token holder can also fire a deploy schedule
+   whenever they like: the code and settings are the default branch's, the timing is theirs.
+   It isn't new power, since a `* * * * *` schedule in a registered repo does the same within a
+   minute. Limiting schedules to webhook-registered repos was declined: local repos are a
+   supported way to use schedules.
+2. **`run` hid config errors** behind "no schedule". It now returns the load error, and an unknown
+   `--repo` says `no repo "…"`. A third review point is also fixed: the run uses the tip whose
+   config declared the schedule, instead of fetching again.
+
+Declined as nits:
+- 404/409 instead of 400 for these errors;
+- `next_after` scanning up to a year of minutes for a date that never comes;
+- the main/master/trunk default-branch guess, which predates this change.
+
+The review also found a hole outside this diff, recorded as P65 below.
+
+**Verdict: SOLVED.** Limits:
+- No "Run" button on the dashboard yet.
+- Missed slots while the server is down are still not replayed (P26).

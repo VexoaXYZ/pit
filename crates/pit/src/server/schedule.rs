@@ -131,7 +131,7 @@ async fn repo_tick(app: &Arc<App>, repo: &super::db::Repo, first: i64, now: i64)
         {
             continue;
         }
-        if let Err(e) = start(app, repo, &d.mirror, &d.branch, &d.tip, name, s).await {
+        if let Err(e) = start(app, repo, &d, name, s, true).await {
             tracing::warn!("schedule {name} on {}: {e:#}", repo.name);
         }
     }
@@ -178,11 +178,15 @@ pub async fn list(app: &Arc<App>, now_ms: i64) -> Result<Vec<serde_json::Value>>
     Ok(out)
 }
 
-/// Starts a schedule now, exactly as its cron would: the default branch's
-/// tip, as a trusted `schedule:<name>` run. The caller picks only which
-/// declared schedule, never the code. Does not use up the next slot.
+/// Starts a schedule now, as its cron would: the default branch's tip (as
+/// last fetched, or fetched now with `repo_name`), as a trusted
+/// `schedule:<name>` run, with the settings that tip's config declares. Does
+/// not use up the next slot. The caller chooses when, and which repo: any
+/// API caller can register a repo (`pit run` does), so this is no more than
+/// what a `* * * * *` schedule in that repo already does within a minute.
 pub async fn run_now(app: &Arc<App>, repo_name: Option<&str>, name: &str) -> Result<String> {
     let mut found = Vec::new();
+    let mut matched_repo = false;
     for repo in app.db.repos()? {
         if repo_name.is_some_and(|r| r != repo.name) {
             continue;
@@ -190,12 +194,18 @@ pub async fn run_now(app: &Arc<App>, repo_name: Option<&str>, name: &str) -> Res
         // A schedule just pushed is what people try first. Only a named
         // repo is fetched: fetching every repo for a typo takes minutes.
         if repo_name.is_some() {
+            matched_repo = true;
             if let Err(e) = app.fetch_mirror(&repo).await {
                 tracing::warn!("schedules of {}: fetching {}: {e:#}", repo.name, repo.url);
             }
         }
-        let Ok(Some(d)) = declared(app, &repo).await else {
-            continue;
+        let d = match declared(app, &repo).await {
+            Ok(Some(d)) => d,
+            // A typo in the config just pushed: say so, not "no schedule".
+            Err(e) if repo_name.is_some() => {
+                return Err(e.context(format!("schedules of {}", repo.name)))
+            }
+            _ => continue,
         };
         if let Some(s) = d.schedules.get(name).cloned() {
             found.push((repo, d, s));
@@ -203,6 +213,7 @@ pub async fn run_now(app: &Arc<App>, repo_name: Option<&str>, name: &str) -> Res
     }
     let (repo, d, s) = match found.len() {
         0 => match repo_name {
+            Some(r) if !matched_repo => anyhow::bail!("no repo {r:?} on this server"),
             Some(r) => anyhow::bail!("no schedule {name:?} on {r}'s default branch"),
             None => anyhow::bail!(
                 "no schedule {name:?} on the default branch of any repo, as last fetched; \
@@ -219,27 +230,32 @@ pub async fn run_now(app: &Arc<App>, repo_name: Option<&str>, name: &str) -> Res
                 .join(", ")
         ),
     };
-    start(app, &repo, &d.mirror, &d.branch, &d.tip, name, &s).await
+    // The tip whose config declared it, not one fetched since.
+    start(app, &repo, &d, name, &s, false).await
 }
 
 async fn start(
     app: &Arc<App>,
     repo: &super::db::Repo,
-    mirror: &std::path::Path,
-    branch: &str,
-    tip: &str,
+    d: &Declared,
     name: &str,
     s: &Schedule,
+    fetch: bool,
 ) -> Result<String> {
+    let (mirror, branch, tip) = (&d.mirror, &d.branch, &d.tip);
     let head = format!("refs/heads/{branch}");
     // Run what is on the branch now, not what the mirror last saw.
-    let sha = match app.fetch_mirror(repo).await {
-        Ok(_) => crate::git::rev_parse(mirror, &head)
-            .await?
-            .unwrap_or_else(|| tip.to_string()),
-        Err(e) => {
-            tracing::warn!("schedule {name}: fetching {}: {e:#}", repo.url);
-            tip.to_string()
+    let sha = if !fetch {
+        tip.to_string()
+    } else {
+        match app.fetch_mirror(repo).await {
+            Ok(_) => crate::git::rev_parse(mirror, &head)
+                .await?
+                .unwrap_or_else(|| tip.to_string()),
+            Err(e) => {
+                tracing::warn!("schedule {name}: fetching {}: {e:#}", repo.url);
+                tip.to_string()
+            }
         }
     };
     let id = app

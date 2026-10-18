@@ -4608,16 +4608,29 @@ async fn schedules_are_listed_and_can_run_now() {
         .unwrap();
     assert_eq!(count_trigger(&pit, "nightly").await, 2);
 
-    // A config that does not load is listed as the reason nothing fires.
+    let err = pit
+        .client
+        .post::<_, serde_json::Value>(
+            "/api/schedules/run",
+            &serde_json::json!({ "name": "nightly", "repo": "nope" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no repo \"nope\""), "{err:#}");
+
+    // A config that does not load is listed as the reason nothing fires,
+    // and running a schedule says why instead of "no schedule".
     write(&work, "pit.config.json", "{ not json");
     sh(&work, "git commit -qam broken && git push -q origin main");
-    pit.client
+    let err = pit
+        .client
         .post::<_, serde_json::Value>(
             "/api/schedules/run",
             &serde_json::json!({ "name": "nightly", "repo": repo }),
         )
         .await
         .unwrap_err();
+    assert!(err.to_string().contains("pit.config.json"), "{err:#}");
     let list: Vec<serde_json::Value> = pit.client.get("/api/schedules").await.unwrap();
     assert_eq!(list.len(), 1, "{list:?}");
     assert!(
