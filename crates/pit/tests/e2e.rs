@@ -6380,3 +6380,37 @@ async fn a_closed_pull_requests_check_keeps_the_commits_result() {
     }
     assert_eq!(newest(&sha), Some("success".into()), "{:?}", seen.lock());
 }
+
+/// Python's output reaches the log as it is printed, not at exit: a task
+/// printing every second is not stopped by a three-second idle limit, and
+/// its lines are in the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn python_output_is_not_held_back_until_exit() {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 not installed; skipping");
+        return;
+    }
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    write(
+        dir,
+        "progress.py",
+        "import time\nfor i in range(5):\n    print(f'step {i}')\n    time.sleep(1)\n",
+    );
+    write(
+        dir,
+        "pit.config.json",
+        r#"{"tasks":{"progress":{"run":"python3 progress.py","idleTimeout":3,"cache":false}}}"#,
+    );
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let v = run(&pit, dir).await;
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+}

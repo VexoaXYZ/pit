@@ -1374,6 +1374,12 @@ impl Worker {
         for k in ["LANG", "LC_ALL"] {
             env.push((k.into(), "C.UTF-8".into()));
         }
+        // Python buffers its output when it isn't writing to a terminal: a
+        // task's lines would arrive only at exit, the idle limit would stop
+        // one that prints every minute, and a stopped one's last lines (why
+        // it hung) would be lost. Output only, so not in the action key; a
+        // task that lists it in `env` gets the worker's value instead.
+        env.push(("PYTHONUNBUFFERED".into(), "1".into()));
         // For Turborepo and Bazel (`TURBO_API=$PIT_CACHE_URL
         // TURBO_TOKEN=$PIT_CACHE_TOKEN`): the server gives requests with this
         // token the run's cache scope, so a branch never writes what main

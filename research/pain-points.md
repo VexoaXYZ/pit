@@ -5672,3 +5672,51 @@ finding was about the order checks are posted in.
   checks `cancelled`, as GitHub does for a cancelled workflow.
 - **Combined checks link to the closed run.** A sharded group's combined check shows the right
   state but its link opens the closed run.
+
+## P89. Python's output shows up only when the job ends (and an idle limit kills it)
+
+**The pain.** Python buffers stdout when it isn't writing to a terminal, which in CI it never is.
+In [community discussion #52284](https://github.com/orgs/community/discussions/52284) ("Github
+Actions is buffering output and not displaying step progress in real time", April 2023, seen on
+"self-hosted runners and Github's Cloud runners"), a reply calls it "a very old issue with github
+runners" and gives the workaround: "for python programs there is a workaround, define
+`PYTHONUNBUFFERED=1`". pytest has the same report:
+[pytest-dev/pytest#1886](https://github.com/pytest-dev/pytest/issues/1886), "When piping pytests
+output e.g. into `tee` it will get buffered ... export `PYTHONUNBUFFERED=1`". Checked here: piped,
+`sys.stdout.line_buffering` is `False`; with `PYTHONUNBUFFERED=1`, `write_through` is `True`.
+
+In Pit it is worse than a late log. A task is stopped after `idleTimeout` (15 minutes by default)
+without output, so a Python job that prints progress every few minutes is stopped as idle, and
+the lines it buffered, the ones that would say how far it got, are lost with it.
+
+**Reproduction** (`/tmp/painhunt/p89`, a scratch server on port 7983). `train.py` prints a line
+every 2 s for 14 s; the task has `idleTimeout: 6`:
+```
+✗ train   6.0s exit ?
+✗ default.train: no output for 6s; stopped (set idleTimeout to change, 0 to disable)
+```
+Three lines had been printed, and the log has none of them.
+
+**Fix.** Every task gets `PYTHONUNBUFFERED=1`, in a container too. It changes how output
+arrives, not what a task does, so it is not part of the action key. A task that lists it in `env`
+gets the worker's own value instead, as for `TZ` (P76).
+
+**After** (rebuilt server and worker; a second task in `debian:bookworm` prints the variable):
+```
+train │ step 1/7: loss 1.000        (live, as printed)
+incontainer │ PYTHONUNBUFFERED=1
+...
+train │ step 7/7: loss 0.143
+train │ done
+✓ train 14.0s    passed
+```
+The e2e test `python_output_is_not_held_back_until_exit` runs a Python task printing every second
+under a 3 s idle limit; without the fix it is stopped as idle.
+
+**Review.** None: a default environment variable, with no security or concurrency effect.
+
+**Verdict: SOLVED** for Python. Limits:
+- **Other runtimes that buffer** (Ruby's `$stdout`, Perl, C programs using stdio) still hold
+  their output when it isn't a terminal. Only Python has a standard variable that turns it off.
+- **CI not run.** GitHub Actions wouldn't start jobs on this account (billing). The workflow's
+  commands pass locally on Linux.
