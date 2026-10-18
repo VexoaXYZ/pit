@@ -10,7 +10,12 @@ export type Backend =
 export type Os = "linux" | "macos" | "windows" | "any";
 
 export interface TaskDef {
-  /** Shell command (`sh -c` on Linux and macOS, `cmd /C` on Windows). */
+  /**
+   * Shell command. On Linux and macOS: `bash -eo pipefail` where bash exists,
+   * else `sh -e` (with pipefail if the shell has it), so a failing line or pipe
+   * stage fails the task; `set +e` / `set +o pipefail` opt out. `cmd /C` on
+   * Windows.
+   */
   run: string;
   /** Tasks in the same group that must pass first. */
   deps?: string[];

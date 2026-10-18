@@ -76,8 +76,25 @@ fn shell(script: &str) -> (String, Vec<String>) {
     if cfg!(windows) {
         ("cmd".into(), vec!["/C".into(), script.into()])
     } else {
-        ("sh".into(), vec!["-c".into(), script.into()])
+        let mut a = strict_sh(script);
+        let program = a.remove(0);
+        (program, a)
     }
+}
+
+/// Starts a task's `run` the way GitHub's `shell: bash` does: bash with
+/// `-e` and `-o pipefail` where the machine or image has bash, else `sh -e`,
+/// with pipefail if that shell has it (busybox does, dash 0.5.12 doesn't).
+/// A plain `sh -c` ignored a failing line unless it was the script's last,
+/// and `npm test | tee log` passed with failing tests.
+const STRICT_SH: &str = r#"if command -v bash >/dev/null 2>&1; then exec bash -eo pipefail -c "$1"; fi
+if (set -o pipefail) 2>/dev/null; then exec sh -e -o pipefail -c "$1"; fi
+exec sh -e -c "$1""#;
+
+fn strict_sh(script: &str) -> Vec<String> {
+    ["sh", "-c", STRICT_SH, "sh", script]
+        .map(String::from)
+        .to_vec()
 }
 
 /// A task's process, plus the container to remove if it has to be killed.
@@ -189,7 +206,7 @@ pub fn command_with(
             if !network {
                 a.push("--net".into());
             }
-            a.extend(["sh".into(), "-c".into(), task.run.clone()]);
+            a.extend(strict_sh(&task.run));
             ("unshare".into(), a)
         }
         Backend::Docker => {
@@ -247,7 +264,7 @@ pub fn command_with(
                 a.extend(["-e".into(), k.clone()]);
             }
             a.push(task.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.into()));
-            a.extend(["sh".into(), "-c".into(), task.run.clone()]);
+            a.extend(strict_sh(&task.run));
             ("docker".into(), a)
         }
     };
@@ -527,6 +544,38 @@ mod tests {
             ..Default::default()
         };
         assert!(out(minimal).await.contains("[][g][path]"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_line_or_pipe_stage_fails_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let exit = |script: &str| {
+            let task = TaskDef {
+                run: script.into(),
+                ..Default::default()
+            };
+            let cmd = command(&task, Backend::Host, dir.path(), &[]);
+            async move {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let out = run(cmd, Limits::default(), tx, never()).await.unwrap();
+                (out.exit_code, out.log)
+            }
+        };
+        let (code, log) = exit("echo one; false\necho two").await;
+        assert_eq!(code, Some(1));
+        assert!(log.contains("one") && !log.contains("two"), "{log}");
+        assert_eq!(exit("sh -c 'exit 3' | cat\necho done").await.0, Some(3));
+        // Handled failures and explicit opt-outs still pass.
+        assert_eq!(
+            exit("false || true\nfalse && echo x\necho ok").await.0,
+            Some(0)
+        );
+        assert_eq!(exit("set +e\nfalse\necho ok").await.0, Some(0));
+        assert_eq!(exit("set +o pipefail\nfalse | cat").await.0, Some(0));
+        // Positional parameters and `$@` are the script's, not the wrapper's.
+        let (_, log) = exit("echo \"[$#][$@]\"").await;
+        assert!(log.contains("[0][]"), "{log}");
     }
 
     #[cfg(unix)]

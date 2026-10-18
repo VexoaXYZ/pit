@@ -81,7 +81,7 @@ export default {
 
 | Field | Meaning |
 | --- | --- |
-| `run` | Shell command (`sh -c`, or `cmd /C` on Windows). |
+| `run` | Shell command. On Linux and macOS it runs like GitHub's `shell: bash`: `bash -eo pipefail` where the machine or image has bash, else `sh -e` with pipefail if that shell has it (busybox does; Debian's dash doesn't). So any failing line fails the task, and so does a failing stage of a pipe (`npm test \| tee log`). Put `set +e` or `set +o pipefail` first to opt out. `cmd /C` on Windows. |
 | `deps` | Tasks in the same group that must pass first. Dependents of a failed task are skipped. |
 | `inputs` | Globs of tracked files the task reads (`!` excludes). Default: everything. Tighter inputs mean more cache hits and smaller merge queue lanes. |
 | `outputs` | Files the task produces. Uploaded on success and restored on a cache hit. |

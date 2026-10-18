@@ -3913,3 +3913,84 @@ Without the fix, `pit run` dies from the signal itself, so it has no exit code a
 - `kill -9` of `pit run` can't be caught, so that run keeps going. `pit cancel` it.
 - There's no separate "force" cancel. Cancelling marks the run finished in the database first, so
   a worker that never answers can't keep the run open.
+
+## P63. Green CI with failing tests: a pipe, or a failing line that isn't the last
+
+**The pain.** On GitHub Actions, a `run:` step with no `shell:` key runs as `bash -e {0}`, without
+pipefail. `npm test | tee test.log` then exits with `tee`'s status, so the step passes when the
+tests failed.
+- An old runner-images issue reports exactly this
+  ([actions/runner-images#4459](https://github.com/actions/runner-images/issues/4459)).
+- gitin shipped a release through it: a test failed on master, `make coverage | tee coverage.log`
+  passed, and the fix was `defaults: run: shell: bash`
+  ([isacikgoz/gitin#82](https://github.com/isacikgoz/gitin/pull/82)).
+- Write-ups:
+  [David Winterbottom's TIL](https://til.codeinthehole.com/posts/github-actions-need-a-shell-specified-to-avoid-silent-pipeline-failures/),
+  ["CI Was Lying to Me"](https://dubasipavankumar.com/blog/ci-typescript-silent-failures-github-actions),
+  [sudoku-cc#287](https://github.com/LeoMo42/sudoku-cc/issues/287) (`$?` after a `tee` pipeline
+  is always 0).
+- Posts that say the default already has pipefail
+  ([copdips](https://copdips.com/2023/11/github-actions-bash-shell--e--o-pipefail.html)) are
+  describing an explicit `shell: bash`. That runs `bash --noprofile --norc -eo pipefail {0}`.
+
+**Reproduction** (`/tmp/painhunt/p63`). Pit was worse than GitHub's default: tasks ran under a
+plain `sh -c`, with no `-e` at all.
+```
+"multiline": "echo step1; false\necho 'step2 still ran'"
+"piped":     "sh -c 'echo 3 tests, 1 failed; exit 1' | tee test.log"
+"andand":    "false && echo x\necho after"
+    ✓ andand                   1ms
+    ✓ multiline                2ms
+    ✓ piped                    8ms
+passed in 292ms · 3 ran, 0 cached
+```
+`multiline` is the serious one. In a script like `npm ci; npm test; npm run build`, only the last
+line's exit status counted. `pit import` copies each Actions step's script into a task as it is,
+so a step that failed correctly under GitHub's `bash -e` passed after import. (`andand` passing is
+normal: a failure on the left of `&&` is handled, in every shell.)
+
+**Fix.** Each Unix task's `run` starts through a small `sh` wrapper (host, sandbox and container
+alike):
+1. If `bash` is on the `PATH`, run `bash -eo pipefail -c "$run"`. That is GitHub's
+   `shell: bash`.
+2. Otherwise, if the shell supports pipefail (busybox, as in Alpine images, does), run
+   `sh -e -o pipefail`.
+3. Otherwise run `sh -e`.
+
+The script is passed as an argument, never spliced into the wrapper, and `$#`/`$@` stay the
+script's own. `set +e` or `set +o pipefail` at the top of `run` opts out. Windows still uses
+`cmd /C`.
+
+The cache key version goes from 3 to 4, so results that passed under the old shell are not reused.
+The first run after upgrading misses everywhere, with "ran because Pit's cache format changed".
+
+**Measured** (same repro, after; plus two Alpine tasks, which have no bash):
+```
+    ✗ multiline                24ms exit 1
+    ✗ piped                    17ms exit 1
+    ✗ alpine-piped             1.6s exit 1
+    ✓ alpine-ok                1.7s
+    (andand: passed)
+```
+The wrapper's fallbacks, run with no bash on the `PATH`:
+
+| `sh` is | failing middle line | `sh -c 'exit 3' \| cat` |
+|---|---|---|
+| dash 0.5.12 | exit 1 | exit 0 (no pipefail in dash) |
+| busybox | exit 1 | exit 3 |
+
+The unit test `a_failing_line_or_pipe_stage_fails_the_task` checks:
+- a failing middle line exits 1 without running the next line;
+- a failing pipe stage exits 3;
+- `false || true`, `false && x`, `set +e` and `set +o pipefail` still pass;
+- `$#` is 0.
+
+Pit's own `pit.config.ts` (fmt, clippy, test, web build and typecheck) passes under the new shell
+in 107.7s.
+
+**Verdict: SOLVED** where bash or busybox runs the task. Limits:
+- An image or host whose only shell is dash still gets `-e` but no pipefail.
+- Scripts that relied on failures being ignored now fail. That is intended, and `set +e` restores
+  the old behaviour. Pipefail also fails `producer | head -1` when the producer is killed by
+  SIGPIPE, as it does under GitHub's `shell: bash`.
+- Service health-check commands still run under plain `sh -c`; they are single probes.

@@ -446,7 +446,9 @@ pub fn key_inputs(
         shard_assigned: &task.shard_assigned,
     };
     Ok(KeyInputs {
-        v: 3,
+        // 4: tasks run with `-e` and pipefail, so a result that passed
+        // without them may not pass now.
+        v: 4,
         config: crate::cas::digest(&serde_json::to_vec(&config)?),
         deps,
         files: matched,
