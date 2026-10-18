@@ -5759,3 +5759,111 @@ async fn missed_webhooks_are_caught_up() {
         "an old head"
     );
 }
+
+/// A sharded group also gets one check under its own name, `pit / ci`, so a
+/// branch rule can require it whatever the shard count: pending while any
+/// shard runs, success only when every shard passed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sharded_groups_get_one_check_with_a_stable_name() {
+    use axum::routing::post;
+    use hmac::Mac;
+    use std::sync::{Arc, Mutex};
+    let posted: Arc<Mutex<Vec<serde_json::Value>>> = Default::default();
+    let rec = posted.clone();
+    let gh_api = axum::Router::new().route(
+        "/repos/{o}/{r}/statuses/{sha}",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let rec = rec.clone();
+            async move {
+                rec.lock().unwrap().push(body);
+                axum::Json(serde_json::json!({ "id": 1 }))
+            }
+        }),
+    );
+    let gh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gh_url = format!("http://{}", gh_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(gh_listener, gh_api).await });
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github =
+        pit::server::github::GitHub::with_token(&gh_url, "t", Some("s3cret".into())).unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("w".into()),
+        data_dir: data.path().join("worker"),
+        slots: 2,
+        parallelism: 2,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let client = Client::new(&base, None).unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    write(
+        repo.path(),
+        "pit.config.json",
+        r#"{"groups":{"ci":{"tasks":{"test":{"run":"echo shard $PIT_SHARD","shards":2,"cache":false}}}}}"#,
+    );
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    let body = serde_json::json!({ "ref": "refs/heads/main", "after": sha,
+        "repository": { "full_name": "acme/web", "clone_url": repo.path().to_string_lossy(), "default_branch": "main" } })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "push")
+        .header("x-hub-signature-256", sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let v = pit::cli::wait(&client, resp["run"].as_str().unwrap(), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    assert_eq!(v.groups.len(), 2, "{v:?}");
+    let last = |context: &str| {
+        for _ in 0..50 {
+            let found = posted
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|b| b["context"] == context)
+                .cloned();
+            if let Some(b) = found.filter(|b| b["state"] != "pending") {
+                return b;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "no final status for {context}: {:?}",
+            posted.lock().unwrap()
+        );
+    };
+    for context in ["pit / ci#1", "pit / ci#2"] {
+        assert_eq!(last(context)["state"], "success", "{context}");
+    }
+    let all = last("pit / ci");
+    assert_eq!(all["state"], "success");
+    assert_eq!(all["description"], "2 of 2 shards passed");
+}

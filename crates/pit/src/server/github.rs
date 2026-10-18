@@ -469,6 +469,58 @@ impl GitHub {
                 }
             }
         }
+        // A sharded group's checks are named by shard (`pit / test#1` …), so
+        // changing `shards` renames them and a branch rule requiring them
+        // waits forever. One more check, `pit / test`, keeps a stable name:
+        // pending while any shard runs, passed only when all passed.
+        let mut sharded: std::collections::BTreeMap<&str, Vec<&GroupView>> = Default::default();
+        for g in &view.groups {
+            if let Some((base, k)) = g.name.rsplit_once('#') {
+                if !base.is_empty() && k.parse::<u32>().is_ok() {
+                    sharded.entry(base).or_default().push(g);
+                }
+            }
+        }
+        for (base, shards) in sharded {
+            let left_out = |g: &GroupView| app.db.group(&g.id).map(|r| r.left_out).unwrap_or(false);
+            // Left out of this kind of run: each shard already says so.
+            if shards.iter().all(|g| left_out(g)) {
+                continue;
+            }
+            let done = shards.iter().filter(|g| g.status.is_done()).count();
+            let passed = shards.iter().filter(|g| g.status.is_ok()).count();
+            let status = if done < shards.len() {
+                Status::Running
+            } else if passed == shards.len() {
+                Status::Passed
+            } else {
+                Status::Failed
+            };
+            let summary = format!("{passed} of {} shards passed", shards.len());
+            let key = format!("shards\0{run_id}\0{base}");
+            let said = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (status.as_str(), summary.as_str()).hash(&mut h);
+                h.finish()
+            };
+            if self.reported.lock().get(&key) == Some(&said) {
+                continue;
+            }
+            self.report_one(
+                app,
+                &full,
+                &run.sha,
+                None,
+                base,
+                status,
+                &summary,
+                &details,
+                &[],
+            )
+            .await?;
+            self.reported.lock().insert(key, said);
+        }
         Ok(())
     }
 
