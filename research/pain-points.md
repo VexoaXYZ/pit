@@ -4762,3 +4762,62 @@ It fails if everything is streamed.
   masking if the pieces are flushed in different 50 ms batches. The stored log is masked whole.
 - The earlier run's 290 MB stays in the database file until a `VACUUM`. Pit doesn't vacuum.
 - No independent review: this only drops output past an existing cap.
+
+## P75. The CI server's database only grows
+
+**The pain.** Self-hosted CI keeps every build's record, and many keep its logs, in a database
+that nothing cleans up. Woodpecker's docs say so plainly: "Woodpecker does not perform data
+archival; it considered out-of-scope for the project", and logs "grow the size of your database
+considerably" ([server docs](https://woodpecker-ci.org/docs/administration/configuration/server)).
+Users ask for logs to move out of the database so they can have "pretty simple retention
+policies", because "pipeline logs are flooding the DB and it's pretty hard to clean them up on DB
+level" ([discussion #2278](https://github.com/woodpecker-ci/woodpecker/discussions/2278)).
+SQLite adds one more catch: deleting rows doesn't shrink the file
+([frappe#42814](https://github.com/frappe/frappe/issues/42814): a log cleanup that "silently
+deletes nothing on SQLite").
+
+**Before.** Pit deleted no run, ever (no `DELETE FROM runs` anywhere), and never vacuumed. Logs
+live in the CAS and are collected after 14 days, but every run's rows stay. Space freed inside
+SQLite stays in the file: after P74's 300 MB flood the live log rows were deleted, yet
+`pit.db` stayed at **293 MB**. Opened read-only, the database itself was 449 pages (1.8 MB); the
+rest was free pages the file kept.
+
+**Fix.**
+- **Retention.** Finished runs older than `PIT_HISTORY_DAYS` (default 90; `0` keeps them forever)
+  are deleted with their groups, tasks, test results and live logs. Runs still queued or running
+  are never touched. The next CAS collection then frees their logs and artifacts. A pass deletes
+  at most 1000 runs, oldest first, so a big backlog never holds the lock for long.
+- **Space back.** The database uses SQLite's incremental auto-vacuum.
+  - A new database gets it before its first table; an older one is rewritten once at startup.
+  - Each collection pass then returns free pages: `incremental_vacuum` stepped to the end (it
+    frees a page per step), then a WAL checkpoint, without which the file doesn't shrink in WAL
+    mode.
+
+**After:**
+```
+startup rewrite + checkpoint:  pit.db 293 MB → 1 MB
+50 MB flood (8 MiB live log kept, dropped at the end): 1 MB → 7 MB (+3 MB WAL) while running
+next collection: "gave 8.5 MB of database space back" → 1 MB, WAL 0 MB
+```
+Unit tests:
+- `old_finished_runs_are_pruned_with_everything_under_them`: an old finished run goes with its
+  groups, tasks and live logs; an old running run and a recent one stay; a second pass deletes
+  nothing.
+- `a_database_gives_freed_space_back_to_the_filesystem`, on a real file: an old-style database
+  with 5 MB written and deleted shrinks under 1 MB when opened, and rows deleted later come back
+  through `reclaim_space`.
+
+Two of my own mistakes along the way, both caught by measuring:
+- The first version vacuumed but didn't checkpoint, so the file stayed at 293 MB.
+- It also ran `incremental_vacuum` through `execute_batch`, which freed almost nothing (it frees a
+  page per step).
+
+**Verdict: SOLVED.** Limits:
+- Deleted runs can no longer be re-run (`/retest`, Re-run) or viewed. Ninety days is the
+  default for that reason.
+- The startup rewrite of a large old database blocks the server for its duration, once.
+- The CAS's own files (logs, artifacts, cached outputs) were already bounded by the cache GC.
+- An unrelated merge-queue e2e test (`merge_queue_batches_waiting_changes_and_bisects_failures`)
+  failed once in a full local run at load about 12, as it did once during P70. It passed 4/4
+  alone and in a full rerun, and has never failed in CI. Its "nothing was batched" assertion
+  depends on timing; noted, not fixed.

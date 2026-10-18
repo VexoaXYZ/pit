@@ -574,6 +574,11 @@ under 90% of the limit, the way bazel-remote does. Blobs younger than two minute
 runs from the last 14 days are kept. Evictions are logged, counted in `/api/stats`, and a
 task whose last result was evicted says so when it reruns. `POST /api/gc` collects now.
 
+**Run history.** Finished runs are kept for `PIT_HISTORY_DAYS` (default 90, `0` keeps them
+forever), with their groups, tasks and test results; their logs only for 14 days anyway. Space
+the database frees goes back to the filesystem at each collection. A database from an older
+version is rewritten once at startup for that (a few seconds for a large one).
+
 **Workspace disk.** Workers keep a warm workspace per repo and group, `node_modules` and
 `target` included. Every ten minutes a worker removes idle workspaces unused for 14 days, and
 past `--workspace-max-gb` (default 50, `0` for no size limit, env `PIT_WORKSPACE_MAX_GB`) the

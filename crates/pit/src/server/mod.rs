@@ -868,6 +868,27 @@ impl App {
     }
 }
 
+/// Finished runs are kept `PIT_HISTORY_DAYS` (default 90, `0` forever); their
+/// logs only 14 days anyway. Without this the database grows with every run.
+fn prune_history(app: &App) {
+    let days: i64 = std::env::var("PIT_HISTORY_DAYS")
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(90);
+    if days > 0 {
+        match app.db.prune_runs(now_ms() - days * 86_400_000) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("deleted {n} run(s) older than {days} days"),
+            Err(e) => tracing::warn!("pruning old runs: {e:#}"),
+        }
+    }
+    match app.db.reclaim_space() {
+        Ok(0) => {}
+        Ok(b) => tracing::info!("gave {:.1} MB of database space back", b as f64 / 1e6),
+        Err(e) => tracing::warn!("reclaiming database space: {e:#}"),
+    }
+}
+
 pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) -> Result<()> {
     // Requeue work from workers that went away.
     let reaper = app.clone();
@@ -911,7 +932,12 @@ pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) ->
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let app = gc_app.clone();
-            match tokio::task::spawn_blocking(move || gc::collect(&app, false)).await {
+            match tokio::task::spawn_blocking(move || {
+                prune_history(&app);
+                gc::collect(&app, false)
+            })
+            .await
+            {
                 Ok(Err(e)) => tracing::warn!("cache gc failed: {e:#}"),
                 Err(e) => tracing::warn!("cache gc panicked: {e}"),
                 _ => {}

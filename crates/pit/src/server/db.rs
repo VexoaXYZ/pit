@@ -507,6 +507,27 @@ impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Space freed by deleted rows goes back to the filesystem
+        // (`reclaim_space`) instead of staying in the file forever. A new
+        // database gets it before its first table; an older one is rewritten
+        // once.
+        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        if auto_vacuum != 2 {
+            let fresh: bool =
+                conn.query_row("SELECT NOT EXISTS (SELECT 1 FROM sqlite_master)", [], |r| {
+                    r.get(0)
+                })?;
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
+            if !fresh {
+                tracing::info!(
+                    "rewriting {} once so it can give space back",
+                    path.display()
+                );
+                // In WAL mode the file shrinks only once a checkpoint copies the
+                // rewritten pages back.
+                conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+            }
+        }
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         Ok(Db {
@@ -2505,6 +2526,59 @@ impl Db {
         Ok(())
     }
 
+    /// Deletes finished runs created before `before_ms`, with their groups,
+    /// tasks, test results and live logs. Their logs and artifacts are then
+    /// unreferenced, and the CAS collects them. Returns how many runs.
+    pub fn prune_runs(&self, before_ms: i64) -> Result<usize> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS pruned (id TEXT PRIMARY KEY);
+             DELETE FROM pruned;",
+        )?;
+        let n = tx.execute(
+            // At most 1000 a pass, oldest first: the lock is held throughout.
+            "INSERT INTO pruned (id) SELECT id FROM runs
+             WHERE created_at < ?1 AND status NOT IN ('queued', 'running')
+             ORDER BY created_at LIMIT 1000",
+            params![before_ms],
+        )?;
+        if n > 0 {
+            tx.execute_batch(
+                "DELETE FROM test_results WHERE task_id IN
+                   (SELECT id FROM tasks WHERE run_id IN (SELECT id FROM pruned));
+                 DELETE FROM task_logs WHERE task_id IN
+                   (SELECT id FROM tasks WHERE run_id IN (SELECT id FROM pruned));
+                 DELETE FROM tasks WHERE run_id IN (SELECT id FROM pruned);
+                 DELETE FROM groups_ WHERE run_id IN (SELECT id FROM pruned);
+                 DELETE FROM runs WHERE id IN (SELECT id FROM pruned);",
+            )?;
+        }
+        tx.execute_batch("DELETE FROM pruned;")?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Gives free pages back to the filesystem (see `Db::open`). Bytes freed.
+    pub fn reclaim_space(&self) -> Result<u64> {
+        let c = self.conn.lock();
+        let (free, size): (i64, i64) = c.query_row(
+            "SELECT freelist_count, page_size FROM pragma_freelist_count, pragma_page_size",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if free > 0 {
+            // It frees a page per step, so step it to the end.
+            let mut st = c.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = st.query([])?;
+            while rows.next()?.is_some() {}
+            drop(rows);
+            drop(st);
+            c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        Ok((free * size) as u64)
+    }
+
     /// Claims a schedule slot. False if this minute already fired.
     pub fn claim_schedule_slot(&self, key: &str, minute: i64) -> Result<bool> {
         let n = self.conn.lock().execute(
@@ -3238,6 +3312,111 @@ mod stats_tests {
         db.forget_shared_trusted_demotion().unwrap();
         assert!(db.demote_shared_trusted_results_once().unwrap());
         assert_eq!(db.cache_find("c", &shared).unwrap(), None);
+    }
+
+    #[test]
+    fn a_database_gives_freed_space_back_to_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pit.db");
+        // A database from before: no auto-vacuum, 5 MB written then deleted.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE junk (v BLOB);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                   INSERT INTO junk SELECT zeroblob(1000) FROM n;
+                 DELETE FROM junk;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        }
+        let size = || std::fs::metadata(&path).unwrap().len();
+        assert!(size() > 4_000_000, "{}", size());
+        let db = Db::open(&path).unwrap();
+        assert!(size() < 1_000_000, "the rewrite left {} bytes", size());
+        // From then on, rows deleted later are given back by `reclaim_space`.
+        db.conn
+            .lock()
+            .execute_batch(
+                "CREATE TABLE junk2 (v BLOB);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                   INSERT INTO junk2 SELECT zeroblob(1000) FROM n;
+                 DELETE FROM junk2;",
+            )
+            .unwrap();
+        assert!(db.reclaim_space().unwrap() > 4_000_000);
+        assert!(size() < 1_000_000, "reclaim left {} bytes", size());
+    }
+
+    #[test]
+    fn old_finished_runs_are_pruned_with_everything_under_them() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let run = |status: &str, created: i64| {
+            let id = db
+                .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
+                .unwrap();
+            db.insert_group(&id, "g", "linux", &[], &task).unwrap();
+            db.conn
+                .lock()
+                .execute(
+                    "UPDATE runs SET status = ?2, created_at = ?3 WHERE id = ?1",
+                    params![id, status, created],
+                )
+                .unwrap();
+            id
+        };
+        let old = run("passed", 1_000);
+        let old_running = run("running", 1_000);
+        let recent = run("failed", 10_000);
+        {
+            let c = db.conn.lock();
+            let t: String = c
+                .query_row(
+                    "SELECT id FROM tasks WHERE run_id = ?1",
+                    params![old],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            c.execute(
+                "INSERT INTO task_logs (task_id, seq, text) VALUES (?1, 1, 'x')",
+                params![t],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.prune_runs(5_000).unwrap(), 1);
+        let count = |table: &str, run: &str| -> i64 {
+            db.conn
+                .lock()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1"),
+                    params![run],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        for table in ["groups_", "tasks"] {
+            assert_eq!(count(table, &old), 0, "{table}");
+            assert_eq!(count(table, &old_running), 1, "{table}");
+            assert_eq!(count(table, &recent), 1, "{table}");
+        }
+        let logs: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM task_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(logs, 0);
+        assert!(db.run(&old).is_err());
+        assert!(db.run(&recent).is_ok());
+        assert_eq!(db.prune_runs(5_000).unwrap(), 0);
     }
 
     #[test]
