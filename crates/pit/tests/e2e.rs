@@ -4998,4 +4998,19 @@ async fn turbo_cache_from_tasks_is_split_by_trust() {
         .await
         .unwrap();
     assert_eq!(stale.status(), 401);
+    // Every cache route checks the token before doing anything, Bazel's
+    // shared CAS included, and a made-up one is refused the same way.
+    let cas = format!("{base}/bazel/cas/{}", "0".repeat(64));
+    for t in [token.as_str(), "pitc_made_up"] {
+        let got = http.get(&cas).bearer_auth(t).send().await.unwrap();
+        assert_eq!(got.status(), 401, "{t}");
+        let put = http
+            .put(format!("{base}/v8/artifacts/h3"))
+            .bearer_auth(t)
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 401, "{t}");
+    }
 }

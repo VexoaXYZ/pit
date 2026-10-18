@@ -16,40 +16,27 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use sha2::Digest;
 
-use super::api::{not_found, unauthorized, ApiError};
+use super::api::{not_found, ApiError};
 use super::db::CacheScope;
 use super::App;
 
 /// The prefix of a job's cache token (see `Db::claim`).
 pub const CACHE_TOKEN_PREFIX: &str = "pitc_";
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::trim)
-}
+/// The request's cache scope: a job's cache token's (checked live by the
+/// auth middleware), else the API token's, or a tokenless server's, which
+/// is trusted, as before.
+type Scope = Option<Extension<CacheScope>>;
 
-/// A job's cache token gives its run's scope; one that is no longer live is
-/// refused, never treated as the API token. Anything else got past auth with
-/// the API token (or the server has none), which is trusted, as before.
-fn scope(app: &App, headers: &HeaderMap) -> Result<CacheScope, ApiError> {
-    match bearer(headers).filter(|b| b.starts_with(CACHE_TOKEN_PREFIX)) {
-        None => Ok(CacheScope {
-            trusted: true,
-            repo: None,
-        }),
-        Some(token) => match app.db.cache_token_trust(token)? {
-            Some((trusted, repo, github)) => Ok(app.cache_scope(&repo, github, trusted)),
-            None => Err(unauthorized("this job's cache token is no longer live")),
-        },
-    }
+fn scope(scope: Scope) -> CacheScope {
+    scope.map(|Extension(s)| s).unwrap_or(CacheScope {
+        trusted: true,
+        repo: None,
+    })
 }
 
 /// The first entry under `ns` this scope may read.
@@ -119,10 +106,10 @@ struct HashesQuery {
 async fn turbo_query(
     State(app): State<Arc<App>>,
     Query(team): Query<TeamQuery>,
-    headers: HeaderMap,
+    req_scope: Scope,
     Json(q): Json<HashesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let scope = scope(&app, &headers)?;
+    let scope = scope(req_scope);
     let mut out = serde_json::Map::new();
     for h in q.hashes.iter().filter(|h| valid_key(h)) {
         if let Some(meta) = find(&app, &scope, &team.ns(), h)? {
@@ -155,12 +142,12 @@ async fn turbo_get(
     method: Method,
     Path(hash): Path<String>,
     Query(team): Query<TeamQuery>,
-    req_headers: HeaderMap,
+    req_scope: Scope,
 ) -> Result<Response, ApiError> {
     if !valid_key(&hash) {
         return Err(not_found("artifact"));
     }
-    let scope = scope(&app, &req_headers)?;
+    let scope = scope(req_scope);
     let meta = find(&app, &scope, &team.ns(), &hash)?.ok_or_else(|| not_found("artifact"))?;
     let (digest, duration) = split_meta(&meta);
     let mut headers = HeaderMap::new();
@@ -180,6 +167,7 @@ async fn turbo_put(
     State(app): State<Arc<App>>,
     Path(hash): Path<String>,
     Query(team): Query<TeamQuery>,
+    req_scope: Scope,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -191,7 +179,7 @@ async fn turbo_put(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let scope = scope(&app, &headers)?;
+    let scope = scope(req_scope);
     let digest = app.cas.put(&body)?;
     app.db.kv_put(
         &scope.write_key(&team.ns()),
@@ -217,13 +205,13 @@ async fn bazel_get(
     State(app): State<Arc<App>>,
     method: Method,
     Path((kind, hash)): Path<(String, String)>,
-    headers: HeaderMap,
+    req_scope: Scope,
 ) -> Result<Response, ApiError> {
     let ns = bazel_ns(&kind)?;
     let digest = if ns == "bazel:cas" {
         app.db.kv_get(ns, &hash)?
     } else {
-        find(&app, &scope(&app, &headers)?, ns, &hash)?
+        find(&app, &scope(req_scope), ns, &hash)?
     }
     .ok_or_else(|| not_found("blob"))?;
     if method == Method::HEAD {
@@ -236,12 +224,11 @@ async fn bazel_get(
 async fn bazel_put(
     State(app): State<Arc<App>>,
     Path((kind, hash)): Path<(String, String)>,
-    headers: HeaderMap,
+    req_scope: Scope,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let ns = bazel_ns(&kind)?;
-    // Checked before anything is stored, CAS writes included.
-    let scope = scope(&app, &headers)?;
+    let scope = scope(req_scope);
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(anyhow::anyhow!("bazel keys are sha256 hex").into());
     }

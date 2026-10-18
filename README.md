@@ -498,7 +498,10 @@ So a branch can't plant an artifact under a hash main will compute, which is cac
 The token works only while its job runs, and only on these cache routes; it can't report
 results. Bazel's CAS is shared whatever the trust, because every blob is checked against its
 sha256. Requests with the API token keep full access, so don't hand `$PIT_TOKEN` to pull
-request builds.
+request builds. On a server without an API token, a build that leaves the job token out gets
+full access too, so the split protects main only on a server with one. A task in a container
+reaches `$PIT_CACHE_URL` only if that address works from inside the container (not
+`127.0.0.1`).
 
 ## Agents (MCP)
 

@@ -39,10 +39,6 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub fn unauthorized(why: impl std::fmt::Display) -> ApiError {
-    ApiError(StatusCode::UNAUTHORIZED, anyhow::anyhow!("{why}"))
-}
-
 pub fn not_found(what: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, anyhow::anyhow!("{what} not found"))
 }
@@ -110,36 +106,52 @@ struct TokenQuery {
 async fn auth(
     State(app): State<Arc<App>>,
     Query(q): Query<TokenQuery>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
+    let refuse = |why: &str| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": why })),
+        )
+            .into_response()
+    };
     let header = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    // OIDC discovery and keys are public: clouds fetch them to verify tokens.
     let path = req.uri().path();
-    // A job's cache token opens the Turborepo and Bazel routes only; those
-    // handlers check it is live and give it its run's scope.
+    // A job's cache token opens the Turborepo and Bazel routes only, while
+    // its group runs. Checked here, before any body is read; the handlers
+    // get its run's scope.
     let cache_token = (path.starts_with("/v8/") || path.starts_with("/bazel/"))
-        && header
-            .and_then(|h| h.strip_prefix("Bearer "))
-            .is_some_and(|b| {
-                b.trim()
-                    .starts_with(super::remote_cache::CACHE_TOKEN_PREFIX)
-            });
+        .then(|| {
+            header
+                .and_then(|h| h.strip_prefix("Bearer "))
+                .map(str::trim)
+        })
+        .flatten()
+        .filter(|b| b.starts_with(super::remote_cache::CACHE_TOKEN_PREFIX))
+        .map(String::from);
+    if let Some(token) = cache_token {
+        return match app.db.cache_token_trust(&token) {
+            Ok(Some((trusted, repo, github))) => {
+                req.extensions_mut()
+                    .insert(app.cache_scope(&repo, github, trusted));
+                next.run(req).await
+            }
+            Ok(None) => refuse("this job's cache token is no longer live"),
+            Err(e) => ApiError::from(e).into_response(),
+        };
+    }
+    // OIDC discovery and keys are public: clouds fetch them to verify tokens.
     if path == "/api/health"
         || path.starts_with("/.well-known/")
-        || cache_token
         || app.authorized(header, q.token.as_deref())
     {
         next.run(req).await
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "missing or invalid token" })),
-        )
-            .into_response()
+        refuse("missing or invalid token")
     }
 }
 
