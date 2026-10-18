@@ -4441,3 +4441,85 @@ It fails at "the missed slot" without the catch-up.
 - A schedule committed while the server was down can fire at start-up for a slot that fell after
   the commit.
 - No independent review this round: the slot claim that prevents double runs is unchanged.
+
+## P70. Any branch could read the production deploy key
+
+**The pain.** In CI, secrets usually go to whatever job asks for them, and the job is defined by
+the code being tested. On GitHub Actions, a workflow change in a same-repo branch can read every
+repository secret. That's why GitHub added environment secrets with deployment-branch rules and
+required reviewers, and why the "pwn request" class of incidents happens when workflows hand
+secrets to code from a pull request
+([GitHub docs: environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments),
+[GitHub Security Lab: pwn requests](https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/)).
+
+**Reproduction** (`/tmp/painhunt/p70`). Pit gave a task any secret in the worker's secrets file
+if its config listed it in `secrets`; only fork pull requests got none. A branch controls its
+own config, so a task on a `feature` branch asked for the deploy token. It printed only the
+length and a hash prefix, which masking doesn't catch:
+```
+exfil │ got DEPLOY_TOKEN: len=21 sha=5454114bb9ea      (the real value's sha: 5454114bb9ea)
+```
+On a GitHub-connected server, any collaborator's branch could do this. On a shared server, so
+could anyone with the API token.
+
+**Fix.**
+- **A `[trusted]` section** in the worker's secrets file, for deploy keys. Those secrets reach
+  only jobs the server marks `trusted_secrets`: a trusted run (default branch, merge queue,
+  schedule) and, on a server with an API token, only of a repo the GitHub webhook registered
+  (P65's rule). The server decides at claim time, never the config.
+- **Withheld, with a reason.** Anything else that asks gets a log note instead. That note, and
+  the fork note, which had the same gap, are now kept in the stored log.
+- **Confinement.** On a worker holding `[trusted]` secrets, every other job is confined the way
+  forks are, because code on the host could read the file directly:
+  - its tasks and `runtime` probes run only in docker (a worker without docker refuses them, and
+    says why);
+  - it gets a throwaway workspace, deleted afterwards;
+  - its tasks run one at a time;
+  - it gets no persistent container home.
+- **Hidden.** Trusted names are hidden from the inherited environment and never read through
+  `env:`.
+- **Fails closed.** The file refuses to load on an unknown `[section]` (`[Trusted]`, a trailing
+  comment and a BOM are accepted), and the error names the line number, not the line. `pit up`
+  checks the file before starting.
+
+**After** (same repro, the token moved under `[trusted]`):
+```
+exfil │ [pit: DEPLOY_TOKEN is for trusted runs only (the default branch, the merge queue, schedules); withheld]
+exfil │ got DEPLOY_TOKEN: len=0 sha=e3b0c44298fc
+a schedule run of main:  got DEPLOY_TOKEN: len=21 sha=5454114bb9ea
+```
+The e2e test `trusted_secrets_reach_only_trusted_runs` covers servers with and without a token:
+- **Branch runs** are withheld the secret and run in a container that can't read the secrets
+  file (`file=unreadable`). Without docker they are refused.
+- **A planted `.git` hook** never runs on the host.
+- **Throwaway workspaces** are deleted.
+- **A trusted run** gets the secret, and so does an API repo's trusted run once the repo is
+  webhook-registered.
+
+Checked against the test, each fails with its part of the fix removed: `file=readable`, "a
+branch's git hook ran on the worker's host", and "a confined run's workspace was left on disk".
+Unit tests cover the parser: accepted spellings, rejected headers, and a name in both sections
+being trusted-only.
+
+**Review.** Four independent rounds:
+1. **Round 1 found a blocker.** The gate stopped only configs asking by name; branch code on the
+   host, or a `runtime` probe, could read the file. Fixed by docker confinement. It also found
+   that near-miss headers failed open, which is fixed, and that reruns aren't trusted, which is
+   now documented.
+2. **Round 2 found two more blockers.** Confined jobs reused warm workspaces, so a planted git hook
+   ran on the host at the next checkout; reproduced, then fixed with throwaway workspaces. And a
+   symlink race while collecting outputs; fixed with serial tasks.
+3. **Round 3 found my own regression.** Those throwaway workspaces were never deleted; fixed and
+   tested.
+4. **Round 4: APPROVE.**
+
+**Verdict: SOLVED** for deploy secrets kept under `[trusted]`, on upgraded workers. Limits:
+- **Older workers fail open.** They skip the header and hand those secrets to any task that asks;
+  the README says to upgrade workers first.
+- **Branch runs on a worker holding deploy keys** need docker, start cold, and run serially. Keep
+  deploy keys on separate workers if branches need the host.
+- **Reruns.** A GitHub Re-run or `/retest` of a main commit isn't trusted, so it gets no deploy
+  keys.
+- **Undeletable workspaces.** A confined job can make its throwaway workspace undeletable
+  (`chmod 000`), so it leaks until the workspace GC, which hits the same error. A slow disk-filling
+  path, no worse than before; not fixed.
