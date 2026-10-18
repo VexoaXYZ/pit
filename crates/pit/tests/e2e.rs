@@ -5866,4 +5866,49 @@ async fn sharded_groups_get_one_check_with_a_stable_name() {
     let all = last("pit / ci");
     assert_eq!(all["state"], "success");
     assert_eq!(all["description"], "2 of 2 shards passed");
+
+    // Left out of this kind of run (`on`), as on a pull request when the
+    // group runs on pushes only: the combined check still reports (as each
+    // shard does), so a required `pit / ci` doesn't wait.
+    write(
+        repo.path(),
+        "pit.config.json",
+        r#"{"groups":{"ci":{"on":["push"],"tasks":{"test":{"run":"true","shards":2,"cache":false}}}}}"#,
+    );
+    sh(repo.path(), "git commit -qam push-only");
+    let sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    let body = serde_json::json!({ "action": "opened", "number": 3,
+        "repository": { "full_name": "acme/web", "clone_url": repo.path().to_string_lossy(), "default_branch": "main" },
+        "pull_request": { "number": 3, "draft": false,
+            "head": { "sha": sha, "ref": "f", "repo": { "full_name": "acme/web" } },
+            "base": { "ref": "main", "repo": { "full_name": "acme/web" } } } })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "pull_request")
+        .header("x-hub-signature-256", sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    pit::cli::wait(&client, resp["run"].as_str().unwrap(), |_| {})
+        .await
+        .unwrap();
+    posted.lock().unwrap().retain(|b| {
+        b["target_url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with(resp["run"].as_str().unwrap()))
+    });
+    assert_eq!(
+        last("pit / ci")["state"],
+        "success",
+        "{:?}",
+        posted.lock().unwrap()
+    );
 }

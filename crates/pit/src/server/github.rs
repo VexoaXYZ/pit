@@ -483,43 +483,159 @@ impl GitHub {
         }
         for (base, shards) in sharded {
             let left_out = |g: &GroupView| app.db.group(&g.id).map(|r| r.left_out).unwrap_or(false);
-            // Left out of this kind of run: each shard already says so.
-            if shards.iter().all(|g| left_out(g)) {
-                continue;
+            let all_left_out = shards.iter().all(|g| left_out(g));
+            // Left out of this kind of run, as each shard is: reported as
+            // skipped (a required check must not wait), unless another run of
+            // the commit really runs the group, whose check counts.
+            if all_left_out {
+                let mut elsewhere = false;
+                for g in &shards {
+                    elsewhere |=
+                        app.db
+                            .real_group_on_commit(&run.repo_id, &run.sha, &g.name, run_id)?;
+                }
+                if elsewhere {
+                    continue;
+                }
             }
             let done = shards.iter().filter(|g| g.status.is_done()).count();
             let passed = shards.iter().filter(|g| g.status.is_ok()).count();
-            let status = if done < shards.len() {
+            let has = |s: Status| shards.iter().any(|g| g.status == s);
+            let status = if all_left_out {
+                Status::Skipped
+            } else if done < shards.len() {
                 Status::Running
             } else if passed == shards.len() {
                 Status::Passed
-            } else {
+            } else if has(Status::Failed) {
                 Status::Failed
+            } else if has(Status::Error) {
+                Status::Error
+            } else {
+                Status::Skipped
             };
             let summary = format!("{passed} of {} shards passed", shards.len());
             let key = format!("shards\0{run_id}\0{base}");
             let said = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                (status.as_str(), summary.as_str()).hash(&mut h);
+                // While running, only a change of state is worth a post.
+                let shown = if status == Status::Running {
+                    ""
+                } else {
+                    summary.as_str()
+                };
+                (status.as_str(), shown).hash(&mut h);
                 h.finish()
             };
             if self.reported.lock().get(&key) == Some(&said) {
                 continue;
             }
-            self.report_one(
+            self.report_shards(
                 app,
                 &full,
                 &run.sha,
-                None,
+                run_id,
                 base,
+                &shards[0].id,
                 status,
+                all_left_out,
                 &summary,
                 &details,
-                &[],
             )
             .await?;
             self.reported.lock().insert(key, said);
+        }
+        Ok(())
+    }
+
+    /// The combined check of a sharded group (see `try_report_run`): a
+    /// commit status, or one check run per run and group, created once and
+    /// then updated, as a group's own is. Re-run on it reruns the run, as on
+    /// any shard's (`external_id` is the first shard's group).
+    #[allow(clippy::too_many_arguments)]
+    async fn report_shards(
+        &self,
+        app: &Arc<App>,
+        full: &str,
+        sha: &str,
+        run_id: &str,
+        base: &str,
+        first_shard: &str,
+        status: Status,
+        left_out: bool,
+        summary: &str,
+        details: &str,
+    ) -> Result<()> {
+        let check_name = format!("pit / {base}");
+        match &self.auth {
+            Auth::Token(_) => {
+                let state = match status {
+                    Status::Queued | Status::Running => "pending",
+                    s if s.is_ok() || left_out => "success",
+                    Status::Error => "error",
+                    _ => "failure",
+                };
+                self.call(
+                    full,
+                    reqwest::Method::POST,
+                    &format!("/repos/{full}/statuses/{sha}"),
+                    serde_json::json!({ "state": state, "context": check_name, "description": summary, "target_url": details }),
+                )
+                .await?;
+            }
+            Auth::App { .. } => {
+                let mut body = serde_json::json!({
+                    "name": check_name,
+                    "head_sha": sha,
+                    "details_url": details,
+                    "external_id": first_shard,
+                    "output": { "title": format!("{base}: {}", status.as_str()), "summary": summary },
+                });
+                match status {
+                    Status::Queued => body["status"] = "queued".into(),
+                    Status::Running => body["status"] = "in_progress".into(),
+                    s => {
+                        body["status"] = "completed".into();
+                        body["conclusion"] = match s {
+                            Status::Passed | Status::Cached => "success",
+                            Status::Skipped if left_out => "skipped",
+                            Status::Skipped => "cancelled",
+                            _ => "failure",
+                        }
+                        .into();
+                    }
+                }
+                let key = format!("{run_id}\0{base}");
+                let existing = app
+                    .db
+                    .kv_get("shard-check", &key)?
+                    .and_then(|v| v.parse::<u64>().ok());
+                match existing {
+                    Some(id) => {
+                        self.call(
+                            full,
+                            reqwest::Method::PATCH,
+                            &format!("/repos/{full}/check-runs/{id}"),
+                            body,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        let created = self
+                            .call(
+                                full,
+                                reqwest::Method::POST,
+                                &format!("/repos/{full}/check-runs"),
+                                body,
+                            )
+                            .await?;
+                        if let Some(id) = created["id"].as_u64() {
+                            app.db.kv_put("shard-check", &key, &id.to_string())?;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }

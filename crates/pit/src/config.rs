@@ -260,6 +260,10 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
         if !plain(gname) {
             bail!("group name {gname:?} must be a relative name without `.`/`..` parts, `\\` or control characters");
         }
+        // `name#k` is how shards are named (and their combined check found).
+        if gname.contains('#') {
+            bail!("group name {gname:?} must not contain `#`, which names shards");
+        }
         for tname in group.tasks.keys() {
             if !plain(tname) {
                 bail!("task name {gname}.{tname:?} must be a relative name without `.`/`..` parts, `\\` or control characters");
@@ -341,6 +345,15 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn group_names_cannot_contain_hash() {
+        let c: crate::model::PitConfig =
+            serde_json::from_str(r#"{"groups":{"ci#1":{"tasks":{"t":{"run":"true"}}}}}"#).unwrap();
+        let err = normalize(c).unwrap_err().to_string();
+        assert!(err.contains("must not contain `#`"), "{err}");
+    }
+
     use super::*;
 
     #[tokio::test]

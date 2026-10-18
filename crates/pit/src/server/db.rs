@@ -15,7 +15,7 @@ use crate::model::*;
 /// (checks whose annotations were sent).
 macro_rules! internal_kv {
     () => {
-        "('last', 'pr-origin', 'annotated')"
+        "('last', 'pr-origin', 'annotated', 'shard-check')"
     };
 }
 
