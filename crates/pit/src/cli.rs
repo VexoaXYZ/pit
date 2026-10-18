@@ -540,6 +540,12 @@ pub async fn flaky(client: &Client, days: u32) -> Result<i32> {
     Ok(0)
 }
 
+/// Where an artifact goes under `out`: refused if the group, task or path
+/// (from a run's config and workspace, a fork's included) would leave it.
+fn artifact_dest(out: &Path, group: &str, task: &str, path: &str) -> Result<PathBuf> {
+    crate::worker::files::safe_join(out, &format!("{group}/{task}/{path}"))
+}
+
 /// Downloads a run's artifacts into `out/<group>/<task>/<path>`.
 pub async fn artifacts(client: &Client, run: &str, task: Option<&str>, out: &Path) -> Result<i32> {
     let view: RunView = client.get(&format!("/api/runs/{run}")).await?;
@@ -556,7 +562,7 @@ pub async fn artifacts(client: &Client, run: &str, task: Option<&str>, out: &Pat
                 // One checked path: names and paths come from the run's config
                 // and workspace, a fork's included.
                 let rel = format!("{}/{}/{}", g.name, t.name, a.path);
-                let fetched = match crate::worker::files::safe_join(out, &rel) {
+                let fetched = match artifact_dest(out, &g.name, &t.name, &a.path) {
                     Ok(dest) => match client.cas_get(&a.digest).await {
                         Ok(data) => {
                             crate::worker::files::write_file(&dest, &data, false).map(|_| dest)
@@ -675,4 +681,31 @@ pub async fn stats(client: &Client) -> Result<i32> {
     let s: serde_json::Value = client.get("/api/stats").await?;
     println!("{}", serde_json::to_string_pretty(&s)?);
     Ok(0)
+}
+
+#[cfg(test)]
+mod artifact_path_tests {
+    use super::artifact_dest;
+    use std::path::Path;
+
+    #[test]
+    fn downloads_never_leave_the_output_directory() {
+        let out = Path::new("/tmp/out");
+        assert_eq!(
+            artifact_dest(out, "ci", "typecheck:@acme/web", "report/a.png").unwrap(),
+            Path::new("/tmp/out/ci/typecheck:@acme/web/report/a.png")
+        );
+        for (g, t, p) in [
+            ("/home/u/sub", "..", ".bashrc"),
+            ("ci", "..", "../x"),
+            ("..", "t", "x"),
+            ("ci", "t", "a/../../x"),
+        ] {
+            assert!(artifact_dest(out, g, t, p).is_err(), "{g} {t} {p}");
+        }
+        // A leading `/` in the path is just an empty component: still inside.
+        assert!(artifact_dest(out, "ci", "t", "/etc/passwd")
+            .unwrap()
+            .starts_with("/tmp/out/ci/t"));
+    }
 }
