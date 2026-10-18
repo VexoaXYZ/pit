@@ -5587,3 +5587,88 @@ Limits:
 - **Steps share it.** Tasks of one job don't share a temp dir, unlike steps sharing
   `RUNNER_TEMP`. Pass files between tasks through the workspace.
 - **`$HOME` is still shared** by host tasks on one worker; containers have their own (P59).
+
+## P88. A closed pull request's CI keeps running
+
+**The pain.** Closing or merging a pull request doesn't stop its CI. In
+[community discussion #178882](https://github.com/orgs/community/discussions/178882) ("RFE Add
+option to automatically cancel workflow/job when pull request is closed", November 2025), the
+author has long-running PR checks and wants them cancelled "to avoid wasting resources and
+runners". Every workaround offered (a cancel job on the `closed` event, a concurrency group, an
+API call) "requires the runner to be available", which it isn't when the queue is full; with
+concurrency, "the cancellation is triggered only when a new job for the same group is queued".
+The discussion was closed unanswered.
+
+Pit stopped a PR's runs when it went back to draft (P77), but on `closed` it only took the PR out
+of the merge queue.
+
+**Reproduction** (`/tmp/painhunt/p88`, a scratch server in GitHub token mode on port 7982, signed
+`pull_request` webhooks sent with `curl`; the task sleeps 60 s):
+```
+opened:  {"run":"run_bd03829e5635"}
+closed:  {"dequeued":0}
+         run_bd03829e5635 running   [('default', 'running', 'box')]
+a minute later: run_bd03829e5635 passed
+```
+The worker spent the whole minute on a PR nobody will merge.
+
+**Fix.**
+- **Cancel on close.** On `closed`, merged or not, the server cancels the PR's runs still queued
+  or running, with the message "pull request closed", as `pit cancel` would. A merge starts its
+  own run on the base branch, and the merge queue's runs were already handled.
+- **Found by PR number.** That covers the runs of its pushes, its `/retest`s and its re-runs,
+  found by PR number, not by ref. A `/retest` copies the ref of the commit's newest run, which
+  may be the branch's push run.
+- **The head commit keeps its result.** A PR run and its branch's push run post under the same
+  check names, so the cancellation would turn the commit red even when the push run passed. A
+  run cancelled because its PR was closed reports each group it never finished with the
+  commit's newest real result for that group from another run (passed, failed or error, never a
+  cancellation). That is one post, on the run's own check, which is the newest of its name,
+  with the summary, annotations and link of the run the result came from. When the push run is
+  still going at the close (one push starts both runs), it has no result yet: once it reports
+  one, the closed run reports again with it.
+- **Back to draft (P77)** uses the same lookup now, so it also stops `/retest` and re-run runs,
+  which it missed.
+
+**After** (the final build; the scratch setup rebuilt after a reboot cleared `/tmp`, same steps):
+```
+opened:  {"run":"run_7204561e4a02"}
+closed:  {"cancelled":1,"dequeued":0}
+         run_7204561e4a02 failed: pull request closed   [('default', 'skipped')]
+worker:  17:34:33 slot 1: run_7204561e4a02 ... 409 Conflict: group ... is no longer claimed by this worker
+         (6 s after it started; no `sleep 60` process left)
+```
+The check results are proven by the e2e tests below, not live: this machine has no GitHub to
+post to.
+The e2e test `draft_pull_requests_run_when_marked_ready` now also closes a PR while its run is
+in progress, and checks it is cancelled with that message. Without the fix it fails. In that
+case the branch's push run of the same commit passed first: the last `pit / default` status on
+the commit must be `success`, and without that substitution it is `failure`. The App-auth test
+`a_closed_pull_requests_check_keeps_the_commits_result` checks the same on check runs: the
+newest `pit / default` check ends `success`, and `cancelled` without it. It also closes the PR
+while the push run is still running, ahead of the PR run: the newest check shows `cancelled`
+until the push run passes, then `success`. Without the re-report it stays `cancelled`. A unit test checks that a
+`/retest` carrying the branch's ref is found, and push, queue and other PRs' runs aren't.
+
+**Review.** Four independent rounds; the fourth went past the usual three because the open
+finding was about the order checks are posted in.
+- **Round 1: changes.** Runs were found by ref, missing a `/retest` that took the branch's ref;
+  now by PR number. The cancellation turned a passed head commit red.
+- **Round 2: changes.** My first answer re-posted the push run's result, which loses under App
+  auth (GitHub shows the newest check run of a name, and the PR run's is newer), could re-post
+  other cancelled runs, and raced rate-limit retries. Replaced by the closed run reporting the
+  commit's real result on its own check.
+- **Round 3: changes.** When the push run was still running at the close, the closed run's check
+  stayed `cancelled`; now it reports again once a result lands (tested both ways). The
+  summary, annotations and link now come from the run the result came from.
+- **Round 4: APPROVE.** Its three nits were fixed: a red `pit / plan` check for a PR closed
+  during planning (now nothing is posted), the re-report skipped when a post failed, and
+  re-reports on every report of a run without results.
+
+**Verdict: SOLVED.** Limits:
+- **A race.** A run created by a webhook handled at the same moment as the close can slip past
+  it and run to the end. Reopening starts a new run.
+- **Nothing else on the commit.** A PR closed with no other result on its commit leaves its
+  checks `cancelled`, as GitHub does for a cancelled workflow.
+- **Combined checks link to the closed run.** A sharded group's combined check shows the right
+  state but its link opens the closed run.

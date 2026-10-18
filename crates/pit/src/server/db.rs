@@ -767,6 +767,22 @@ impl Db {
         .optional()?)
     }
 
+    /// A pull request's runs still queued or running: of its pushes, its
+    /// `/retest`s and its re-runs, whatever ref they copied (a `/retest` of a
+    /// commit whose newest run was its branch's push takes that ref). Not
+    /// merge queue candidates.
+    pub fn active_pr_runs(&self, repo_id: &str, pr: u64) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT id FROM runs WHERE repo_id = ?1 AND github_pr = ?2 AND overlay IS NULL
+               AND trigger IN ('pr', 'retest', 'rerun') AND status IN ('queued', 'running')",
+        )?;
+        let ids = st
+            .query_map(params![repo_id, pr as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
     /// The run a rerun of this commit copies its restrictions from: one
     /// without secrets if any was (a fork's commit), else the newest.
     pub fn prior_run(&self, repo_id: &str, sha: &str) -> Result<Option<RunRow>> {
@@ -1775,6 +1791,47 @@ impl Db {
             .exists(params![repo_id, sha, name, run_id])?)
     }
 
+    /// Runs of this commit, other than `run_id`, cancelled because their
+    /// pull request was closed (see `github::PR_CLOSED`).
+    pub fn closed_pr_runs_on_commit(
+        &self,
+        repo_id: &str,
+        sha: &str,
+        run_id: &str,
+    ) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT id FROM runs WHERE repo_id = ?1 AND sha = ?2 AND id != ?3
+               AND overlay IS NULL AND message = 'pull request closed'",
+        )?;
+        let ids = st
+            .query_map(params![repo_id, sha, run_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// The other run of this commit whose group of this name most recently
+    /// finished with a result (passed, failed or error: not cancelled).
+    pub fn newest_result_elsewhere(
+        &self,
+        repo_id: &str,
+        sha: &str,
+        name: &str,
+        run_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .prepare_cached(
+                "SELECT r.id FROM groups_ g JOIN runs r ON r.id = g.run_id
+                 WHERE r.repo_id = ?1 AND r.sha = ?2 AND g.name = ?3 AND r.id != ?4 AND g.left_out = 0
+                   AND r.overlay IS NULL AND g.status IN ('passed', 'failed', 'error')
+                 ORDER BY g.finished_at DESC LIMIT 1",
+            )?
+            .query_row(params![repo_id, sha, name, run_id], |r| r.get(0))
+            .optional()?)
+    }
+
     /// Runs of this commit that really run a group of this name.
     pub fn real_group_runs(&self, repo_id: &str, sha: &str, name: &str) -> Result<Vec<String>> {
         let c = self.conn.lock();
@@ -2762,6 +2819,30 @@ mod tests {
         assert_eq!(job.group_id, linux);
         assert!(db.heartbeat_group(&job.group_id, Some(&job.lease)).unwrap());
         assert!(!db.heartbeat_group(&job.group_id, Some("stale")).unwrap());
+    }
+
+    #[test]
+    fn a_pull_requests_active_runs_are_found_by_number_not_ref() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = |r: &str, trigger: &str, pr: Option<u64>| {
+            db.insert_run(&repo.id, "sha", Some(r), None, 0, trigger, false, pr, false)
+                .unwrap()
+        };
+        let pr = run("pull/7", "pr", Some(7));
+        // A `/retest` that copied the ref of the commit's newest run, its
+        // branch's push.
+        let retest = run("feature", "retest", Some(7));
+        run("feature", "push", None);
+        run("pull/7", "queue", Some(7));
+        run("pull/8", "pr", Some(8));
+        let done = run("pull/7", "pr", Some(7));
+        assert!(db.cancel_run_because(&done, "x").unwrap());
+        let mut found = db.active_pr_runs(&repo.id, 7).unwrap();
+        found.sort();
+        let mut want = vec![pr, retest];
+        want.sort();
+        assert_eq!(found, want);
     }
 
     #[test]

@@ -356,13 +356,67 @@ impl GitHub {
         let Some(full) = repo.github.clone() else {
             return Ok(());
         };
-        let view = app.db.run_view(run_id)?;
+        let mut view = app.db.run_view(run_id)?;
+        // Cancelled because its pull request was closed: a group it never
+        // finished shows the commit's newest real result for that name (its
+        // branch's push run posts under the same check names), not
+        // "cancelled" over a commit that passed. Posted on this run's own
+        // check, the newest one of that name, with the summary, annotations
+        // and link of the run the result came from: (run, group, no_secrets).
+        let mut sources: std::collections::HashMap<String, (String, String, bool)> =
+            Default::default();
+        let closed = view.message.as_deref() == Some(PR_CLOSED);
+        if closed {
+            for g in view
+                .groups
+                .iter_mut()
+                .filter(|g| g.status == Status::Skipped)
+            {
+                let Some(other) =
+                    app.db
+                        .newest_result_elsewhere(&run.repo_id, &run.sha, &g.name, run_id)?
+                else {
+                    continue;
+                };
+                if let Some(real) = app
+                    .db
+                    .run_view(&other)?
+                    .groups
+                    .into_iter()
+                    .find(|o| o.name == g.name)
+                {
+                    let no_secrets = app.db.run(&other)?.no_secrets;
+                    sources.insert(g.id.clone(), (other, real.id.clone(), no_secrets));
+                    *g = GroupView {
+                        id: g.id.clone(),
+                        ..real
+                    };
+                }
+            }
+        }
         let details = format!("{}/runs/{run_id}", app.public_url);
         // Skipped on purpose (`[skip ci]`, a draft with `drafts: false`):
         // nothing, as GitHub posts nothing for a workflow it skips. A
         // "skipped" or "failure" check would show a red X on a release bot's
         // commit, and a passing one could satisfy a required check.
         if view.groups.is_empty() && view.status == Status::Skipped {
+            return Ok(());
+        }
+        // A closed pull request's run of this commit that reported before
+        // this run had results: its check is newer than this run's (App
+        // auth), so it reports again, now with them. It reads them from the
+        // database, so whatever the posts below do.
+        if !closed && view.groups.iter().any(|g| g.status.is_done()) {
+            for other in app
+                .db
+                .closed_pr_runs_on_commit(&run.repo_id, &run.sha, run_id)?
+            {
+                self.report_later(app, &other);
+            }
+        }
+        // Closed before it was planned: nothing to show, and a "plan" check
+        // no other run posts would stay red on the commit.
+        if closed && view.groups.is_empty() {
             return Ok(());
         }
         if view.groups.is_empty() && view.status.is_done() {
@@ -382,7 +436,15 @@ impl GitHub {
                 .await;
         }
         for g in &view.groups {
-            let summary = summarize(g, run_id, run.no_secrets);
+            let source = sources.get(&g.id);
+            let summary = match source {
+                Some((other, _, no_secrets)) => summarize(g, other, *no_secrets),
+                None => summarize(g, run_id, run.no_secrets),
+            };
+            let group_details = match source {
+                Some((other, _, _)) => format!("{}/runs/{other}", app.public_url),
+                None => details.clone(),
+            };
             // Left out of this kind of run (`on`): reported "skipped", which
             // GitHub counts as passing for a required check, as for a job an
             // `if:` skips. Unless another run of this commit really runs that
@@ -398,7 +460,8 @@ impl GitHub {
             }
             let status = if left_out { Status::Skipped } else { g.status };
             let annotations = if g.status.is_done() {
-                app.db.group_annotations(&g.id)?
+                app.db
+                    .group_annotations(source.map_or(&g.id, |(_, id, _)| id))?
             } else {
                 vec![]
             };
@@ -447,7 +510,7 @@ impl GitHub {
                 &g.name,
                 status,
                 &summary,
-                &details,
+                &group_details,
                 &annotations,
             )
             .await?;
@@ -1117,11 +1180,19 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 let reason = if unlabeled {
                     "merge label removed"
                 } else {
-                    "pull request closed"
+                    PR_CLOSED
                 };
                 let n =
                     super::queue::remove(app, &format!("pr/{number}"), Some(&repo.name), reason)?;
-                return Ok(serde_json::json!({ "dequeued": n }));
+                // Closed (merged or not), its runs still in progress only
+                // hold workers: nothing will read them, and a merge starts
+                // its own run on the base branch.
+                let cancelled = if unlabeled {
+                    0
+                } else {
+                    cancel_pr_runs(app, &repo.id, number, reason).await?
+                };
+                return Ok(serde_json::json!({ "dequeued": n, "cancelled": cancelled }));
             }
             // Back to draft, with `drafts: false`: the PR's runs still in
             // progress stop, as its next pushes would be skipped. The config
@@ -1139,19 +1210,9 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 if !skips {
                     return Ok(serde_json::json!({ "ignored": action }));
                 }
-                let mut cancelled = 0;
-                for id in app
-                    .db
-                    .superseded_runs(&repo.id, "pr", &format!("pull/{number}"), "")?
-                {
-                    if app
-                        .db
-                        .cancel_run_because(&id, "pull request converted to draft")?
-                    {
-                        app.run_finished(&id).await;
-                        cancelled += 1;
-                    }
-                }
+                let cancelled =
+                    cancel_pr_runs(app, &repo.id, number, "pull request converted to draft")
+                        .await?;
                 return Ok(serde_json::json!({ "cancelled": cancelled }));
             }
             // `ready_for_review`: a draft marked ready runs then, if the
@@ -1325,6 +1386,24 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
         }
         other => Ok(serde_json::json!({ "ignored": other })),
     }
+}
+
+/// Why a pull request's runs are cancelled when it is closed; such a run
+/// reports differently (see `try_report_run`). One cancelled for another
+/// reason (back to draft), or with no other result on its commit, still
+/// reports "cancelled".
+const PR_CLOSED: &str = "pull request closed";
+
+/// Stops a pull request's runs still in progress (see `Db::active_pr_runs`).
+async fn cancel_pr_runs(app: &Arc<App>, repo_id: &str, number: u64, reason: &str) -> Result<usize> {
+    let mut cancelled = 0;
+    for id in app.db.active_pr_runs(repo_id, number)? {
+        if app.db.cancel_run_because(&id, reason)? {
+            app.run_finished(&id).await;
+            cancelled += 1;
+        }
+    }
+    Ok(cancelled)
 }
 
 /// Pushes and pull requests whose webhook never arrived (the server was down

@@ -5479,6 +5479,94 @@ async fn draft_pull_requests_run_when_marked_ready() {
         v.message.as_deref(),
         Some("pull request converted to draft")
     );
+
+    // Closed while a run is in progress: it stops, with or without the
+    // setting. The branch's push run of that commit passed earlier, under
+    // the same check name: its result is posted again, not left "cancelled".
+    let hold = dir.join("..").join(format!("hold-{}", std::process::id()));
+    let sha = commit(
+        &serde_json::json!({ "tasks": { "slow": {
+            "run": format!("if [ -e {} ]; then sleep 30; fi", hold.display()),
+            "cache": false,
+        } } })
+        .to_string(),
+        4,
+    );
+    let push = serde_json::json!({ "ref": "refs/heads/feature", "after": sha,
+        "repository": { "full_name": "acme/web", "clone_url": dir.to_string_lossy(), "default_branch": "main" } })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(push.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let resp: serde_json::Value = http
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "push")
+        .header("x-hub-signature-256", sig)
+        .body(push)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pushed = resp["run"].as_str().expect("a push run").to_string();
+    let v = pit::cli::wait(&client, &pushed, |_| {}).await.unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    std::fs::write(&hold, "").unwrap();
+    let id = event("synchronize", false, &sha).await.expect("a run");
+    for _ in 0..200 {
+        let v: RunView = client.get(&format!("/api/runs/{id}")).await.unwrap();
+        if v.groups.iter().any(|g| g.status == Status::Running) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let body = serde_json::json!({ "action": "closed", "number": 7,
+        "repository": { "full_name": "acme/web", "clone_url": dir.to_string_lossy(), "default_branch": "main" },
+        "pull_request": { "number": 7, "draft": false, "merged": false,
+            "head": { "sha": sha, "ref": "feature", "repo": { "full_name": "acme/web" } },
+            "base": { "ref": "main", "repo": { "full_name": "acme/web" } } } })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let resp: serde_json::Value = http
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "pull_request")
+        .header("x-hub-signature-256", sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["cancelled"], 1, "{resp}");
+    let v: RunView = client.get(&format!("/api/runs/{id}")).await.unwrap();
+    assert_eq!(v.status, Status::Failed, "{v:?}");
+    assert_eq!(v.message.as_deref(), Some("pull request closed"));
+    let _ = std::fs::remove_file(&hold);
+    let last = || {
+        posted
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(s, b)| s == &sha && b["context"] == "pit / default")
+            .map(|(_, b)| b["state"].clone())
+    };
+    for _ in 0..100 {
+        if last() == Some("success".into()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        last(),
+        Some("success".into()),
+        "{:?}",
+        posted.lock().unwrap()
+    );
 }
 
 /// Tasks get the same zone and locale on every worker (UTC, and C.UTF-8 on
@@ -6086,4 +6174,209 @@ async fn tasks_get_their_own_temp_dir_removed_with_the_job() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(!one.exists() && !two.exists(), "temp dirs outlived the job");
+}
+
+/// A pull request closed while its run was in progress (App auth): the
+/// cancelled run's check, the newest of its name on the commit, shows the
+/// result the branch's push run got for that group, not "cancelled".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_pull_requests_check_keeps_the_commits_result() {
+    use axum::routing::{get, patch, post};
+    type Seen = std::sync::Arc<parking_lot::Mutex<Vec<(String, serde_json::Value)>>>;
+    let seen: Seen = Default::default();
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(100));
+    let (s1, n1, s2) = (seen.clone(), next.clone(), seen.clone());
+    let mock = axum::Router::new()
+        .route(
+            "/repos/acme/web/installation",
+            get(|| async { axum::Json(serde_json::json!({ "id": 1 })) }),
+        )
+        .route(
+            "/app/installations/1/access_tokens",
+            post(|| async { axum::Json(serde_json::json!({ "token": "t" })) }),
+        )
+        .route(
+            "/repos/acme/web/check-runs",
+            post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+                let (s, n) = (s1.clone(), n1.clone());
+                async move {
+                    let id = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    s.lock().push((format!("POST {id}"), b));
+                    axum::Json(serde_json::json!({ "id": id }))
+                }
+            }),
+        )
+        .route(
+            "/repos/acme/web/check-runs/{id}",
+            patch(
+                move |axum::extract::Path(id): axum::extract::Path<u64>,
+                      axum::Json(b): axum::Json<serde_json::Value>| {
+                    let s = s2.clone();
+                    async move {
+                        s.lock().push((format!("PATCH {id}"), b));
+                        axum::Json(serde_json::json!({ "id": id }))
+                    }
+                },
+            ),
+        );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_url = format!("http://{}", mock_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await });
+    let keys = tempfile::tempdir().unwrap();
+    sh(keys.path(), "openssl genrsa -out key.pem 2048 2>/dev/null");
+    let pem = std::fs::read_to_string(keys.path().join("key.pem")).unwrap();
+    let github = pit::server::github::GitHub::with_app(&mock_url, "1", &pem).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("closed".into()),
+        data_dir: data.path().join("worker"),
+        slots: 1,
+        parallelism: 1,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let repo = tempfile::tempdir().unwrap();
+    let hold = repo
+        .path()
+        .join("..")
+        .join(format!("hold-closed-{}", std::process::id()));
+    let config = serde_json::json!({ "tasks": { "slow": {
+        "run": format!("while [ -e {} ]; do sleep 0.1; done", hold.display()),
+        "cache": false,
+    } } });
+    write(repo.path(), "pit.config.json", &config.to_string());
+    sh(
+        repo.path(),
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let mut sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    app.db
+        .upsert_repo(
+            "acme/web",
+            Some(&repo.path().to_string_lossy()),
+            Some("acme/web"),
+        )
+        .unwrap();
+    let client = Client::new(&base, None).unwrap();
+    let start = |sha: &str, trigger: &str, git_ref: &str, pr: Option<u64>| {
+        let (app, sha) = (app.clone(), sha.to_string());
+        let (trigger, git_ref) = (trigger.to_string(), git_ref.to_string());
+        async move {
+            app.create_run(
+                CreateRun {
+                    repo: "acme/web".into(),
+                    url: None,
+                    sha,
+                    overlay: None,
+                    tasks: vec![],
+                    trigger: Some(trigger),
+                    git_ref: Some(git_ref),
+                    no_cache: false,
+                    fresh: false,
+                    debug: false,
+                    counts_as: None,
+                    no_secrets: false,
+                    trusted: false,
+                    draft: false,
+                },
+                pr,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // The newest check run of the name on `sha`, and its last completed
+    // update's conclusion.
+    let newest = |sha: &str| {
+        let sent = seen.lock().clone();
+        let id = sent
+            .iter()
+            .filter(|(how, b)| {
+                how.starts_with("POST") && b["name"] == "pit / default" && b["head_sha"] == sha
+            })
+            .map(|(how, _)| how.trim_start_matches("POST ").to_string())
+            .next_back()
+            .unwrap_or_else(|| panic!("no check run for {sha}: {sent:?}"));
+        sent.iter()
+            .rev()
+            .find(|(how, b)| how.ends_with(&id) && b["status"] == "completed")
+            .map(|(_, b)| b["conclusion"].clone())
+    };
+
+    // Closed after the branch's push run passed.
+    let push = start(&sha, "push", "feature", None).await;
+    let v = pit::cli::wait(&client, &push, |_| {}).await.unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    std::fs::write(&hold, "").unwrap();
+    let pr = start(&sha, "pr", "pull/1", Some(1)).await;
+    for _ in 0..200 {
+        let v: RunView = client.get(&format!("/api/runs/{pr}")).await.unwrap();
+        if v.groups.iter().any(|g| g.status == Status::Running) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(app
+        .db
+        .cancel_run_because(&pr, "pull request closed")
+        .unwrap());
+    app.run_finished(&pr).await;
+    let _ = std::fs::remove_file(&hold);
+    assert_eq!(newest(&sha), Some("success".into()), "{:?}", seen.lock());
+
+    // Closed while the push run is still running (both started by one
+    // push): the PR run's check is the newer one, and once the push run
+    // passes it shows that.
+    write(repo.path(), "n.txt", "2");
+    sh(repo.path(), "git add -A && git commit -qm two");
+    sha = sh(repo.path(), "git rev-parse HEAD").trim().to_string();
+    std::fs::write(&hold, "").unwrap();
+    let push = start(&sha, "push", "feature", None).await;
+    let has_group = |id: &str, want: Status| {
+        let (client, id) = (client.clone(), id.to_string());
+        async move {
+            for _ in 0..200 {
+                let v: RunView = client.get(&format!("/api/runs/{id}")).await.unwrap();
+                if v.groups.iter().any(|g| g.status == want) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("{id} never had a {want:?} group");
+        }
+    };
+    has_group(&push, Status::Running).await;
+    // One slot: it waits behind the push run, its check posted after.
+    let pr = start(&sha, "pr", "pull/1", Some(1)).await;
+    has_group(&pr, Status::Queued).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(app
+        .db
+        .cancel_run_because(&pr, "pull request closed")
+        .unwrap());
+    app.run_finished(&pr).await;
+    assert_eq!(newest(&sha), Some("cancelled".into()), "{:?}", seen.lock());
+    std::fs::remove_file(&hold).unwrap();
+    let v = pit::cli::wait(&client, &push, |_| {}).await.unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    for _ in 0..100 {
+        if newest(&sha) == Some("success".into()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(newest(&sha), Some("success".into()), "{:?}", seen.lock());
 }
