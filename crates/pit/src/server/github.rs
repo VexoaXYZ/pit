@@ -284,6 +284,18 @@ impl GitHub {
         }
     }
 
+    /// Reports another run now, in its own task, under its own run lock: a
+    /// repost from inside a report (see `try_report_run`) must not race that
+    /// run's own report, nor wait on it.
+    fn report_later(&self, app: &Arc<App>, run_id: &str) {
+        let (app, run_id) = (app.clone(), run_id.to_string());
+        tokio::spawn(async move {
+            if let Some(gh) = &app.github {
+                gh.report_run(&app, &run_id).await;
+            }
+        });
+    }
+
     /// Rate limited: report the run again later (the latest state, whatever
     /// it is by then), once per run, without holding up the caller. Jittered,
     /// so runs limited together do not all come back at once.
@@ -456,16 +468,10 @@ impl GitHub {
             // is the newest (it posts a new check run over this one).
             if left_out && real_elsewhere(app)? {
                 for other in app.db.real_group_runs(&run.repo_id, &run.sha, &g.name)? {
-                    // Not under `other`'s run lock: it may be reporting
-                    // this run the same way, and would wait for ours. If the
-                    // repost is rate limited, `other` is retried, not us.
-                    match Box::pin(self.try_report_run(app, &other)).await {
-                        Ok(()) => {}
-                        Err(e) => match e.downcast_ref::<RateLimited>() {
-                            Some(RateLimited(wait)) => self.schedule_retry(app, &other, *wait),
-                            None => return Err(e),
-                        },
-                    }
+                    // In its own task, under its own run lock (not ours: it
+                    // may be reporting this run the same way, and would wait
+                    // for ours), so it never races its own report.
+                    self.report_later(app, &other);
                 }
             }
         }
@@ -575,13 +581,7 @@ impl GitHub {
                     .db
                     .real_group_runs(&run.repo_id, &run.sha, &shards[0].name)?
                 {
-                    match Box::pin(self.try_report_run(app, &other)).await {
-                        Ok(()) => {}
-                        Err(e) => match e.downcast_ref::<RateLimited>() {
-                            Some(RateLimited(wait)) => self.schedule_retry(app, &other, *wait),
-                            None => return Err(e),
-                        },
-                    }
+                    self.report_later(app, &other);
                 }
             }
         }
@@ -676,7 +676,12 @@ impl GitHub {
                         if let Some(id) = created["id"].as_u64() {
                             app.db.kv_put("shard-check", &key, &id.to_string())?;
                             // The newest left-out copy, for real runs to beat.
-                            if left_out {
+                            // Only ever the highest: GitHub takes the newest.
+                            let stored = app
+                                .db
+                                .kv_get("shard-check", copies_key)?
+                                .and_then(|v| v.parse::<u64>().ok());
+                            if left_out && stored.is_none_or(|s| id > s) {
                                 app.db.kv_put("shard-check", copies_key, &id.to_string())?;
                             }
                         }
