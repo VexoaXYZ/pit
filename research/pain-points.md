@@ -4242,3 +4242,91 @@ Limits:
   said since P20.
 - Upgrading costs one cold trusted run per repo and, on shared servers, cold workspaces and
   mirrors. Old directories age out through the workspace GC.
+
+## P67. Remote cache poisoning: a branch build plants the artifact main ships (CREEP, CVE-2025-36852)
+
+**The pain.** Self-hosted remote caches let any build that can write the cache poison what every
+later build reuses. Nx disclosed CREEP ("Cache Race-condition Exploit Enables Poisoning"),
+CVE-2025-36852, rated critical.
+- **The flaw:** "first to cache wins". A pull request computes the same key main will compute,
+  because what it changed (its CI steps, files outside the hashed inputs) isn't part of the key.
+  It uploads a malicious artifact, and main's next build gets a cache hit and ships it without
+  rebuilding.
+- **Who it hits:** bucket-style caches with no branch isolation. Nx deprecated its S3, GCS, Azure
+  and shared-filesystem cache packages on 2026-05-21, saying the flaw can't be patched in that
+  design.
+- **The usual fix:** builds that aren't trusted must not write what trusted builds read.
+
+Sources: [Nx's write-up](https://nx.dev/blog/cve-2025-36852-critical-cache-poisoning-vulnerability-creep),
+[the deprecation notice](https://nx.dev/docs/reference/deprecated/self-hosted-cache-packages),
+[GitLab advisory](https://advisories.gitlab.com/pkg/npm/@nx/azure-cache/CVE-2025-36852),
+[dev.to](https://dev.to/rerodrigues/how-to-prevent-cache-poisoning-in-nx-and-lerna-monorepos-5f5g).
+None of these say Turborepo itself is affected. The attack depends on the cache server, and
+Pit's was one namespace for everyone.
+
+**Before.** Pit has split its own action cache by trust since P20. Its Turborepo and Bazel cache
+routes didn't, and the README said so.
+
+**Reproduction** (`/tmp/painhunt/p67`, real `turbo@2.11.9` via npx): a monorepo whose
+`packages/app` build writes `dist/out.txt`, poisoned if a file `../../POISON` exists. That file is
+outside the package's inputs, so it's not in Turbo's hash. Turborepo 2 runs tasks in strict env
+mode, so a `POISON=1` env var would have been dropped; an unhashed file is the realistic vector.
+- **branch** (`pit run`, untrusted): `touch POISON; TURBO_API=… turbo run build`
+- **main** (a schedule, trusted): `rm -f POISON; TURBO_API=… turbo run build; cat dist/out.txt`
+```
+branch │ app:build: cache miss, executing cf4ae40573cdf625
+main:    app:build: cache hit, replaying logs cf4ae40573cdf625
+         POISONED build
+```
+
+**Fix.**
+- **A job token.** Each claim of a group gets a random cache token (`pitc_…`, 122 bits). The
+  worker gives the group's tasks `PIT_CACHE_URL` and `PIT_CACHE_TOKEN`; Turbo gets them as
+  `TURBO_API`/`TURBO_TOKEN`, Bazel as `--remote_header=Authorization=…`. The token is separate
+  from the lease, so a task holding it can't report results.
+- **Where it's accepted.** It opens only the `/v8/` and `/bazel/` routes, and only while its group
+  runs. A token that is no longer live gets a 401, never the API token's access.
+- **Scope.** A request with a job token gets the run's cache scope (P66): branches and pull
+  requests write artifacts only untrusted builds reuse; main writes what everyone reuses and
+  never reads a branch's.
+- **Bazel's CAS** stays shared: every blob is checked against its sha256 on upload.
+- **Direct use** (the API token, or a server without one) is unchanged: full access.
+
+**After** (same repro, tasks using the job token):
+```
+branch │ app:build: cache miss, executing f9e8c9cb2a35c16d
+main:    app:build: cache miss, executing f9e8c9cb2a35c16d
+         clean build
+a later branch │ app:build: cache hit, replaying logs f9e8c9cb2a35c16d   (main's artifact)
+```
+The e2e test `turbo_cache_from_tasks_is_split_by_trust` covers it with real task processes:
+- an untrusted run plants `h1`, and the trusted run sees a 404 for it;
+- the trusted run writes `h2`, which a later branch reads;
+- the finished job's token gets a 401.
+
+With the old always-trusted scope, the test fails at "sees h1: 404".
+Further assertions:
+- A made-up token and the finished job's token both get a 401 on Bazel's CAS GET and on a Turbo
+  PUT.
+
+**Review.** Two independent rounds.
+1. **Round 1** found a blocker and a should.
+   - **The blocker:** Bazel's CAS read never checked the token, so any `Bearer pitc_x` read shared
+     blobs without credentials on a server with an API token.
+   - **The should:** every handler checked the token only after reading the body, up to 2 GiB,
+     which gave anyone who can reach the server a way to make it buffer.
+
+   Both are fixed the same way: the auth middleware checks the token is live before any handler
+   or body read, and hands the run's scope to the cache routes.
+
+   Two nits went into the README: on a tokenless server the split doesn't protect main, and
+   container tasks can't reach a loopback `PIT_CACHE_URL`. One nit was declined: masking the
+   token in logs, since logs already need the API token and the token dies with its job.
+2. **Round 2: APPROVE.** The middleware is the only place a cache scope comes from.
+
+**Verdict: SOLVED** for Pit tasks that use their job token, on a server with an API token.
+Limits:
+- Direct users holding the API token still have full access; the README says not to give it to
+  pull request builds.
+- On a tokenless server the split protects nothing, since anyone can leave the token out.
+- `PIT_CACHE_URL` is the worker's server address, so a container task can't reach a loopback one.
