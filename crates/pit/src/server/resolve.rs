@@ -63,6 +63,13 @@ pub fn resolve(
     } else {
         group.os.clone()
     };
+    // Keys carry the architecture they were computed on. The server can only
+    // compute its own, so a group pinned to another one is left to a worker
+    // that has it; otherwise an `aarch64` instance would pass on the results
+    // of its `x86_64` twin.
+    if group.arch != "any" && group.arch != crate::model::canonical_arch(std::env::consts::ARCH) {
+        return Ok(None);
+    }
     let mut keys: HashMap<&str, String> = HashMap::new();
     let mut results = Vec::with_capacity(group.tasks.len());
     // The cache row each hit came from (see `Db::cache_find`).

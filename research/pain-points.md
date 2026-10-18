@@ -5363,3 +5363,78 @@ version checking the protocol before the worker token; the order is now right.
   warning does.
 - **In-flight jobs.** A job an old worker claimed before the server was upgraded runs to its end.
 - **Raising it.** `PROTOCOL` must be raised by hand when such a field is added.
+
+## P85. A job lands on a runner of the wrong CPU architecture
+
+**The pain.** Fleets now mix `x86_64` and `aarch64` machines (Graviton, Ampere, Apple Silicon).
+A self-hosted GitHub runner gets an architecture label (`x64`, `ARM`, `ARM64`), and labels
+"operate cumulatively", so a job only stays off the wrong machine if its `runs-on` lists the
+label ([GitHub docs](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/use-in-a-workflow)).
+When it doesn't, the job runs anyway and fails late: in
+[nichobbs/lyric-lang#7025](https://github.com/nichobbs/lyric-lang/issues/7025), every job sent to
+a new ARM64 runner failed with "cannot execute binary file: Exec format error", because "the
+kernel refuses to exec the mismatched-architecture ELF" built on x86-64. Building for both means
+adding a runner label per arch to a matrix: [naqerl/citydiff#12](https://github.com/naqerl/citydiff/pull/12)
+adds `ubuntu-24.04-arm` because the build "cannot be cross-compiled: CGO is mandatory", "so
+linux/arm64 needs an actual arm64 runner".
+
+Pit routed by OS and backend only. Workers already reported their architecture, but nothing
+used it.
+
+**Reproduction** (`/tmp/painhunt/p85`, a scratch server on port 7979, one `x86_64` worker). An
+`aarch64`-only build:
+```
+✗ native.build: exited with 1
+  │ arch x86_64
+  │ exec format error: this build is aarch64-only
+```
+Asking for `aarch64` was an error: ``unknown field `arch`, expected one of `os`, ...``.
+
+On the way, a second bug: a worker started with a relative `--data` (`--data ../w`) failed
+every job with ``git clone ... ../w/worker/mirrors/p85-....git ... failed in ../w/worker:
+fatal: repository ... does not exist``, because git runs inside the data directory, where the
+relative path names nothing.
+
+**Fix.**
+- **`arch` on a group.** `"arch": ["x86_64", "aarch64"]` plans one instance per entry, as `os`
+  does: `native@x86_64`, `native@aarch64`, or `native@linux-aarch64` with several OSes. `amd64`/`x64`
+  and `arm64` fold into Rust's names, so `["amd64", "x86_64"]` is one instance. Leaving it out
+  means any, as before.
+- **Claiming.** A pinned group is only claimed by a worker whose architecture, folded the same
+  way, matches.
+- **Waiting.** The waiting hint names the missing arch, and lists each online worker's.
+- **Plan-time cache.** Action keys already include the architecture they were computed on, and
+  the server computes its own. It no longer answers a group pinned to another arch from the
+  cache, which would have passed `native@aarch64` on its `x86_64` twin's results; that group's
+  worker checks the cache itself.
+- **`--data`** is made absolute for `pit up`, `pit server` and `pit worker`.
+
+**After** (rebuilt server and worker; the second worker is a `POST /api/workers/claim` saying
+`"arch": "arm64"`, as there is no ARM machine here):
+```
+pinned to aarch64:  native (any) waiting: no online worker can run it (needs os any, arch aarch64);
+                    online: x86-box (linux x86_64; host, sandbox, docker). Start a matching `pit worker`.
+arm64 claim:        {"groupId": "grp_b669140531b2", "group": "native", ...}
+both arches:        native@x86_64 passed on x86-box ("built on x86_64"); native@aarch64 queued, waiting
+relative --data:    native@x86_64 on rel-box  ✓ build 28ms
+```
+Tests: `plans_one_group_per_arch_and_names_them_apart`, `arch_aliases_fold_into_one_instance`,
+`a_group_pinned_to_an_arch_goes_only_to_a_worker_with_it` (an `x86_64` worker gets nothing; an
+`arm64` one gets the group), and the waiting-hint test now covers the arch.
+
+**Review.** One independent round: APPROVE, nits only, all declined.
+- **Checked and right.** Shards of a pinned group keep its arch (`g@aarch64#2`), and so do their
+  timing keys and combined check. A requeue changes only the status, so the arch stays. Reruns
+  and `/retest` plan again. A pinned group's waiting hint still begins `waiting: no online
+  worker`, so a locked one with no matching worker doesn't hold later runs in line. A single
+  entry leaves the name `g`, so required check names don't change.
+- **Declined: a typo** (`"arm"`) is accepted and waits, with a hint naming it. Pit doesn't
+  keep a list of architectures, so new ones need no change.
+- **Declined: warm affinity** can hold an arm worker back up to 2 s after a group gains `arch`,
+  as when its `os` changes.
+- **Declined: a group answered at plan time** (cached or skipped) is stored as `any`. Nothing reads it there.
+
+**Verdict: SOLVED.** Limits:
+- **Proof.** No ARM machine here: the `aarch64` claim was a raw API request, not a running worker.
+- **Granularity.** The arch is per group; a task needing another arch goes in its own group.
+- **No checking of the name.** A misspelt arch waits until someone reads the hint.

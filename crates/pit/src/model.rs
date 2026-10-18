@@ -57,6 +57,11 @@ pub struct GroupDef {
     /// `any`. One group instance is planned per entry.
     #[serde(default)]
     pub os: Vec<String>,
+    /// CPU architectures to run this group on: `x86_64` (or `amd64`),
+    /// `aarch64` (or `arm64`). Empty means any. One group instance is planned
+    /// per entry, as for `os`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arch: Vec<String>,
     /// Default execution backend for tasks in this group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<Backend>,
@@ -312,6 +317,17 @@ pub struct CreateRun {
     /// `drafts: false`. Only the server sets it.
     #[serde(skip)]
     pub draft: bool,
+}
+
+/// A CPU architecture's canonical name: Rust's (`std::env::consts::ARCH`),
+/// with the common aliases folded in (`amd64` is `x86_64`, `arm64` is
+/// `aarch64`).
+pub fn canonical_arch(arch: &str) -> String {
+    match arch.trim().to_ascii_lowercase().as_str() {
+        "amd64" | "x64" => "x86_64".into(),
+        "arm64" => "aarch64".into(),
+        other => other.into(),
+    }
 }
 
 /// What a worker understands of a `Job`. Raised when a job gains a field an

@@ -245,6 +245,14 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
             },
         );
     }
+    // `amd64` and `x86_64` are one architecture: one name, one instance.
+    for group in config.groups.values_mut() {
+        for a in group.arch.iter_mut() {
+            *a = crate::model::canonical_arch(a);
+        }
+        let mut seen = std::collections::HashSet::new();
+        group.arch.retain(|a| seen.insert(a.clone()));
+    }
     // Group and task names end up in paths (workspaces, `pit artifacts`
     // downloads) and check names. `/` is fine (`typecheck:@acme/web`), but
     // nothing that could climb out of a directory or break a line.
@@ -259,6 +267,11 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
     for (gname, group) in &config.groups {
         if !plain(gname) {
             bail!("group name {gname:?} must be a relative name without `.`/`..` parts, `\\` or control characters");
+        }
+        for a in &group.arch {
+            if a.trim().is_empty() || a == "any" {
+                bail!("group {gname:?}: `arch` entries name an architecture (`x86_64`, `aarch64`); leave `arch` out for any");
+            }
         }
         // `name#k` is how shards are named (and their combined check found).
         if gname.contains('#') {
@@ -352,6 +365,23 @@ mod tests {
             serde_json::from_str(r#"{"groups":{"ci#1":{"tasks":{"t":{"run":"true"}}}}}"#).unwrap();
         let err = normalize(c).unwrap_err().to_string();
         assert!(err.contains("must not contain `#`"), "{err}");
+    }
+
+    #[test]
+    fn arch_aliases_fold_into_one_instance() {
+        let c: crate::model::PitConfig = serde_json::from_str(
+            r#"{"groups":{"ci":{"arch":["amd64","x86_64","ARM64"],"tasks":{"t":{"run":"true"}}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            normalize(c).unwrap().groups["ci"].arch,
+            ["x86_64", "aarch64"]
+        );
+        let c: crate::model::PitConfig = serde_json::from_str(
+            r#"{"groups":{"ci":{"arch":["any"],"tasks":{"t":{"run":"true"}}}}}"#,
+        )
+        .unwrap();
+        assert!(normalize(c).is_err());
     }
 
     use super::*;

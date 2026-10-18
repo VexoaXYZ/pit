@@ -296,6 +296,13 @@ fn default_data() -> PathBuf {
         .join(".pit")
 }
 
+/// `--data`, made absolute: workers run git in other directories, where a
+/// relative path (`--data ../w`) names nothing.
+fn data_root(data: Option<PathBuf>) -> PathBuf {
+    let data = data.unwrap_or_else(default_data);
+    std::path::absolute(&data).unwrap_or(data)
+}
+
 fn gb_to_bytes(gb: f64) -> u64 {
     (gb.max(0.0) * 1_000_000_000.0) as u64
 }
@@ -354,7 +361,7 @@ async fn run(cli: Cli) -> Result<i32> {
             notify_url,
             secrets_file,
         } => {
-            let data = data.unwrap_or_else(default_data);
+            let data = data_root(data);
             cli::up(cli::UpOpts {
                 addr,
                 data,
@@ -381,7 +388,7 @@ async fn run(cli: Cli) -> Result<i32> {
             oidc,
         } => {
             pit::server::serve(pit::server::ServerOpts {
-                data_dir: data.unwrap_or_else(default_data).join("server"),
+                data_dir: data_root(data).join("server"),
                 addr,
                 token,
                 public_url,
@@ -407,7 +414,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 server: conn.server,
                 token: conn.token,
                 name,
-                data_dir: data.unwrap_or_else(default_data).join("worker"),
+                data_dir: data_root(data).join("worker"),
                 slots,
                 parallelism: parallelism.unwrap_or_else(default_parallelism),
                 workspace_max_bytes: gb_to_bytes(workspace_max_gb),

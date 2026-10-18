@@ -93,6 +93,8 @@ pub fn topo_order(tasks: &BTreeMap<String, TaskDef>) -> Result<Vec<String>> {
 pub struct PlannedGroup {
     pub name: String,
     pub os: String,
+    /// `any`, or the CPU architecture a worker must have.
+    pub arch: String,
     /// Task name and definition, in dependency order.
     pub tasks: Vec<(String, TaskDef)>,
     /// See `GroupDef::lock`.
@@ -150,21 +152,39 @@ pub fn plan_for(
             .filter(|t| keep.contains(t))
             .map(|t| (t.clone(), group.tasks[&t].clone()))
             .collect();
+        let any = vec!["any".to_string()];
+        let archs = if group.arch.is_empty() {
+            &any
+        } else {
+            &group.arch
+        };
         for os in &group.os {
-            let name = if group.os.len() > 1 {
-                format!("{gname}@{os}")
-            } else {
-                gname.clone()
-            };
-            groups.extend(
-                shard_groups(&name, os, &tasks)
-                    .into_iter()
-                    .map(|g| PlannedGroup {
-                        lock: group.lock.clone(),
-                        not_in: not_in.clone(),
-                        ..g
-                    }),
-            );
+            for arch in archs {
+                // One instance per entry: `build@macos`, `build@aarch64`,
+                // `build@linux-aarch64`.
+                let mut tags = Vec::new();
+                if group.os.len() > 1 {
+                    tags.push(os.as_str());
+                }
+                if archs.len() > 1 {
+                    tags.push(arch.as_str());
+                }
+                let name = if tags.is_empty() {
+                    gname.clone()
+                } else {
+                    format!("{gname}@{}", tags.join("-"))
+                };
+                groups.extend(
+                    shard_groups(&name, os, &tasks)
+                        .into_iter()
+                        .map(|g| PlannedGroup {
+                            arch: arch.clone(),
+                            lock: group.lock.clone(),
+                            not_in: not_in.clone(),
+                            ..g
+                        }),
+                );
+            }
         }
     }
     if let Some(missing) = selected.iter().find(|s| !matched.contains(s.as_str())) {
@@ -187,6 +207,7 @@ fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<Planne
         return vec![PlannedGroup {
             name: name.to_string(),
             os: os.to_string(),
+            arch: "any".into(),
             tasks: tasks.to_vec(),
             lock: None,
             not_in: None,
@@ -229,6 +250,7 @@ fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<Planne
             PlannedGroup {
                 name: format!("{name}#{k}"),
                 os: os.to_string(),
+                arch: "any".into(),
                 tasks,
                 lock: None,
                 not_in: None,
@@ -581,6 +603,35 @@ mod tests {
         let pos = |n: &str| names.iter().position(|x| *x == n).unwrap();
         assert!(pos("install") < pos("lint"));
         assert!(pos("install") < pos("build"));
+    }
+
+    #[test]
+    fn plans_one_group_per_arch_and_names_them_apart() {
+        let mut config = sample();
+        let ci = config.groups.get_mut("ci").unwrap();
+        ci.arch = vec!["x86_64".into(), "aarch64".into()];
+        let groups = plan(&config, &[]).unwrap();
+        let names: Vec<_> = groups
+            .iter()
+            .map(|g| (g.name.as_str(), g.arch.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("ci@linux-x86_64", "x86_64"),
+                ("ci@linux-aarch64", "aarch64"),
+                ("ci@windows-x86_64", "x86_64"),
+                ("ci@windows-aarch64", "aarch64"),
+            ]
+        );
+        let ci = config.groups.get_mut("ci").unwrap();
+        ci.os = vec!["linux".into()];
+        ci.arch = vec!["aarch64".into()];
+        let groups = plan(&config, &[]).unwrap();
+        assert_eq!(
+            (groups[0].name.as_str(), groups[0].arch.as_str()),
+            ("ci", "aarch64")
+        );
     }
 
     #[test]

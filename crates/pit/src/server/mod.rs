@@ -600,6 +600,7 @@ impl App {
                 run_id,
                 &g.name,
                 &g.os,
+                &g.arch,
                 &backends,
                 &g.tasks,
                 lock.as_deref(),
@@ -820,14 +821,24 @@ pub fn run_kinds(trigger: &str, trusted: bool, git_ref: Option<&str>) -> Vec<&'s
 
 /// Why no online worker can take a group, if none can: the GitHub "Waiting
 /// for a runner to pick up this job" that never says what is missing.
-pub fn waiting_reason(os: &str, needs: &[Backend], online: &[WorkerInfo]) -> Option<String> {
+pub fn waiting_reason(
+    os: &str,
+    arch: &str,
+    needs: &[Backend],
+    online: &[WorkerInfo],
+) -> Option<String> {
     let fits = |w: &WorkerInfo| {
-        (os == "any" || w.os == os) && needs.iter().all(|b| w.backends.contains(b))
+        (os == "any" || w.os == os)
+            && (arch == "any" || crate::model::canonical_arch(&w.arch) == arch)
+            && needs.iter().all(|b| w.backends.contains(b))
     };
     if online.iter().any(fits) {
         return None;
     }
     let mut need = vec![format!("os {os}")];
+    if arch != "any" {
+        need.push(format!("arch {arch}"));
+    }
     need.extend(
         needs
             .iter()
@@ -841,7 +852,7 @@ pub fn waiting_reason(os: &str, needs: &[Backend], online: &[WorkerInfo]) -> Opt
             .iter()
             .map(|w| {
                 let b: Vec<&str> = w.backends.iter().map(|b| b.as_str()).collect();
-                format!("{} ({}; {})", w.name, w.os, b.join(", "))
+                format!("{} ({} {}; {})", w.name, w.os, w.arch, b.join(", "))
             })
             .collect();
         format!("online: {}", list.join(", "))
@@ -865,7 +876,7 @@ impl App {
             .map(|(w, _, _)| w)
             .collect();
         for g in self.db.waiting_groups(now - 3_000)? {
-            let reason = waiting_reason(&g.os, &g.needs, &online).or_else(|| {
+            let reason = waiting_reason(&g.os, &g.arch, &g.needs, &online).or_else(|| {
                 let (lock, holder) = (g.lock.as_ref()?, g.lock_holder.as_ref()?);
                 let lock = lock.split_once(':').map_or(lock.as_str(), |(_, l)| l);
                 Some(format!("waiting: lock `{lock}` is held by {holder}"))
@@ -1106,21 +1117,34 @@ mod waiting_tests {
             protocol: crate::model::PROTOCOL,
         };
         assert_eq!(
-            waiting_reason("linux", &[Backend::Host], std::slice::from_ref(&linux)),
+            waiting_reason(
+                "linux",
+                "any",
+                &[Backend::Host],
+                std::slice::from_ref(&linux)
+            ),
             None
         );
         assert_eq!(
-            waiting_reason("any", &[], std::slice::from_ref(&linux)),
+            waiting_reason("any", "any", &[], std::slice::from_ref(&linux)),
             None
         );
-        let mac = waiting_reason("macos", &[Backend::Host], std::slice::from_ref(&linux)).unwrap();
+        let mac = waiting_reason(
+            "macos",
+            "any",
+            &[Backend::Host],
+            std::slice::from_ref(&linux),
+        )
+        .unwrap();
         assert!(
-            mac.contains("needs os macos") && mac.contains("local (linux; host, sandbox)"),
+            mac.contains("needs os macos") && mac.contains("local (linux x86_64; host, sandbox)"),
             "{mac}"
         );
-        let docker = waiting_reason("linux", &[Backend::Docker], &[linux]).unwrap();
+        let arm = waiting_reason("linux", "aarch64", &[], std::slice::from_ref(&linux)).unwrap();
+        assert!(arm.contains("needs os linux, arch aarch64"), "{arm}");
+        let docker = waiting_reason("linux", "any", &[Backend::Docker], &[linux]).unwrap();
         assert!(docker.contains("backend docker"), "{docker}");
-        assert!(waiting_reason("linux", &[], &[])
+        assert!(waiting_reason("linux", "any", &[], &[])
             .unwrap()
             .contains("no workers are online"));
     }

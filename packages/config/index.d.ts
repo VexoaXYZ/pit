@@ -116,6 +116,12 @@ export interface TaskDef {
 export interface GroupDef {
   /** One copy of the group runs per OS. Defaults to `["any"]`. */
   os?: Os[];
+  /**
+   * One copy of the group runs per CPU architecture, only on workers that
+   * have it: `"x86_64"` (or `"amd64"`), `"aarch64"` (or `"arm64"`). Default:
+   * any. With several OSes too, each copy is named `group@os-arch`.
+   */
+  arch?: ("x86_64" | "amd64" | "aarch64" | "arm64" | (string & {}))[];
   backend?: Backend;
   image?: string;
   /**
