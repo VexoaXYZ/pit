@@ -87,8 +87,34 @@ pub fn remove(app: &App, key: &str, repo: Option<&str>, reason: &str) -> Result<
     Ok(n)
 }
 
-pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
+/// Refused: on a shared server a GitHub repo's queue is entered only through
+/// the `pit:merge` label.
+#[derive(Debug)]
+pub struct GithubOnlyLabel(pub String);
+
+impl std::fmt::Display for GithubOnlyLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is a GitHub repo: queue its pull requests with the `pit:merge` label",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for GithubOnlyLabel {}
+
+/// `from_api`: sent by an API caller, not by the GitHub webhook.
+pub async fn add(app: &Arc<App>, req: QueueAdd, from_api: bool) -> Result<QueueEntryView> {
     let repo = app.db.upsert_repo(&req.repo, req.url.as_deref(), None)?;
+    // A queued change runs as trusted, config included, and the mirror has
+    // every pull request, forks' too. On a shared server, a GitHub repo's
+    // queue is entered only through the `pit:merge` label, which a
+    // maintainer applies after reading the change. Checked on the repo the
+    // request resolved to: a new name with that repo's URL resolves to it.
+    if from_api && app.token.is_some() && repo.github.is_some() {
+        return Err(GithubOnlyLabel(repo.name).into());
+    }
     // If origin is down, queue from the last fetched state of the branch; the
     // queue lands it once origin is back.
     let mut offline: Option<String> = None;

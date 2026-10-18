@@ -1161,26 +1161,14 @@ async fn queue_add(
     _h: HeaderMap,
     Json(req): Json<QueueAdd>,
 ) -> ApiResult<Json<QueueEntryView>> {
-    // A queued change runs as trusted, config included, and the mirror has
-    // every pull request, forks' too. On a shared server, a GitHub repo's
-    // queue is entered only through the `pit:merge` label, which a
-    // maintainer applies after reading the change.
-    if app.token.is_some()
-        && app
-            .db
-            .repos()?
-            .iter()
-            .any(|r| r.name == req.repo && r.github.is_some())
-    {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            anyhow::anyhow!(
-                "{} is a GitHub repo: queue its pull requests with the `pit:merge` label",
-                req.repo
-            ),
-        ));
-    }
-    Ok(Json(super::queue::add(&app, req).await?))
+    let entry = super::queue::add(&app, req, true).await.map_err(|e| {
+        if e.downcast_ref::<super::queue::GithubOnlyLabel>().is_some() {
+            ApiError(StatusCode::FORBIDDEN, e)
+        } else {
+            e.into()
+        }
+    })?;
+    Ok(Json(entry))
 }
 
 #[derive(Deserialize)]

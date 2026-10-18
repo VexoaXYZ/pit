@@ -4674,6 +4674,15 @@ async fn api_cannot_queue_into_a_github_repo_on_a_shared_server() {
         .unwrap_err();
     assert!(err.to_string().contains("403"), "{err:#}");
     assert!(err.to_string().contains("pit:merge"), "{err:#}");
+    // A new name with the GitHub repo's URL resolves to that repo.
+    let err = client
+        .post::<_, serde_json::Value>(
+            "/api/queue",
+            &serde_json::json!({ "repo": "other", "url": "https://github.com/acme/web.git", "pr": 7 }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("403"), "{err:#}");
     // Not refused for being a GitHub repo (it fails later: nothing to fetch).
     let err = client
         .post::<_, serde_json::Value>(
@@ -4683,4 +4692,46 @@ async fn api_cannot_queue_into_a_github_repo_on_a_shared_server() {
         .await
         .unwrap_err();
     assert!(!err.to_string().contains("403"), "{err:#}");
+}
+
+/// On a shared server, the first webhook for a repo never adopts a row an
+/// API caller registered with the same URL: that row's pending queue
+/// entries and runs would become the GitHub repo's, trusted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhooks_do_not_adopt_api_registered_repos_on_a_shared_server() {
+    let data = tempfile::tempdir().unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        Some("tok".into()),
+        "http://x".into(),
+        None,
+    )
+    .unwrap();
+    let url = "https://github.com/acme/web.git";
+    let api = app.db.upsert_repo("x", Some(url), None).unwrap();
+    let gh = app
+        .db
+        .insert_github_repo("acme/web", url, "acme/web")
+        .unwrap();
+    assert_ne!(gh.id, api.id);
+    assert_eq!(app.db.repo(&api.id).unwrap().github, None);
+    assert_eq!(
+        app.db.repo_by_github("acme/web").unwrap().unwrap().id,
+        gh.id
+    );
+    // A second webhook finds the same row.
+    let again = app
+        .db
+        .insert_github_repo("acme/web", url, "acme/web")
+        .unwrap();
+    assert_eq!(again.id, gh.id);
+    // A name in use gets a suffix.
+    app.db
+        .upsert_repo("acme/api", Some("/elsewhere"), None)
+        .unwrap();
+    let named = app
+        .db
+        .insert_github_repo("acme/api", "https://github.com/acme/api.git", "acme/api")
+        .unwrap();
+    assert!(named.name.starts_with("acme/api-"), "{}", named.name);
 }

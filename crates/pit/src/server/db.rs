@@ -542,6 +542,54 @@ impl Db {
         })
     }
 
+    /// A new repo row for a GitHub repository, never one that exists: on a
+    /// shared server an API caller may have registered the same URL first,
+    /// and that row's runs and queue entries must not become the GitHub
+    /// repo's. Takes `name`, or `name-<suffix>` if it is in use.
+    pub fn insert_github_repo(&self, name: &str, url: &str, github: &str) -> Result<Repo> {
+        let c = self.conn.lock();
+        // Two webhooks for a new repo can race here.
+        let row = |r: &rusqlite::Row| {
+            Ok(Repo {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                url: r.get(2)?,
+                github: r.get(3)?,
+            })
+        };
+        if let Some(repo) = c
+            .query_row(
+                "SELECT id, name, url, github FROM repos WHERE github = ?1",
+                params![github],
+                row,
+            )
+            .optional()?
+        {
+            return Ok(repo);
+        }
+        let id = new_id("repo");
+        let taken: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repos WHERE name = ?1)",
+            params![name],
+            |r| r.get(0),
+        )?;
+        let name = if taken {
+            format!("{name}-{}", &crate::cas::digest(id.as_bytes())[..6])
+        } else {
+            name.to_string()
+        };
+        c.execute(
+            "INSERT INTO repos (id, name, url, github, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, name, url, github, now_ms()],
+        )?;
+        Ok(Repo {
+            id,
+            name,
+            url: url.into(),
+            github: Some(github.into()),
+        })
+    }
+
     pub fn repo(&self, id: &str) -> Result<Repo> {
         let c = self.conn.lock();
         c.query_row(

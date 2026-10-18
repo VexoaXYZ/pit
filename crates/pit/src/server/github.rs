@@ -854,6 +854,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                         // on, not whatever the fork pushes next.
                         sha: fork.then(|| sha.clone()),
                     },
+                    false,
                 )
                 .await?;
                 return Ok(serde_json::json!({ "queued": entry.id }));
@@ -1073,6 +1074,12 @@ fn register(app: &App, r: &RepoPayload) -> Result<super::db::Repo> {
     );
     let url = std::env::var(env_key).unwrap_or_else(|_| r.clone_url.clone());
     let _ = &r.default_branch;
+    // On a shared server, a row an API caller registered with this URL is
+    // theirs: adopting it would make its pending queue entries and runs the
+    // GitHub repo's, trusted. A local server without a token has one user.
+    if app.token.is_some() {
+        return app.db.insert_github_repo(&r.full_name, &url, &r.full_name);
+    }
     app.db
         .upsert_repo(&r.full_name, Some(&url), Some(&r.full_name))
 }
