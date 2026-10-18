@@ -813,6 +813,30 @@ impl Worker {
             )
             .await?;
         }
+        // A checkout is the commit's bytes, converted only as its
+        // `.gitattributes` asks, whatever this host's git config says. Action
+        // keys come from those bytes, so a global `core.autocrlf=true` would
+        // give this worker's outputs (CRLF) other workers' keys.
+        let pinned = git::git(ws, &["config", "--local", "--get", "core.autocrlf"])
+            .await
+            .is_ok_and(|v| v.trim() == "false");
+        if !pinned {
+            // A warm workspace checked out before this still has the old
+            // line endings, and git's stat cache calls those files clean. An
+            // index without stat data makes the checkout below compare, and
+            // rewrite, every file (still deleting ones the new commit
+            // dropped); submodules get no index, so their update rewrites
+            // theirs. Pinned last, so an interrupted pass is redone.
+            if git::git(ws, &["read-tree", "HEAD"]).await.is_err() {
+                let _ = std::fs::remove_file(ws.join(".git").join("index"));
+            }
+            let modules = ws.join(".git").join("modules");
+            if std::fs::symlink_metadata(&modules).is_ok_and(|m| m.is_dir()) {
+                remove_indexes(&modules);
+            }
+            git::git(ws, &["config", "core.eol", "native"]).await?;
+            git::git(ws, &["config", "core.autocrlf", "false"]).await?;
+        }
         if lfs {
             let storage = mirror.join("lfs");
             git::git(ws, &["lfs", "install", "--local", "--skip-repo"]).await?;
@@ -966,6 +990,12 @@ impl Worker {
                     &[
                         "-c",
                         "protocol.file.allow=always",
+                        // As for the workspace (see `prepare`); passed on to
+                        // the submodule's own checkout.
+                        "-c",
+                        "core.autocrlf=false",
+                        "-c",
+                        "core.eol=native",
                         "submodule",
                         "update",
                         "--init",
@@ -1917,6 +1947,27 @@ fn submodule_host_allowed(superproject: &str, submodule: &str) -> bool {
 #[cfg(test)]
 mod submodule_tests {
     #[test]
+    fn only_git_directories_lose_their_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = tmp.path();
+        for f in [
+            "a/HEAD",
+            "a/index",
+            "a/refs/tags/index",
+            "a/modules/b/HEAD",
+            "a/modules/b/index",
+        ] {
+            let p = m.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
+        super::remove_indexes(m);
+        assert!(!m.join("a/index").exists());
+        assert!(!m.join("a/modules/b/index").exists());
+        assert!(m.join("a/refs/tags/index").exists(), "a ref named index");
+    }
+
+    #[test]
     fn hosted_repos_fetch_submodules_from_their_own_host_only() {
         let ok = super::submodule_host_allowed;
         let app = "https://github.com/acme/app.git";
@@ -2325,6 +2376,23 @@ async fn image_id(image: &str) -> String {
         .output()
         .await;
     inspect().await.unwrap_or_else(|| "unavailable".into())
+}
+
+/// Deletes the index of every git directory under `dir` (the submodules',
+/// nested ones included), without following symlinks. Only a git directory's
+/// own `index`, next to its `HEAD`: a ref may be named `index` too.
+fn remove_indexes(dir: &Path) {
+    if dir.join("HEAD").is_file() {
+        let _ = std::fs::remove_file(dir.join("index"));
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_indexes(&e.path());
+        }
+    }
 }
 
 /// A git command that rewrites the work tree (`checkout`, `clean`), retried

@@ -471,7 +471,9 @@ pub fn key_inputs(
         // 4: tasks run with `-e` and pipefail, so a result that passed
         // without them may not pass now. 5: tasks run in UTC (and C.UTF-8 on
         // Linux), so a result from a worker in another zone may not hold.
-        v: 5,
+        // 6: checkouts ignore the worker's line-ending config, so a result
+        // built from a CRLF checkout may not hold.
+        v: 6,
         config: crate::cas::digest(&serde_json::to_vec(&config)?),
         deps,
         files: matched,

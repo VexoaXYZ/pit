@@ -5438,3 +5438,76 @@ Tests: `plans_one_group_per_arch_and_names_them_apart`, `arch_aliases_fold_into_
 - **Proof.** No ARM machine here: the `aarch64` claim was a raw API request, not a running worker.
 - **Granularity.** The arch is per group; a task needing another arch goes in its own group.
 - **No checking of the name.** A misspelt arch waits until someone reads the hint.
+
+## P86. A runner's git config turns line endings into CRLF, and the cache spreads them
+
+**The pain.** What a checkout contains depends on the runner's git config, not just the commit.
+Windows runners check out with `core.autocrlf=true` (a comment there objects to "the default
+config of `core.autocrlf=true` on a runner"), so CI gets CRLF files and tests that expect LF fail: [actions/checkout#135](https://github.com/actions/checkout/issues/135) ("Windows - Line
+endings & conversion", open since 2020, 37 comments) says "this isn't an issue with actual code,
+but has messed up testing", and the workaround is `git config --global core.autocrlf false`
+before the checkout. One comment adds that "duplicate caches ... are falsely being created only
+because the checkout action does not support config options" for it.
+
+For Pit it is worse than a failing test. Action keys come from git blob ids, which are the same
+whatever line endings the checkout produced, so a worker whose host has `core.autocrlf=true`
+produces CRLF outputs under the keys every other worker uses.
+
+**Reproduction** (`/tmp/painhunt/p86`, a scratch server on port 7980; two workers on this
+machine, one with `GIT_CONFIG_GLOBAL` holding `core.autocrlf = true`). `pack` copies `build.sh`
+into `dist/` (cached); `use` runs `sh dist/build.sh`:
+```
+crlf-box:  ✓ pack   ✗ use  dist/build.sh: 1: set: Illegal option -
+lf-box:    ◆ pack cached   ✗ use  dist/build.sh: 1: set: Illegal option -
+lf-box, --no-cache:  ✓ pack  ✓ use  passed
+```
+The clean worker failed only because of the other worker's cached output.
+
+**Fix.**
+- **The checkout is the commit's bytes.** Each workspace's own config pins `core.autocrlf=false`
+  and `core.eol=native`, overriding the host's, so files are converted only as the repo's
+  `.gitattributes` asks (`*.bat text eol=crlf` still gives CRLF). Submodule checkouts get the
+  same settings.
+- **Warm workspaces.** One checked out before the upgrade still has CRLF files that git's stat
+  cache calls clean. The first time the setting is pinned, the index is rebuilt without stat
+  data (`git read-tree HEAD`), so the checkout compares and rewrites every file, and still
+  deletes files the new commit dropped. The submodules' indexes are removed, so their update
+  rewrites them too. The setting is written last, so an interrupted pass is redone.
+- **Old results.** The action key version goes from 5 to 6, so results cached from CRLF
+  checkouts before the fix are never reused.
+
+**After** (rebuilt server and worker, the same CRLF host config and the same warm workspace):
+```
+before the run: set -e \r \n ...   (the warm workspace, checked out by the old worker)
+key v5:  ✓ pack ✓ use (--no-cache)   after: set -e \n ...   core.autocrlf (local) = false
+         ◆ pack cached  ✗ use  set: Illegal option -   (the CRLF entry cached before the fix)
+key v6:  ✓ pack  ran because Pit's cache format changed   ✓ use   passed
+         ◆ pack cached  ◆ use cached   passed
+```
+The e2e test `a_workers_git_config_does_not_change_its_checkout` runs the worker binary with a
+global `core.autocrlf=true`, and checks that `build.sh` is LF and the `eol=crlf` `.bat` file is
+CRLF, in the repo and in a submodule. It then puts the workspace back the way an older worker
+left it (CRLF files, stat cache settled past git's racy window) and checks that the next run is
+LF. Without the fix it fails (`exit 2`). With the first version of the fix (index only) it fails
+in the submodule.
+The live runs above used the first version of the fix (index only); the submodule and
+interrupted-pass cases rest on the e2e test, which fails on that version.
+
+**Review.** Two independent rounds.
+- **Round 1: changes.**
+  - **Submodules** kept their CRLF files: their indexes, under `.git/modules`, still called
+    them clean. Fixed: those indexes are removed (only a git directory's own, next to its
+    `HEAD`, never following a symlink), and the test now covers it.
+  - **Order:** the setting was written before the index work, so an interrupted pass stayed
+    stale. Fixed: it is written last.
+  - **Stale files:** with no index, a checkout to another commit left behind files the old
+    one tracked. Fixed: `read-tree` keeps the paths and drops only the stat data.
+- **Round 2: APPROVE.** Two nits were fixed: a misplaced doc comment, and a ref named `index`
+  being deleted (now a unit test).
+
+**Verdict: SOLVED.** Limits:
+- **One cold run.** The key bump makes every cached result miss once after upgrading.
+- **Other git config.** Only line endings are pinned. Other host git config can still change a
+  checkout (a `filter` driver, `core.symlinks=false`).
+- **Windows workers** now check out LF unless `.gitattributes` says otherwise, unlike GitHub's
+  Windows runners. That is deliberate: the bytes are the commit's, as on every other worker.

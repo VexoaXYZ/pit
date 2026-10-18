@@ -5944,3 +5944,85 @@ async fn outdated_workers_get_no_jobs() {
         .unwrap();
     assert_ne!(resp.status(), 426);
 }
+
+/// A worker's own git config (`core.autocrlf=true`, as on many Windows
+/// hosts) doesn't change what it checks out, submodules included: the
+/// commit's bytes, converted only as `.gitattributes` asks. Otherwise its
+/// outputs would differ from other workers' under the same action key. A warm
+/// workspace checked out with CRLF before is rewritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workers_git_config_does_not_change_its_checkout() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = pit::server::App::new(&data.path().join("server"), None, base.clone()).unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    let config = data.path().join("crlf.gitconfig");
+    std::fs::write(&config, "[core]\n\tautocrlf = true\n").unwrap();
+    let _worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_pit"))
+        .args([
+            "worker", "--server", &base, "--name", "crlf", "--slots", "1",
+        ])
+        .arg("--data")
+        .arg(data.path())
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let workspaces = data.path().join("worker").join("workspaces");
+    let pit = Pit {
+        client: Client::new(&base, None).unwrap(),
+        _data: data,
+        app,
+        base,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    sh(&root, "git init -q --bare -b main lib.git");
+    let lib = root.join("libwork");
+    write(&lib, "lib.sh", "set -e\necho lib\n");
+    sh(&lib, "git init -q -b main && git add -A && git commit -qm one && git remote add origin ../lib.git && git push -q origin main");
+    let dir = root.join("app");
+    write(&dir, "build.sh", "set -e\necho built\n");
+    write(&dir, "win.bat", "@echo off\n");
+    write(&dir, ".gitattributes", "*.bat text eol=crlf\n");
+    write(
+        &dir,
+        "pit.config.json",
+        &serde_json::json!({ "tasks": { "check": {
+            "run": "cr=$(printf '\\r'); sh build.sh && sh vendor/lib/lib.sh && ! grep -q \"$cr\" build.sh vendor/lib/lib.sh && grep -q \"$cr\" win.bat",
+            "cache": false,
+        } } })
+        .to_string(),
+    );
+    sh(&dir, &format!(
+        "git init -q -b main && git -c protocol.file.allow=always submodule add -q {} vendor/lib && git add -A && git commit -qm init",
+        root.join("lib.git").display()
+    ));
+    let v = run(&pit, &dir).await;
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+
+    // As an older worker left it: CRLF files that git's stat cache, settled
+    // past its racy window, calls clean.
+    let ws = walkdir(&workspaces)
+        .into_iter()
+        .find(|p| p.ends_with("build.sh"))
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    sh(
+        &ws,
+        "git config core.autocrlf true && git config --unset core.eol && rm .git/index && git checkout -q -f HEAD \
+         && find .git/modules -name index -delete \
+         && git -c protocol.file.allow=always -c core.autocrlf=true submodule update -q --force --checkout \
+         && grep -q \"$(printf '\\r')\" build.sh vendor/lib/lib.sh && sleep 2 \
+         && git update-index -q --refresh && git -C vendor/lib -c core.autocrlf=true update-index -q --refresh",
+    );
+    write(&dir, "README.md", "again\n");
+    sh(&dir, "git add -A && git commit -qm again");
+    let v = run(&pit, &dir).await;
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+}
