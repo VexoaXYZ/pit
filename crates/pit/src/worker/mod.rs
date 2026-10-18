@@ -1746,15 +1746,20 @@ mod submodule_tests {
 }
 
 impl Worker {
-    /// The `$HOME` a job's `docker` tasks keep between runs: one per trust
-    /// pool, like warm workspaces (P20), so a branch cannot leave a poisoned
-    /// tool cache for main. A fork's run, or a `--fresh` one, gets none.
+    /// The `$HOME` a job's `docker` tasks keep between runs: one per repo and
+    /// trust pool, like warm workspaces (P20), so neither another repo nor a
+    /// branch can leave a poisoned tool cache for main. A fork's run, or a
+    /// `--fresh` one, gets none.
     fn docker_home(&self, job: &Job) -> Result<Option<PathBuf>> {
         if job.no_secrets || job.fresh {
             return Ok(None);
         }
         let pool = if job.trusted { "trusted" } else { "untrusted" };
-        let dir = self.data_dir.join("homes").join(pool);
+        let dir = self
+            .data_dir
+            .join("homes")
+            .join(safe_name(&job.repo))
+            .join(pool);
         std::fs::create_dir_all(&dir)?;
         Ok(Some(dir))
     }

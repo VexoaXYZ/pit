@@ -3657,9 +3657,10 @@ containers got `HOME=/tmp` in a container removed after the task:
 
 **Fix.**
 - A container's `$HOME` is now `/pit-home`, bind-mounted from a worker directory
-  (`homes/trusted`, `homes/untrusted`), so tool caches persist.
-- It's split by trust pool like warm workspaces (P20), so a branch can't leave a poisoned npm
-  cache for main.
+  (`homes/<repo>/trusted`, `homes/<repo>/untrusted`), so tool caches persist.
+- It's split by repo and trust pool like warm workspaces (P20), so neither another repo nor a
+  branch can leave a poisoned npm cache for main. (The first commit shared it across repos; fixed
+  right after.)
 - Fork runs and `--fresh` (and `pit verify`) get the old empty `/tmp`.
 
 The rest of the time is npm resolving metadata over the network; `--prefer-offline` would cut more.
