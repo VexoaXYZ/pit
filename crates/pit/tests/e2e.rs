@@ -4416,4 +4416,22 @@ async fn artifacts_are_kept_from_failed_runs_and_served_as_files() {
         .map(|a| a.path.as_str())
         .collect();
     assert_eq!(paths, ["report/fail.png"]);
+    // A glob that also matches a committed file the task reads deletes
+    // nothing, and keeps only what the task wrote.
+    write(dir, "snapshots/baseline.png", "committed\n");
+    let config = serde_json::json!({ "tasks": { "e2e": {
+        "run": "cat snapshots/baseline.png > /dev/null && echo new > snapshots/diff.png",
+        "artifacts": ["**/*.png"], "cache": false,
+    } } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(dir, "git add -A && git commit -qm baseline");
+    let third = run(&pit, dir).await;
+    assert_eq!(third.status, Status::Passed, "{third:?}");
+    let mut paths: Vec<&str> = third.groups[0].tasks[0]
+        .artifacts
+        .iter()
+        .map(|a| a.path.as_str())
+        .collect();
+    paths.sort();
+    assert_eq!(paths, ["snapshots/diff.png"]);
 }

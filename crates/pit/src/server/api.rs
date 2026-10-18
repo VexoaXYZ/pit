@@ -446,7 +446,7 @@ async fn set_artifacts(
 ) -> ApiResult<StatusCode> {
     let (group_id, _, _) = app.db.task_group(&id)?;
     files.truncate(MAX_ARTIFACTS);
-    files.retain(|f| app.cas.contains(&f.digest));
+    files.retain(|f| f.path.len() <= 1024 && app.cas.contains(&f.digest));
     if !app.db.set_artifacts(&id, lease(&headers), &files)? {
         return Err(stale(&group_id));
     }
@@ -467,20 +467,34 @@ async fn get_artifact(
         .cas
         .get(&a.digest)?
         .ok_or_else(|| not_found("artifact blob"))?;
-    let name: String = path
-        .rsplit('/')
-        .next()
-        .unwrap_or("artifact")
+    let last = path.rsplit('/').next().unwrap_or_default();
+    let ascii: String = last
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+        .collect();
+    let ascii = if ascii.is_empty() {
+        "artifact".to_string()
+    } else {
+        ascii
+    };
+    let encoded: String = last
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"._-".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
         .collect();
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (
                 header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{name}\""),
+                format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}"),
             ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
         ],
         bytes,
     )

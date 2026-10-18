@@ -90,7 +90,12 @@ pub fn collect(app: &App, force: bool) -> Result<GcReport> {
 /// Deletes blobs that nothing refers to and that are older than the grace
 /// period. Returns the bytes held by blobs still inside the grace period.
 fn sweep(app: &App, report: &mut GcReport) -> Result<u64> {
-    let (mut keep, overlays) = app.db.referenced_blobs(now_ms() - RUN_RETENTION_MS)?;
+    // Artifacts get a quarter of the cache budget: past it, the oldest runs'
+    // go first, before any build cache entry would.
+    let budget = app.cache_max_bytes.load(Ordering::Relaxed) / 4;
+    let (mut keep, overlays) = app
+        .db
+        .referenced_blobs(now_ms() - RUN_RETENTION_MS, budget)?;
     for d in overlays {
         if let Some(bytes) = app.cas.get(&d)? {
             if let Ok(overlay) = serde_json::from_slice::<Overlay>(&bytes) {

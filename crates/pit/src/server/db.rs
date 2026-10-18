@@ -1906,9 +1906,13 @@ impl Db {
     /// cache artifact points to, plus logs and overlays of runs that are
     /// active or newer than `keep_runs_since` (ms). Overlay manifests are
     /// returned separately: the files they list must be kept too.
+    /// Blobs to keep. Artifacts of runs since `keep_runs_since` count only
+    /// up to `artifact_budget` bytes (0: no limit), newest runs first, so
+    /// they never push the build cache out.
     pub fn referenced_blobs(
         &self,
         keep_runs_since: i64,
+        artifact_budget: u64,
     ) -> Result<(std::collections::HashSet<String>, Vec<String>)> {
         let c = self.conn.lock();
         let mut keep = std::collections::HashSet::new();
@@ -1946,10 +1950,15 @@ impl Db {
         {
             let mut st = c.prepare(&format!(
                 "SELECT tasks.artifacts FROM tasks JOIN runs ON runs.id = tasks.run_id
-                 WHERE tasks.artifacts IS NOT NULL AND {recent}"
+                 WHERE tasks.artifacts IS NOT NULL AND {recent} ORDER BY runs.created_at DESC"
             ))?;
-            for a in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
+            let mut kept = 0u64;
+            'runs: for a in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
                 for f in serde_json::from_str::<Vec<Artifact>>(&a?).unwrap_or_default() {
+                    if artifact_budget > 0 && kept + f.size > artifact_budget {
+                        break 'runs;
+                    }
+                    kept += f.size;
                     keep.insert(f.digest);
                 }
             }
@@ -2594,7 +2603,7 @@ mod tests {
                 params![g, serde_json::to_string(&files).unwrap()],
             )
             .unwrap();
-        let (keep, _) = db.referenced_blobs(0).unwrap();
+        let (keep, _) = db.referenced_blobs(0, 0).unwrap();
         assert!(keep.contains("d1"));
         assert_eq!(
             db.view_task_artifact_for_test(&g)

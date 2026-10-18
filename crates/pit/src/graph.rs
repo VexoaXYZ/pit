@@ -34,7 +34,13 @@ pub fn validate(config: &PitConfig) -> Result<()> {
             if task.shards == Some(0) {
                 bail!("task {gname}.{tname}: shards must be at least 1");
             }
-            for pattern in task.inputs.iter().flatten().chain(&task.outputs) {
+            for pattern in task
+                .inputs
+                .iter()
+                .flatten()
+                .chain(&task.outputs)
+                .chain(&task.artifacts)
+            {
                 Glob::new(pattern.strip_prefix('!').unwrap_or(pattern)).map_err(|e| {
                     anyhow::anyhow!("task {gname}.{tname}: bad glob {pattern:?}: {e}")
                 })?;

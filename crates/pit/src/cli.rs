@@ -544,6 +544,7 @@ pub async fn flaky(client: &Client, days: u32) -> Result<i32> {
 pub async fn artifacts(client: &Client, run: &str, task: Option<&str>, out: &Path) -> Result<i32> {
     let view: RunView = client.get(&format!("/api/runs/{run}")).await?;
     let mut count = 0;
+    let mut failed = 0;
     let mut bytes = 0u64;
     for g in &view.groups {
         for t in &g.tasks {
@@ -552,22 +553,38 @@ pub async fn artifacts(client: &Client, run: &str, task: Option<&str>, out: &Pat
                 continue;
             }
             for a in &t.artifacts {
-                let dest =
-                    crate::worker::files::safe_join(&out.join(&g.name).join(&t.name), &a.path)?;
-                let data = client.cas_get(&a.digest).await?;
-                crate::worker::files::write_file(&dest, &data, false)?;
-                count += 1;
-                bytes += a.size;
-                println!("{}", dest.display());
+                // One checked path: names and paths come from the run's config
+                // and workspace, a fork's included.
+                let rel = format!("{}/{}/{}", g.name, t.name, a.path);
+                let fetched = match crate::worker::files::safe_join(out, &rel) {
+                    Ok(dest) => match client.cas_get(&a.digest).await {
+                        Ok(data) => {
+                            crate::worker::files::write_file(&dest, &data, false).map(|_| dest)
+                        }
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
+                match fetched {
+                    Ok(dest) => {
+                        count += 1;
+                        bytes += a.size;
+                        println!("{}", dest.display());
+                    }
+                    Err(e) => {
+                        eprintln!("skipped {rel}: {e:#}");
+                        failed += 1;
+                    }
+                }
             }
         }
     }
-    if count == 0 {
+    if count == 0 && failed == 0 {
         eprintln!("no artifacts in {run} (tasks keep them with `artifacts: [...]`)");
         return Ok(1);
     }
     eprintln!("{count} file(s), {:.1} MB", bytes as f64 / 1e6);
-    Ok(0)
+    Ok(i32::from(failed > 0))
 }
 
 pub async fn logs(client: &Client, run: &str, task: &str) -> Result<i32> {

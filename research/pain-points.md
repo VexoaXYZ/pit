@@ -3782,8 +3782,9 @@ upload v7 and download v8
 worker's workspace, where the next run overwrote it.
 
 **Fix: `artifacts` on a task** (globs).
-- **Cleared first.** Matching files are cleared before each attempt, so a warm workspace's
-  leftovers from an earlier run aren't kept.
+- **Only what the task wrote.** Before the task, the matches are recorded (size and mtime); only
+  files new or changed afterwards are kept. A warm workspace's leftovers from an earlier run are
+  skipped, and so are committed files the glob also matches.
 - **Kept from every run.** After the task, passed or failed, the matches are collected (regular
   files, not through symlinks, at most 100 MiB a file and 512 MiB a task; anything left out is
   noted in the log), stored in the CAS and recorded on the task (`POST /api/tasks/{id}/artifacts`,
@@ -3793,7 +3794,9 @@ worker's workspace, where the next run overwrote it.
     `GET /api/tasks/<id>/artifacts/<path>`;
   - all of them with `pit artifacts <run> [--task t] [--out dir]`, into
     `<out>/<group>/<task>/<path>`.
-- **Kept 14 days.** The CAS GC keeps artifact blobs for the same 14 days it keeps a run's logs.
+- **Kept up to 14 days.** The CAS GC keeps artifact blobs for the same 14 days it keeps a run's
+  logs, within a quarter of the cache budget, newest runs first, so artifacts never push the build
+  cache out.
 - **Cleared on a new claim**, so a requeued attempt's artifacts aren't shown.
 
 **Measured.**
@@ -3806,7 +3809,29 @@ worker's workspace, where the next run overwrote it.
   - the next run, which writes only `fail.png`, does not keep the previous run's `stale.txt`.
 - A unit test: the GC keeps artifact blobs.
 
+**Review fixes.** An independent review found two blockers and several shoulds in the first
+version, all fixed:
+1. **`pit artifacts` could write anywhere.** Group and task names were joined onto `--out`
+   unchecked, so a fork's config naming a group `/home/u/sub` and a task `..` could make a
+   maintainer's download overwrite `~/.bashrc`. Now the whole `<group>/<task>/<path>` goes through
+   `safe_join`, and config loading rejects names with `.`/`..` parts, a leading `/`, `\` or
+   control characters. Scoped names like `typecheck:@acme/web` are still fine.
+2. **Clearing the globs before each attempt deleted whatever they matched**: committed Playwright
+   baselines for `**/*.png`, a dependency's `dist/`. Nothing is deleted now. The e2e test commits
+   a `baseline.png` the task reads under `**/*.png`: the task passes, and only the new `diff.png`
+   is kept.
+3. **Should-fixes:**
+   - artifacts are best-effort (a failure is logged, never fails the task);
+   - they no longer fill the worker's local CAS;
+   - they have their own GC budget;
+   - sizes are checked before reading, and files are uploaded one at a time;
+   - the CLI skips a bad file and carries on;
+   - the worker applies the 1000-file cap and says why files were left out;
+   - globs are validated at config load;
+   - downloads get a UTF-8 `filename*` and `nosniff`.
+
 **Verdict: SOLVED.** Limits:
-- Files are read whole into memory to upload (hence the caps).
+- Each file is read whole into memory to upload (hence the caps).
+- A file changed back to its old size and mtime looks unchanged.
 - Artifacts are not restored on a cache hit; that's what `outputs` is for.
 - No dashboard links yet.

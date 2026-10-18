@@ -242,6 +242,27 @@ pub fn normalize(mut config: PitConfig) -> Result<PitConfig> {
             },
         );
     }
+    // Group and task names end up in paths (workspaces, `pit artifacts`
+    // downloads) and check names. `/` is fine (`typecheck:@acme/web`), but
+    // nothing that could climb out of a directory or break a line.
+    let plain = |n: &str| {
+        !n.is_empty()
+            && !n.starts_with('/')
+            && !n.chars().any(|c| c == '\\' || c.is_control())
+            && !n
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+    };
+    for (gname, group) in &config.groups {
+        if !plain(gname) {
+            bail!("group name {gname:?} must be a relative name without `.`/`..` parts, `\\` or control characters");
+        }
+        for tname in group.tasks.keys() {
+            if !plain(tname) {
+                bail!("task name {gname}.{tname:?} must be a relative name without `.`/`..` parts, `\\` or control characters");
+            }
+        }
+    }
     for (gname, group) in config.groups.iter_mut() {
         if group.os.is_empty() {
             group.os.push("any".into());
@@ -345,6 +366,10 @@ mod tests {
             br#"{"tasks":{"t":{"run":"true","shards":1,"shardFiles":["src/**"]}}}"#,
             br#"{"tasks":{"t":{"run":"true","image":"--privileged"}}}"#,
             br#"{"tasks":{"t":{"run":"true","memory":"2g"}}}"#,
+            br#"{"groups":{"/home/u":{"tasks":{"t":{"run":"true"}}}}}"#,
+            br#"{"groups":{"g":{"tasks":{"..":{"run":"true"}}}}}"#,
+            br#"{"groups":{"g":{"tasks":{"a/../../x":{"run":"true"}}}}}"#,
+            br#"{"tasks":{"t":{"run":"true","artifacts":["[unclosed"]}}}"#,
             br#"{"tasks":{"t":{"run":"true","image":"node:22","memory":"lots"}}}"#,
         ] {
             assert!(
@@ -355,6 +380,16 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
         }
+        // Scoped package names are fine as task names.
+        assert!(parse(
+            CONFIG_JSON,
+            br#"{"tasks":{"typecheck:@acme/web":{"run":"true"}}}"#,
+            dir.path(),
+            &Default::default(),
+            false
+        )
+        .await
+        .is_ok());
         let good = br#"{"tasks":{"test":{"run":"true","inputs":["src/**"],"cache":false}}}"#;
         assert!(
             parse(CONFIG_JSON, good, dir.path(), &Default::default(), false)

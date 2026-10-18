@@ -1388,13 +1388,16 @@ impl Worker {
         let mut failures: Vec<String> = Vec::new();
         let mut duration_ms = 0u64;
         let mut attempt = 0;
+        // What `artifacts` matches before the task: only files the task then
+        // writes or changes are kept (a warm workspace's leftovers are not,
+        // and nothing is deleted: the globs may match tracked files or a
+        // dependency's outputs).
+        let artifacts_before = artifact_snapshot(ws, &def.artifacts);
         // Tests that failed in an attempt that was then retried.
         let mut retried_tests: std::collections::BTreeSet<String> = Default::default();
         let outcome = loop {
             attempt += 1;
             files::clear_outputs(ws, &def.reports)?;
-            // The last attempt's artifacts, never a warm workspace's leftovers.
-            files::clear_outputs(ws, &def.artifacts)?;
             // Each attempt starts a summary of its own.
             files::write_file(&summary_path, b"", false)?;
             let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -1715,7 +1718,19 @@ impl Worker {
             .await;
         let _ = std::fs::remove_file(&summary_path);
         if !def.artifacts.is_empty() {
-            self.keep_artifacts(&client, task, ws, def).await?;
+            // Best effort: keeping artifacts never fails the task.
+            if let Err(e) = self
+                .keep_artifacts(&client, task, ws, def, &artifacts_before)
+                .await
+            {
+                let note = format!("\n[pit: artifacts not kept: {e:#}]\n");
+                let _ = client
+                    .post_empty(
+                        &format!("/api/tasks/{}/log", task.id),
+                        &LogChunk { text: note },
+                    )
+                    .await;
+            }
         }
         let message = message.map(|m| masker.mask(&m));
         let status = if ok { Status::Passed } else { Status::Failed };
@@ -1812,47 +1827,87 @@ mod submodule_tests {
 
 /// Largest artifact file kept, and the most a task keeps in all.
 const MAX_ARTIFACT_FILE: u64 = 100 << 20;
-const MAX_ARTIFACT_TOTAL: usize = 512 << 20;
+const MAX_ARTIFACT_TOTAL: u64 = 512 << 20;
+const MAX_ARTIFACT_FILES: usize = 1000;
+
+/// Size and modification time of each file `artifacts` matches now.
+fn artifact_snapshot(
+    ws: &Path,
+    globs: &[String],
+) -> HashMap<String, (u64, Option<std::time::SystemTime>)> {
+    if globs.is_empty() {
+        return HashMap::new();
+    }
+    files::collect_outputs(ws, globs)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(rel, abs)| {
+            let m = std::fs::symlink_metadata(abs).ok()?;
+            Some((rel, (m.len(), m.modified().ok())))
+        })
+        .collect()
+}
 
 impl Worker {
-    /// Uploads the files `artifacts` matches, passed or failed, and records
-    /// them on the task.
+    /// Uploads the files `artifacts` matches that the task wrote or changed,
+    /// passed or failed, one at a time, and records them on the task.
     async fn keep_artifacts(
         &self,
         client: &crate::client::Client,
         task: &JobTask,
         ws: &Path,
         def: &TaskDef,
+        before: &HashMap<String, (u64, Option<std::time::SystemTime>)>,
     ) -> Result<()> {
         let mut kept = Vec::new();
-        let mut blobs = Vec::new();
-        let mut total = 0usize;
-        let mut skipped = 0usize;
+        let mut total = 0u64;
+        let (mut too_big, mut unreadable, mut over) = (0usize, 0usize, 0usize);
         for (rel, abs) in files::collect_outputs(ws, &def.artifacts)? {
-            // Not through a symlink; regular files only.
-            let Some(bytes) = files::read_task_file(&abs, MAX_ARTIFACT_FILE) else {
-                skipped += 1;
+            let Ok(meta) = std::fs::symlink_metadata(&abs) else {
+                unreadable += 1;
                 continue;
             };
-            if total + bytes.len() > MAX_ARTIFACT_TOTAL {
-                skipped += 1;
+            if before.get(&rel) == Some(&(meta.len(), meta.modified().ok())) {
+                continue; // There before the task, unchanged.
+            }
+            if meta.len() > MAX_ARTIFACT_FILE {
+                too_big += 1;
                 continue;
             }
-            total += bytes.len();
-            let digest = self.cas.put(&bytes)?;
+            if kept.len() >= MAX_ARTIFACT_FILES || total + meta.len() > MAX_ARTIFACT_TOTAL {
+                over += 1;
+                continue;
+            }
+            // Not through a symlink; regular files only.
+            let Some(bytes) = files::read_task_file(&abs, MAX_ARTIFACT_FILE) else {
+                unreadable += 1;
+                continue;
+            };
+            total += bytes.len() as u64;
+            let digest = crate::cas::digest(&bytes);
+            let size = bytes.len() as u64;
+            client.upload_missing(vec![(digest.clone(), bytes)]).await?;
             kept.push(Artifact {
                 path: rel,
-                digest: digest.clone(),
-                size: bytes.len() as u64,
+                digest,
+                size,
             });
-            blobs.push((digest, bytes));
         }
-        if skipped > 0 {
-            let note = format!(
-                "\n[pit: {skipped} artifact file(s) left out: over {} MiB each or {} MiB in all]\n",
-                MAX_ARTIFACT_FILE >> 20,
+        let mut notes = Vec::new();
+        if too_big > 0 {
+            notes.push(format!("{too_big} over {} MiB", MAX_ARTIFACT_FILE >> 20));
+        }
+        if over > 0 {
+            notes.push(format!(
+                "{over} past {MAX_ARTIFACT_FILES} files or {} MiB in all",
                 MAX_ARTIFACT_TOTAL >> 20
-            );
+            ));
+        }
+        if unreadable > 0 {
+            notes.push(format!("{unreadable} not regular files or unreadable"));
+        }
+        if !notes.is_empty() {
+            let note = format!("\n[pit: artifact files left out: {}]\n", notes.join(", "));
             let _ = client
                 .post_empty(
                     &format!("/api/tasks/{}/log", task.id),
@@ -1860,7 +1915,6 @@ impl Worker {
                 )
                 .await;
         }
-        client.upload_missing(blobs).await?;
         client
             .post_empty(&format!("/api/tasks/{}/artifacts", task.id), &kept)
             .await?;
