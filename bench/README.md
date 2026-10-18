@@ -35,6 +35,20 @@ as root.
 | Warm, uncommitted README edit | **1.1s** | Outside every task's inputs: all cached. |
 | Warm, uncommitted edit in `apps/marketing` | **1.0s** | Excluded from these tasks' inputs: all cached. |
 
+### Re-measured on an idle box, with per-package tasks (research P21)
+
+The same box later, with nothing else running. The one-file edits are uncommitted (`pit run`).
+[`t3code.packages.pit.config.ts`](t3code.packages.pit.config.ts) generates one typecheck per
+package from the repo's workspace, and gives `build` and `test-web` only the packages they import.
+
+| Scenario | Monolithic config | Per-package config |
+| --- | --- | --- |
+| Cold | 716s | |
+| One-file edit in `apps/web` | 443s | 438s (`typecheck` 137s of work → 43s; `test-web` sets the time) |
+| One-file edit in `packages/ssh` (`web` does not import it) | reruns everything | **209s** (`test-web` cached, 3 of 30 typechecks) |
+
+Blacksmith's p50 is 190s for any change, because every job reruns every time.
+
 ### Reading it honestly
 
 - When nothing a task reads has changed, Pit answers in about a second, against about 190s on

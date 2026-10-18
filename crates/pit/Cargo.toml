@@ -19,6 +19,8 @@ blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 globset = "0.4"
+quick-xml = "0.37"
+ring = "0.17"
 hex = "0.4"
 hmac = "0.12"
 jsonwebtoken = "9"
@@ -37,6 +39,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+jiff = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

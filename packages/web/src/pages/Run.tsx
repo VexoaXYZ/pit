@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, eventSource, type GroupView, type PitEvent, type RunView, type Status, type TaskView } from "../api";
 import {
   Chip,
@@ -36,28 +36,52 @@ function patchGroup(run: RunView | undefined, groupId: string | undefined, patch
 // eslint-disable-next-line no-control-regex
 const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g;
 
+/** Logs up to this many lines render as plain wrapped text. */
+const SMALL_LOG = 2000;
+/** Line height of the virtualized view, in px (matches `.log-virtual`). */
+const LINE_PX = 18;
+
 function LogPanel({ text, status }: { text: string | undefined; status: Status }) {
-  const ref = useRef<HTMLPreElement>(null);
+  const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewHeight, setViewHeight] = useState(440);
+  // Split once per update; colour codes are stripped only for visible lines.
+  const lines = useMemo(() => (text ? text.split("\n") : []), [text]);
   useLayoutEffect(() => {
     const el = ref.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [text]);
+    if (!el) return;
+    setViewHeight(el.clientHeight);
+    if (stick.current) el.scrollTop = el.scrollHeight;
+  }, [lines]);
   if (text === undefined) return <div className="log log-empty">Loading log…</div>;
   if (text === "") {
     return <div className="log log-empty">{status === "running" ? "Waiting for output…" : status === "queued" ? "Not started yet." : "No output."}</div>;
   }
+  const onScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    setScrollTop(el.scrollTop);
+  };
+  if (lines.length <= SMALL_LOG) {
+    return (
+      <div ref={ref} className="log" onScroll={onScroll}>
+        {text.replace(ANSI, "")}
+      </div>
+    );
+  }
+  // Long logs: render only the lines in view (plus a margin), so a 200k-line
+  // log opens and streams without freezing the page.
+  const first = Math.max(0, Math.floor(scrollTop / LINE_PX) - 50);
+  const last = Math.min(lines.length, Math.ceil((scrollTop + viewHeight) / LINE_PX) + 50);
+  const visible = lines.slice(first, last).map((l) => l.replace(ANSI, "")).join("\n");
   return (
-    <pre
-      ref={ref}
-      className="log"
-      onScroll={(e) => {
-        const el = e.currentTarget;
-        stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-      }}
-    >
-      {text.replace(ANSI, "")}
-    </pre>
+    <div ref={ref} className="log log-virtual" onScroll={onScroll}>
+      <div style={{ height: lines.length * LINE_PX, position: "relative" }}>
+        <pre style={{ position: "absolute", top: first * LINE_PX, left: 0, margin: 0 }}>{visible}</pre>
+      </div>
+      <div className="log-count">{lines.length.toLocaleString()} lines</div>
+    </div>
   );
 }
 

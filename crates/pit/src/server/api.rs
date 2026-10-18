@@ -1,5 +1,6 @@
 //! HTTP routes for the CLI, workers and dashboard.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,14 +58,34 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/events", get(all_events))
         .route("/api/tasks/{id}/log", get(task_log).post(append_log))
         .route("/api/tasks/{id}/start", post(start_task))
+        .route("/api/tasks/{id}/annotations", post(set_annotations))
+        .route("/api/tasks/{id}/tests", post(set_test_outcomes))
+        .route("/api/tasks/{id}/summary", post(set_summary))
+        .route("/api/tasks/{id}/artifacts", post(set_artifacts))
+        .route("/api/tasks/{id}/artifacts/{*path}", get(get_artifact))
         .route("/api/tasks/{id}/finish", post(finish_task))
         .route("/api/groups/{id}/heartbeat", post(heartbeat))
+        .route("/api/groups/{id}/release", post(release_group))
         .route("/api/groups/{id}/finish", post(finish_group))
         .route("/api/workers", get(workers))
         .route("/api/workers/claim", post(claim))
         .route("/api/cache/{key}", get(cache_get).put(cache_put))
+        .route("/api/cache/last/{scope}", get(cache_last))
+        .route("/api/cache/failed/{key}", get(cache_failed))
+        .route("/api/cache/{key}/claim", post(cache_claim))
+        .route("/api/flaky", get(flaky))
+        .route("/api/slow", get(slow))
+        .route("/api/flaky/tests", get(flaky_tests))
+        .route("/metrics", get(metrics))
+        .route("/api/timings", post(record_timings))
+        .route("/api/oidc/token", post(oidc_token))
+        .route("/.well-known/openid-configuration", get(oidc_discovery))
+        .route("/.well-known/jwks.json", get(oidc_jwks))
+        .route("/api/gc", post(gc_now))
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
+        .route("/api/schedules", get(list_schedules))
+        .route("/api/schedules/run", post(run_schedule))
         .route("/api/queue", get(queue_list).post(queue_add))
         .route("/api/queue/{key}", axum::routing::delete(queue_remove))
         .merge(super::remote_cache::routes())
@@ -85,21 +106,52 @@ struct TokenQuery {
 async fn auth(
     State(app): State<Arc<App>>,
     Query(q): Query<TokenQuery>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
+    let refuse = |why: &str| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": why })),
+        )
+            .into_response()
+    };
     let header = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if req.uri().path() == "/api/health" || app.authorized(header, q.token.as_deref()) {
+    let path = req.uri().path();
+    // A job's cache token opens the Turborepo and Bazel routes only, while
+    // its group runs. Checked here, before any body is read; the handlers
+    // get its run's scope.
+    let cache_token = (path.starts_with("/v8/") || path.starts_with("/bazel/"))
+        .then(|| {
+            header
+                .and_then(|h| h.strip_prefix("Bearer "))
+                .map(str::trim)
+        })
+        .flatten()
+        .filter(|b| b.starts_with(super::remote_cache::CACHE_TOKEN_PREFIX))
+        .map(String::from);
+    if let Some(token) = cache_token {
+        return match app.db.cache_token_trust(&token) {
+            Ok(Some((trusted, repo, github))) => {
+                req.extensions_mut()
+                    .insert(app.cache_scope(&repo, github, trusted));
+                next.run(req).await
+            }
+            Ok(None) => refuse("this job's cache token is no longer live"),
+            Err(e) => ApiError::from(e).into_response(),
+        };
+    }
+    // OIDC discovery and keys are public: clouds fetch them to verify tokens.
+    if path == "/api/health"
+        || path.starts_with("/.well-known/")
+        || app.authorized(header, q.token.as_deref())
+    {
         next.run(req).await
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "missing or invalid token" })),
-        )
-            .into_response()
+        refuse("missing or invalid token")
     }
 }
 
@@ -117,7 +169,99 @@ async fn stats(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>
     let (blobs, bytes) = app.cas.stats();
     s["casBlobs"] = blobs.into();
     s["casBytes"] = bytes.into();
+    let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    s["cacheLimitBytes"] = load(&app.cache_max_bytes).into();
+    s["evictedEntries"] = load(&app.evicted_entries).into();
+    s["evictedBytes"] = load(&app.freed_bytes).into();
     Ok(Json(s))
+}
+
+/// `POST /api/groups/{id}/release`: a worker that is being stopped hands its
+/// group back, so another worker can start it now rather than after the
+/// heartbeat timeout.
+async fn release_group(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let lease = lease(&headers).ok_or_else(|| stale(&id))?;
+    if !app.db.requeue_group(&id, lease)? {
+        return Err(stale(&id));
+    }
+    tracing::info!("group {id} released by its worker; requeued");
+    app.work.notify_waiters();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /metrics`: Prometheus text format. The queue gauges are what to
+/// scale workers on (KEDA, an HPA, or a script that starts `pit worker`):
+/// work waiting, and for how long.
+async fn metrics(
+    State(app): State<Arc<App>>,
+) -> ApiResult<([(header::HeaderName, &'static str); 1], String)> {
+    use std::fmt::Write;
+    let now = crate::model::now_ms();
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, rows: &[(String, f64)]| {
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge");
+        for (labels, v) in rows {
+            let _ = writeln!(out, "{name}{labels} {v}");
+        }
+    };
+    let depth = app.db.queue_depth()?;
+    let queued: Vec<(String, f64)> = depth
+        .iter()
+        .map(|(os, n, _)| (format!("{{os=\"{os}\"}}"), *n as f64))
+        .collect();
+    let oldest: Vec<(String, f64)> = depth
+        .iter()
+        .map(|(os, _, at)| {
+            (
+                format!("{{os=\"{os}\"}}"),
+                ((now - at).max(0) as f64) / 1000.0,
+            )
+        })
+        .collect();
+    gauge(
+        "pit_queued_groups",
+        "Groups waiting for a worker, by OS.",
+        &queued,
+    );
+    gauge(
+        "pit_oldest_queued_seconds",
+        "How long the oldest waiting group has waited, by OS.",
+        &oldest,
+    );
+    gauge(
+        "pit_running_groups",
+        "Groups running on workers.",
+        &[(String::new(), app.db.running_groups()? as f64)],
+    );
+    let workers = app.db.workers()?;
+    let online = workers
+        .iter()
+        .filter(|(_, seen, _)| now - seen < 30_000)
+        .count();
+    let busy = workers
+        .iter()
+        .filter(|(_, seen, run)| now - seen < 30_000 && run.is_some())
+        .count();
+    gauge(
+        "pit_workers_online",
+        "Workers seen in the last 30s.",
+        &[(String::new(), online as f64)],
+    );
+    gauge(
+        "pit_workers_busy",
+        "Online workers running a group.",
+        &[(String::new(), busy as f64)],
+    );
+    let s = app.db.stats()?;
+    let counter = |k: &str| s[k].as_f64().unwrap_or(0.0);
+    let _ = writeln!(out, "# HELP pit_cache_hits_total Task results served from the cache.\n# TYPE pit_cache_hits_total counter\npit_cache_hits_total {}", counter("cacheHits"));
+    let _ = writeln!(out, "# HELP pit_tasks_run_total Tasks executed.\n# TYPE pit_tasks_run_total counter\npit_tasks_run_total {}", counter("tasksRun"));
+    let _ = writeln!(out, "# HELP pit_time_saved_seconds_total Task time saved by cache hits.\n# TYPE pit_time_saved_seconds_total counter\npit_time_saved_seconds_total {}", counter("timeSavedMs") / 1000.0);
+    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out))
 }
 
 async fn repos(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>> {
@@ -134,8 +278,12 @@ async fn repos(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>
 
 async fn create_run(
     State(app): State<Arc<App>>,
-    Json(req): Json<CreateRun>,
+    Json(mut req): Json<CreateRun>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Whatever trigger it names, a client's run counts as `local` for
+    // groups' `on`, like `pit run`: a `main`-only group is left out unless
+    // the client names its tasks.
+    req.counts_as = Some(vec!["local".into()]);
     if let Some(d) = &req.overlay {
         if !app.cas.contains(d) {
             return Err(anyhow::anyhow!("overlay {d} is not in the CAS; upload it first").into());
@@ -173,14 +321,46 @@ async fn get_run(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResu
         .map_err(|_| not_found(format!("run {id}")))
 }
 
+async fn list_schedules(State(app): State<Arc<App>>) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    Ok(Json(
+        super::schedule::list(&app, crate::model::now_ms()).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct RunSchedule {
+    name: String,
+    repo: Option<String>,
+}
+
+/// `POST /api/schedules/run`: start a schedule now, as its cron would.
+async fn run_schedule(
+    State(app): State<Arc<App>>,
+    Json(req): Json<RunSchedule>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = super::schedule::run_now(&app, req.repo.as_deref(), &req.name).await?;
+    let url = format!("{}/runs/{id}", app.public_url);
+    Ok(Json(serde_json::json!({ "id": id, "url": url })))
+}
+
 async fn cancel_run(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if app.db.cancel_run(&id)? {
+    let cancelled = app.db.cancel_run(&id)?;
+    if cancelled {
         app.run_finished(&id).await;
     }
-    Ok(Json(serde_json::json!({ "ok": true })))
+    // `cancelled: false` with the status says the run had already ended.
+    let run = app
+        .db
+        .run(&id)
+        .map_err(|_| not_found(format!("run {id}")))?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "cancelled": cancelled,
+        "status": run.status.as_str(),
+    })))
 }
 
 fn to_sse(e: &Event) -> SseEvent {
@@ -313,6 +493,164 @@ async fn append_log(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Artifact files a task keeps at most.
+const MAX_ARTIFACTS: usize = 1000;
+
+/// `POST /api/tasks/{id}/artifacts`: the files the running task kept; their
+/// bytes are already in the CAS.
+async fn set_artifacts(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(mut files): Json<Vec<Artifact>>,
+) -> ApiResult<StatusCode> {
+    let (group_id, _, _) = app.db.task_group(&id)?;
+    files.truncate(MAX_ARTIFACTS);
+    files.retain(|f| f.path.len() <= 1024 && app.cas.contains(&f.digest));
+    if !app.db.set_artifacts(&id, lease(&headers), &files)? {
+        return Err(stale(&group_id));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/tasks/{id}/artifacts/<path>`: one artifact file, as itself (no
+/// zip), named for download.
+async fn get_artifact(
+    State(app): State<Arc<App>>,
+    Path((id, path)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let a = app
+        .db
+        .artifact(&id, &path)?
+        .ok_or_else(|| not_found("artifact"))?;
+    let bytes = app
+        .cas
+        .get(&a.digest)?
+        .ok_or_else(|| not_found("artifact blob"))?;
+    let last = path.rsplit('/').next().unwrap_or_default();
+    let ascii: String = last
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+        .collect();
+    let ascii = if ascii.is_empty() {
+        "artifact".to_string()
+    } else {
+        ascii
+    };
+    let encoded: String = last
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"._-".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}"),
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// The most of a task summary kept: a check shows about 60 KB, and every
+/// run view carries it.
+pub const MAX_SUMMARY_BYTES: usize = 64 << 10;
+
+#[derive(Deserialize)]
+struct SummaryBody {
+    markdown: String,
+}
+
+/// `POST /api/tasks/{id}/summary`: the markdown the running task wrote.
+async fn set_summary(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(mut b): Json<SummaryBody>,
+) -> ApiResult<StatusCode> {
+    let (group_id, _, _) = app.db.task_group(&id)?;
+    if b.markdown.len() > MAX_SUMMARY_BYTES {
+        let mut cut = MAX_SUMMARY_BYTES;
+        while !b.markdown.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        b.markdown.truncate(cut);
+    }
+    if !app.db.set_summary(&id, lease(&headers), &b.markdown)? {
+        return Err(stale(&group_id));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Tests recorded per task execution at most.
+const MAX_TESTS: usize = 500;
+
+/// `POST /api/tasks/{id}/tests`: which tests failed, and which passed only
+/// on a retry, from the running job.
+async fn set_test_outcomes(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(mut t): Json<TestOutcomes>,
+) -> ApiResult<StatusCode> {
+    let (group_id, _, _) = app.db.task_group(&id)?;
+    for list in [&mut t.failed, &mut t.passed_on_retry] {
+        list.truncate(MAX_TESTS);
+        for name in list.iter_mut() {
+            *name = name.chars().take(300).collect();
+        }
+    }
+    if !app.db.set_test_outcomes(&id, lease(&headers), &t)? {
+        return Err(stale(&group_id));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/flaky/tests?days=14`: see `Db::flaky_tests`.
+async fn flaky_tests(
+    State(app): State<Arc<App>>,
+    Query(q): Query<FlakyQuery>,
+) -> ApiResult<Json<Vec<FlakyTest>>> {
+    let days = q.days.unwrap_or(14).clamp(1, 90);
+    let since = crate::model::now_ms() - days * 86_400_000;
+    let rows = tokio::task::spawn_blocking(move || app.db.flaky_tests(since))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(rows))
+}
+
+/// Annotations a task keeps at most.
+const MAX_ANNOTATIONS: usize = 200;
+
+/// `POST /api/tasks/{id}/annotations`: where its failed tests are, from the
+/// running job.
+async fn set_annotations(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(mut annotations): Json<Vec<Annotation>>,
+) -> ApiResult<StatusCode> {
+    let (group_id, _, _) = app.db.task_group(&id)?;
+    annotations.truncate(MAX_ANNOTATIONS);
+    for a in &mut annotations {
+        a.title = a.title.chars().take(255).collect();
+        a.message = a.message.chars().take(1000).collect();
+    }
+    if !app.db.set_annotations(&id, lease(&headers), &annotations)? {
+        return Err(stale(&group_id));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn start_task(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
@@ -340,21 +678,46 @@ async fn finish_task(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    Json(r): Json<TaskResult>,
+    Json(mut r): Json<TaskResult>,
 ) -> ApiResult<StatusCode> {
     let (group_id, run_id, name) = app.db.task_group(&id)?;
+    // A pass that took far longer than this task usually does says so: CI
+    // that gets slower otherwise goes unnoticed until everything is slow.
+    // Not for a pass that needed a retry (its time is every attempt's) or a
+    // cold workspace (`--fresh`, forks), which warm history would always
+    // call slow.
+    let flaky = r
+        .message
+        .as_deref()
+        .is_some_and(|m| m.starts_with("flaky:"));
+    let run = app.db.run(&run_id)?;
+    if r.status == Status::Passed && !flaky && !run.fresh && !run.no_secrets {
+        let (a, task) = (app.clone(), id.clone());
+        let history =
+            tokio::task::spawn_blocking(move || a.db.recent_durations(&task, crate::slow::HISTORY))
+                .await
+                .map_err(anyhow::Error::from)??;
+        if let Some(note) = crate::slow::note(r.duration_ms as i64, &history) {
+            r.message = Some(match r.message.take() {
+                Some(m) => format!("{m} · {note}"),
+                None => note,
+            });
+        }
+    }
     if !app.db.finish_task(&id, lease(&headers), &r)? {
         return Err(stale(&group_id));
     }
     if r.log_digest.is_some() {
         app.db.drop_live_log(&id)?;
     }
+    // Its single-flight claims (see `cache_claim`) end with it.
+    app.inflight.lock().retain(|_, holder| *holder != id);
     app.emit(
         "task.finished",
         Some(&run_id),
         Some(&group_id),
         Some(&id),
-        serde_json::json!({ "name": name, "status": r.status, "durationMs": r.duration_ms, "exitCode": r.exit_code }),
+        serde_json::json!({ "name": name, "status": r.status, "durationMs": r.duration_ms, "exitCode": r.exit_code, "message": r.message }),
     );
     Ok(StatusCode::NO_CONTENT)
 }
@@ -419,15 +782,65 @@ async fn workers(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Valu
 /// Long-poll: returns a job the moment one is claimable, or `idle` after 20s.
 async fn claim(
     State(app): State<Arc<App>>,
+    headers: HeaderMap,
     Json(info): Json<WorkerInfo>,
 ) -> ApiResult<Json<ClaimResponse>> {
+    let required = app.worker_token.lock().clone();
+    if let Some(required) = required {
+        let given = headers
+            .get(crate::client::WORKER_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        if given != Some(required.as_str()) {
+            return Err(ApiError(
+                StatusCode::FORBIDDEN,
+                anyhow::anyhow!("claiming jobs needs the worker token (PIT_WORKER_TOKEN)"),
+            ));
+        }
+    }
+    // Checked after the worker token, so nobody unauthenticated learns this.
+    // A worker older than the jobs it would get ignores what it doesn't know
+    // (an old one hands `[trusted]` secrets to any task): no work for it.
+    if info.protocol < crate::model::PROTOCOL {
+        static WARNED: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, i64>>> =
+            std::sync::OnceLock::new();
+        let now = crate::model::now_ms();
+        let mut warned = WARNED.get_or_init(Default::default).lock();
+        if warned.len() > 1000 {
+            warned.clear();
+        }
+        let last = warned.entry(info.name.clone()).or_insert(0);
+        if now - *last > 60_000 {
+            *last = now;
+            tracing::warn!(
+                "worker {} is older than this server (protocol {} < {}); it gets no jobs until it is upgraded",
+                info.name,
+                info.protocol,
+                crate::model::PROTOCOL
+            );
+        }
+        return Err(ApiError(
+            StatusCode::UPGRADE_REQUIRED,
+            anyhow::anyhow!(
+                "this worker is older than the server (protocol {} < {}): upgrade pit on {}",
+                info.protocol,
+                crate::model::PROTOCOL,
+                info.name
+            ),
+        ));
+    }
     app.db.touch_worker(&info)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         let notified = app.work.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if let Some(job) = app.db.claim_group(&info)? {
+        let (job, held) = app.db.claim_group(&info)?;
+        if let Some(mut job) = job {
+            // One user, who runs the server: any trusted run will do. On a
+            // shared server only GitHub repos' (see `App::config_sandboxed`).
+            if app.token.is_none() {
+                job.trusted_secrets = job.trusted;
+            }
             app.db.set_run_status(&job.run_id, Status::Running, None)?;
             app.emit(
                 "group.started",
@@ -447,26 +860,79 @@ async fn claim(
             }
             return Ok(Json(ClaimResponse::Job(Box::new(job))));
         }
-        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+        // A group held for its warm worker becomes ours after a short wait,
+        // and no event announces that, so look again soon.
+        let wake = if held {
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(250))
+        } else {
+            deadline
+        };
+        if tokio::time::timeout_at(wake, notified).await.is_err()
+            && tokio::time::Instant::now() >= deadline
+        {
             app.db.touch_worker(&info)?;
             return Ok(Json(ClaimResponse::Idle));
         }
     }
 }
 
+/// Trust comes from the job's lease, never from the request: only a worker
+/// running a trusted run's group holds one. A lease that is no longer live
+/// (the run was cancelled or requeued) is refused rather than treated as
+/// untrusted, which would let a trusted job read untrusted results.
+///
+/// Action keys are digests. Anything else (`u:…`, `r:…`) would name a row
+/// of another scope directly.
+fn action_key(key: &str) -> ApiResult<()> {
+    if crate::cas::is_digest(key) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{key:?} is not an action key").into())
+    }
+}
+
+/// See `App::cache_scope`.
+fn cache_trust(app: &App, headers: &HeaderMap) -> ApiResult<super::db::CacheScope> {
+    match lease(headers) {
+        None => Ok(super::db::CacheScope::UNTRUSTED),
+        Some(l) => match app.db.lease_trust(l)? {
+            Some((trusted, repo, github)) => Ok(app.cache_scope(&repo, github, trusted)),
+            None => Err(ApiError(
+                StatusCode::CONFLICT,
+                anyhow::anyhow!("this job's lease is no longer live"),
+            )),
+        },
+    }
+}
+
 async fn cache_get(
     State(app): State<Arc<App>>,
     Path(key): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Json<CacheEntry>> {
+    action_key(&key)?;
+    let scope = cache_trust(&app, &headers)?;
     app.db
-        .cache_get(&key)?
+        .cache_find(&key, &scope)?
+        .map(|stored| app.db.cache_get(&stored))
+        .transpose()?
+        .flatten()
         .map(Json)
         .ok_or_else(|| not_found("cache entry"))
+}
+
+#[derive(Deserialize)]
+struct ScopeQuery {
+    /// Identifies the task (repo, group, task, OS) so its latest cached run
+    /// can be found when a later run misses.
+    scope: Option<String>,
 }
 
 async fn cache_put(
     State(app): State<Arc<App>>,
     Path(key): Path<String>,
+    Query(q): Query<ScopeQuery>,
+    headers: HeaderMap,
     Json(entry): Json<CacheEntry>,
 ) -> ApiResult<StatusCode> {
     for d in entry
@@ -474,6 +940,7 @@ async fn cache_put(
         .iter()
         .map(|o| &o.digest)
         .chain(entry.log_digest.iter())
+        .chain(entry.inputs.iter())
     {
         if !app.cas.contains(d) {
             return Err(
@@ -481,8 +948,258 @@ async fn cache_put(
             );
         }
     }
-    app.db.cache_put(&key, &entry)?;
+    action_key(&key)?;
+    let scope = cache_trust(&app, &headers)?;
+    let stored = app.db.cache_put(&key, &scope, &entry)?;
+    // Whoever was waiting on this key finds the result now.
+    app.inflight.lock().remove(&stored);
+    if let Some(scope) = q.scope.filter(|s| crate::cas::is_digest(s)) {
+        app.db.kv_put("last", &scope, &stored)?;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The latest cached run of a task, to explain why a new run missed.
+/// 410 Gone when it existed but has been evicted.
+async fn cache_last(
+    State(app): State<Arc<App>>,
+    Path(scope): Path<String>,
+) -> ApiResult<Json<CacheEntry>> {
+    let key = app
+        .db
+        .kv_get("last", &scope)?
+        .ok_or_else(|| not_found("previous run"))?;
+    app.db.cache_peek(&key)?.map(Json).ok_or_else(|| {
+        ApiError(
+            StatusCode::GONE,
+            anyhow::anyhow!("previous result was evicted"),
+        )
+    })
+}
+
+async fn oidc_discovery(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>> {
+    let issuer = app.oidc.get().ok_or_else(|| not_found("OIDC issuer"))?;
+    Ok(Json(issuer.discovery(&app.public_url)))
+}
+
+async fn oidc_jwks(State(app): State<Arc<App>>) -> ApiResult<Json<serde_json::Value>> {
+    let issuer = app.oidc.get().ok_or_else(|| not_found("OIDC issuer"))?;
+    Ok(Json(issuer.jwks()))
+}
+
+#[derive(Deserialize)]
+struct OidcRequest {
+    audience: String,
+}
+
+/// `POST /api/oidc/token`: a token for the job holding this lease, for
+/// trusted runs of repos GitHub has vouched for (registered by a signed
+/// webhook) only. The claims come from the run as the server recorded it,
+/// never from the request.
+async fn oidc_token(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(req): Json<OidcRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let forbidden = |m: &str| ApiError(StatusCode::FORBIDDEN, anyhow::anyhow!("{m}"));
+    let issuer = app
+        .oidc
+        .get()
+        .ok_or_else(|| forbidden("this server does not issue OIDC tokens (pit server --oidc)"))?;
+    let run_id = match lease(&headers) {
+        Some(l) => app.db.lease_run(l)?,
+        None => None,
+    }
+    .ok_or_else(|| forbidden("OIDC tokens are only issued to a running job"))?;
+    let run = app.db.run(&run_id)?;
+    // Pull requests, other branches, `pit run`, API-created runs and forks:
+    // code nobody has merged gets no cloud identity.
+    if !run.trusted || run.no_secrets {
+        return Err(forbidden(
+            "OIDC tokens are only issued to trusted runs (the default branch, its merge queue and schedules)",
+        ));
+    }
+    let repo = app.db.repo(&run.repo_id)?;
+    let Some(full_name) = repo.github else {
+        return Err(forbidden(
+            "OIDC tokens are only issued for repos registered by a GitHub webhook",
+        ));
+    };
+    if req.audience.is_empty() {
+        return Err(anyhow::anyhow!("audience is required").into());
+    }
+    let sub = super::oidc::subject(&full_name, &run.trigger, run.git_ref.as_deref())
+        .ok_or_else(|| forbidden("this run has no OIDC subject"))?;
+    let now = crate::model::now_ms() / 1000;
+    let claims = serde_json::json!({
+        "iss": app.public_url,
+        "aud": req.audience,
+        "sub": sub,
+        "iat": now,
+        "nbf": now - 5,
+        "exp": now + super::oidc::TOKEN_SECS,
+        "jti": crate::model::new_id("jwt"),
+        "repo": full_name,
+        "ref": run.git_ref,
+        "sha": run.sha,
+        "run_id": run_id,
+        "trigger": run.trigger,
+        "trusted": run.trusted,
+    });
+    Ok(Json(serde_json::json!({ "token": issuer.sign(&claims)? })))
+}
+
+#[derive(Deserialize)]
+struct TimingsBody {
+    task: String,
+    /// Per-file seconds, when the task's reports name files.
+    #[serde(default)]
+    times: HashMap<String, f64>,
+    /// Otherwise the shard's total and its files: the total is split in
+    /// proportion to what is known of each file, so a slow file sharing a
+    /// shard with fast ones does not make them look slow.
+    #[serde(default)]
+    total: Option<f64>,
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+/// `POST /api/timings`: per-file durations from a sharded task, for the
+/// next split. Only from a running job, for its own repo.
+async fn record_timings(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(body): Json<TimingsBody>,
+) -> ApiResult<StatusCode> {
+    // Only for a task of the job's own group, keyed the way planning reads
+    // it: two groups' `test` tasks are different tasks.
+    let (repo_id, group, no_secrets) = lease(&headers)
+        .map(|l| app.db.lease_task(l, &body.task))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::CONFLICT,
+                anyhow::anyhow!("no live job runs that task"),
+            )
+        })?;
+    // A fork's numbers would steer the split of trusted runs.
+    if no_secrets {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let task = super::shards::timing_key(&group, &body.task);
+    let mut times = body.times;
+    if let (Some(total), false) = (
+        body.total.filter(|t| t.is_finite() && *t >= 0.0),
+        body.files.is_empty(),
+    ) {
+        let known = app.db.shard_timings(&repo_id, &task)?;
+        let average = if known.is_empty() {
+            1.0
+        } else {
+            known.values().sum::<f64>() / known.len() as f64
+        };
+        let weight = |f: &String| known.get(f).copied().unwrap_or(average).max(0.001);
+        let sum: f64 = body.files.iter().map(weight).sum();
+        for f in body.files.iter().take(10_000) {
+            times.insert(f.clone(), total * weight(f) / sum);
+        }
+    }
+    let times: HashMap<String, f64> = times
+        .into_iter()
+        .filter(|(_, s)| s.is_finite() && *s >= 0.0)
+        .take(10_000)
+        .collect();
+    app.db.record_shard_timings(&repo_id, &task, &times)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct FlakyQuery {
+    days: Option<i64>,
+}
+
+/// `GET /api/slow?days=14`: see `Db::slow_tasks`.
+async fn slow(
+    State(app): State<Arc<App>>,
+    Query(q): Query<FlakyQuery>,
+) -> ApiResult<Json<Vec<SlowTask>>> {
+    let days = q.days.unwrap_or(14).clamp(1, 90);
+    let since = crate::model::now_ms() - days * 86_400_000;
+    let rows = tokio::task::spawn_blocking(move || app.db.slow_tasks(since))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(rows))
+}
+
+/// `GET /api/flaky?days=14`: see `Db::flaky_tasks`.
+async fn flaky(
+    State(app): State<Arc<App>>,
+    Query(q): Query<FlakyQuery>,
+) -> ApiResult<Json<Vec<FlakyTask>>> {
+    let days = q.days.unwrap_or(14).clamp(1, 90);
+    // A scan of weeks of history: keep it off the async threads that answer
+    // workers' heartbeats.
+    let since = crate::model::now_ms() - days * 86_400_000;
+    let rows = tokio::task::spawn_blocking(move || app.db.flaky_tasks(since))
+        .await
+        .map_err(anyhow::Error::from)??;
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+struct ClaimBody {
+    task: String,
+}
+
+/// Single flight for cache misses. Shards that start together, or two runs
+/// of the same commit, would each compute the same action. The first task to
+/// claim a key computes it. Others are told to wait for its result, for as
+/// long as that task is still running; if it fails or dies, the next claim
+/// takes over. Keys are scoped by trust, since untrusted results are never
+/// served to trusted runs (P20).
+async fn cache_claim(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    action_key(&key)?;
+    let scope = cache_trust(&app, &headers)?;
+    // The row it would be stored under: one claim per scope.
+    let slot = scope.write_key(&key);
+    // Check and claim under one guard, so two claims cannot both win.
+    let mut inflight = app.inflight.lock();
+    // The result may have landed since the caller looked: go get it.
+    if app.db.cache_find(&key, &scope)?.is_some() {
+        return Ok(Json(serde_json::json!({ "wait": true })));
+    }
+    if let Some(holder) = inflight.get(&slot).filter(|h| **h != body.task) {
+        if let Some(run) = app.db.running_task_run(holder)? {
+            return Ok(Json(serde_json::json!({ "wait": true, "run": run })));
+        }
+    }
+    inflight.insert(slot, body.task);
+    Ok(Json(serde_json::json!({ "wait": false })))
+}
+
+/// The run where a task with these exact inputs last failed. Failures are
+/// not cached, so this is how a rerun can say why it ran again.
+async fn cache_failed(
+    State(app): State<Arc<App>>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    app.db
+        .last_failure(&key)?
+        .map(|run| Json(serde_json::json!({ "runId": run })))
+        .ok_or_else(|| not_found("failure"))
+}
+
+/// `POST /api/gc`: collect now. Under the limit this only deletes blobs
+/// nothing refers to.
+async fn gc_now(State(app): State<Arc<App>>) -> ApiResult<Json<super::gc::GcReport>> {
+    let report = tokio::task::spawn_blocking(move || super::gc::collect(&app, true)).await??;
+    Ok(Json(report))
 }
 
 async fn cas_missing(
@@ -520,7 +1237,14 @@ async fn queue_add(
     _h: HeaderMap,
     Json(req): Json<QueueAdd>,
 ) -> ApiResult<Json<QueueEntryView>> {
-    Ok(Json(super::queue::add(&app, req).await?))
+    let entry = super::queue::add(&app, req, true).await.map_err(|e| {
+        if e.downcast_ref::<super::queue::GithubOnlyLabel>().is_some() {
+            ApiError(StatusCode::FORBIDDEN, e)
+        } else {
+            e.into()
+        }
+    })?;
+    Ok(Json(entry))
 }
 
 #[derive(Deserialize)]

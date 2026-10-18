@@ -44,11 +44,13 @@ pub async fn identity(dir: &Path) -> Result<RepoIdentity> {
         .map(|u| u.trim().to_string());
     let (url, remote) = match origin.filter(|u| !u.is_empty()) {
         Some(u) => {
-            // Relative local remotes must be absolute for the server.
-            let local = root.join(&u);
-            let url = if !u.contains("://") && !u.contains('@') && local.exists() {
-                std::fs::canonicalize(&local)
-                    .unwrap_or(local)
+            // Local remotes must be absolute for the server. Resolve them
+            // lexically: the path may be unreachable right now (an outage), and
+            // a relative URL saved then would break the repo for good.
+            let url = if is_local_path(&u) {
+                let joined = root.join(&u);
+                std::fs::canonicalize(&joined)
+                    .unwrap_or_else(|_| normalize(&joined))
                     .to_string_lossy()
                     .to_string()
             } else {
@@ -64,6 +66,29 @@ pub async fn identity(dir: &Path) -> Result<RepoIdentity> {
         url,
         remote,
     })
+}
+
+/// A remote that is a filesystem path, not a URL (`https://`, `file://`) or
+/// scp-style address (`git@host:repo`).
+fn is_local_path(remote: &str) -> bool {
+    !remote.contains("://")
+        && !remote.contains('@')
+        && !remote.split('/').next().unwrap_or_default().contains(':')
+}
+
+/// Removes `.` and `..` components without touching the filesystem.
+fn normalize(path: &Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub async fn local(client: &Client, dir: &Path) -> Result<Snapshot> {
@@ -182,4 +207,22 @@ async fn pushed_base(root: &Path, head: &str, branch: Option<&str>) -> Result<Op
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_remotes_resolve_even_when_missing() {
+        assert!(is_local_path("../origin.git"));
+        assert!(is_local_path("/srv/git/repo.git"));
+        assert!(!is_local_path("https://github.com/a/b.git"));
+        assert!(!is_local_path("git@github.com:a/b.git"));
+        assert!(!is_local_path("host:path/repo.git"));
+        assert_eq!(
+            normalize(Path::new("/tmp/p7/work/../origin.git")),
+            Path::new("/tmp/p7/origin.git")
+        );
+    }
 }

@@ -9,6 +9,17 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::model::*;
 
+/// `kv` namespaces that are Pit's own records, not cache entries: never
+/// evicted or counted as artifacts. `last` (a task's last result),
+/// `pr-origin` (whether a pull request comes from a fork), `annotated`
+/// (checks whose annotations were sent), `shard-check` (a sharded group's
+/// combined check run, and the newest left-out copy of one).
+macro_rules! internal_kv {
+    () => {
+        "('last', 'pr-origin', 'annotated', 'shard-check')"
+    };
+}
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -45,6 +56,7 @@ CREATE TABLE IF NOT EXISTS runs (
   finished_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS runs_created ON runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS runs_sha ON runs(repo_id, sha);
 
 CREATE TABLE IF NOT EXISTS groups_ (
   id TEXT PRIMARY KEY,
@@ -65,6 +77,7 @@ CREATE TABLE IF NOT EXISTS groups_ (
 );
 CREATE INDEX IF NOT EXISTS groups_status ON groups_(status, created_at);
 CREATE INDEX IF NOT EXISTS groups_run ON groups_(run_id);
+CREATE INDEX IF NOT EXISTS groups_run_status ON groups_(run_id, status);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -84,6 +97,16 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS tasks_group ON tasks(group_id, position);
 CREATE INDEX IF NOT EXISTS tasks_run ON tasks(run_id);
+CREATE INDEX IF NOT EXISTS tasks_key ON tasks(action_key);
+CREATE INDEX IF NOT EXISTS tasks_finished ON tasks(finished_at);
+CREATE INDEX IF NOT EXISTS tasks_name ON tasks(name, finished_at);
+
+CREATE TABLE IF NOT EXISTS test_results (
+  task_id TEXT NOT NULL,
+  test TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  PRIMARY KEY (task_id, test, outcome)
+);
 
 CREATE TABLE IF NOT EXISTS task_logs (
   task_id TEXT NOT NULL,
@@ -100,13 +123,47 @@ CREATE TABLE IF NOT EXISTS cache (
   last_hit_at INTEGER
 );
 
+-- One-time steps already done (see `demote_shared_trusted_results_once`).
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY
+);
+
 -- Key-value index into the CAS for the Turborepo and Bazel cache protocols.
 CREATE TABLE IF NOT EXISTS kv (
   ns TEXT NOT NULL,
   key TEXT NOT NULL,
   digest TEXT NOT NULL,
   created_at INTEGER NOT NULL,
+  last_used_at INTEGER,
   PRIMARY KEY (ns, key)
+);
+
+-- Running totals for /api/stats that must survive cache eviction.
+-- Smoothed per-file durations of sharded tasks (see server::shards).
+CREATE TABLE IF NOT EXISTS shard_timings (
+  repo_id TEXT NOT NULL,
+  task TEXT NOT NULL,
+  path TEXT NOT NULL,
+  secs REAL NOT NULL,
+  PRIMARY KEY (repo_id, task, path)
+);
+
+-- The last result of each notified line (see server::notify).
+CREATE TABLE IF NOT EXISTS notify_state (
+  key TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  run_created_at INTEGER NOT NULL DEFAULT 0
+);
+
+-- The minute each schedule last fired, so it fires once per slot.
+CREATE TABLE IF NOT EXISTS schedules (
+  key TEXT PRIMARY KEY,
+  last_minute INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS counters (
+  name TEXT PRIMARY KEY,
+  value INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS workers (
@@ -131,6 +188,7 @@ CREATE TABLE IF NOT EXISTS queue (
   run_id TEXT,
   landed_sha TEXT,
   reason TEXT,
+  pinned INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -156,6 +214,26 @@ pub struct RunRow {
     pub status: Status,
     pub no_cache: bool,
     pub github_pr: Option<u64>,
+    pub trusted: bool,
+    pub fresh: bool,
+    pub no_secrets: bool,
+    pub debug: bool,
+    pub base_sha: Option<String>,
+    /// What the run counts as for `on` (`pr`, `main`…), set when planned.
+    pub kinds: Option<Vec<String>>,
+}
+
+pub struct WaitingGroup {
+    pub id: String,
+    pub run_id: String,
+    pub name: String,
+    pub os: String,
+    pub arch: String,
+    pub needs: Vec<Backend>,
+    pub message: Option<String>,
+    pub lock: Option<String>,
+    /// The run whose group holds `lock` now.
+    pub lock_holder: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +244,8 @@ pub struct GroupRow {
     pub os: String,
     pub status: Status,
     pub check_run_id: Option<u64>,
+    /// Recorded but not run: this kind of run leaves the group out (`on`).
+    pub left_out: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -185,9 +265,18 @@ pub struct QueueRow {
     pub run_id: Option<String>,
     pub landed_sha: Option<String>,
     pub reason: Option<String>,
+    /// Queued at exactly `head_sha` (a fork's pull request, approved by the
+    /// label on that commit): a later push drops it instead of retesting.
+    pub pinned: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
+
+/// How long a queued group waits for the worker that ran it last.
+pub const AFFINITY_MS: i64 = 2_000;
+/// A worker that polled within this window counts as online. Idle workers
+/// long-poll every 20 s.
+const WORKER_ONLINE_MS: i64 = 30_000;
 
 /// Columns added after the first release of a table.
 fn migrate(conn: &Connection) -> Result<()> {
@@ -197,7 +286,172 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_lease {
         conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lease TEXT")?;
     }
+    let has_kv_used: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('kv') WHERE name = 'last_used_at'")?
+        .exists([])?;
+    if !has_kv_used {
+        conn.execute_batch("ALTER TABLE kv ADD COLUMN last_used_at INTEGER")?;
+    }
+    let has_lock: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'lock_name'")?
+        .exists([])?;
+    if !has_lock {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lock_name TEXT")?;
+    }
+    let has_arch: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'arch'")?
+        .exists([])?;
+    if !has_arch {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN arch TEXT NOT NULL DEFAULT 'any'")?;
+    }
+    let has_lock_until: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'lock_until'")?
+        .exists([])?;
+    if !has_lock_until {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN lock_until INTEGER")?;
+    }
+    let has_cache_token: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'cache_token'")?
+        .exists([])?;
+    if !has_cache_token {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN cache_token TEXT")?;
+    }
+    let notify_ordered: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('notify_state') WHERE name = 'run_created_at'")?
+        .exists([])?;
+    if !notify_ordered {
+        conn.execute_batch(
+            "ALTER TABLE notify_state ADD COLUMN run_created_at INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    let has_fresh: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'fresh'")?
+        .exists([])?;
+    if !has_fresh {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN fresh INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let has_left_out: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'left_out'")?
+        .exists([])?;
+    if !has_left_out {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN left_out INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let has_kinds: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'kinds'")?
+        .exists([])?;
+    if !has_kinds {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN kinds TEXT")?;
+    }
+    let has_base: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'base_sha'")?
+        .exists([])?;
+    if !has_base {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN base_sha TEXT")?;
+    }
+    // For the lock rules in claims; after the columns they cover exist.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS groups_lock ON groups_(lock_name, status);
+         CREATE INDEX IF NOT EXISTS runs_repo_status ON runs(repo_id, status, created_at);",
+    )?;
+    let has_planned: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'planned_at'")?
+        .exists([])?;
+    if !has_planned {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN planned_at INTEGER")?;
+    }
+    let has_artifacts: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'artifacts'")?
+        .exists([])?;
+    if !has_artifacts {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN artifacts TEXT")?;
+    }
+    let has_summary: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'summary'")?
+        .exists([])?;
+    if !has_summary {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN summary TEXT")?;
+    }
+    let has_annotations: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'annotations'")?
+        .exists([])?;
+    if !has_annotations {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN annotations TEXT")?;
+    }
+    let has_debug: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'debug'")?
+        .exists([])?;
+    if !has_debug {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN debug INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let has_no_secrets: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'no_secrets'")?
+        .exists([])?;
+    if !has_no_secrets {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN no_secrets INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let has_pinned: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('queue') WHERE name = 'pinned'")?
+        .exists([])?;
+    if !has_pinned {
+        conn.execute_batch("ALTER TABLE queue ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let has_trusted: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'trusted'")?
+        .exists([])?;
+    if !has_trusted {
+        // Results cached before trust existed may have come from anywhere;
+        // keep them, but only for untrusted runs.
+        // One transaction: a crash must not leave the column without the
+        // demotion, or the next start would skip it.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE runs ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0;
+             UPDATE cache SET action_key = 'u:' || action_key WHERE action_key NOT LIKE 'u:%';
+             UPDATE kv SET digest = 'u:' || digest WHERE ns = 'last' AND digest NOT LIKE 'u:%';
+             COMMIT;",
+        )?;
+    }
     Ok(())
+}
+
+/// Which cached results a run may read, and where its own go (P20, P66).
+/// Trusted results are shared by every repo, since keys hold no repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheScope {
+    pub trusted: bool,
+    /// For a repo whose trusted runs may not write the shared trusted
+    /// results (see `App::cache_scope`): its own trusted namespace, which
+    /// its runs read and its trusted runs write.
+    pub repo: Option<String>,
+}
+
+impl CacheScope {
+    pub const UNTRUSTED: CacheScope = CacheScope {
+        trusted: false,
+        repo: None,
+    };
+
+    /// The row key a result of this scope is stored under.
+    pub fn write_key(&self, key: &str) -> String {
+        match (self.trusted, &self.repo) {
+            (true, None) => key.to_string(),
+            (true, Some(r)) => format!("r:{r}:{key}"),
+            (false, _) => format!("u:{key}"),
+        }
+    }
+
+    /// The row keys it may read, most trusted first. A trusted run never
+    /// reads untrusted results; a repo's own namespace is read only by it.
+    pub fn read_keys(&self, key: &str) -> Vec<String> {
+        let mut keys = vec![key.to_string()];
+        if let Some(r) = &self.repo {
+            keys.push(format!("r:{r}:{key}"));
+        }
+        if !self.trusted {
+            keys.push(format!("u:{key}"));
+        }
+        keys
+    }
 }
 
 /// SQL condition: the task's group is running under the lease in `?4`.
@@ -225,6 +479,7 @@ fn queue_row(r: &Row) -> rusqlite::Result<QueueRow> {
         run_id: r.get("run_id")?,
         landed_sha: r.get("landed_sha")?,
         reason: r.get("reason")?,
+        pinned: r.get("pinned")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })
@@ -241,6 +496,14 @@ fn run_row(r: &Row) -> rusqlite::Result<RunRow> {
         status: Status::parse(&r.get::<_, String>("status")?),
         no_cache: r.get::<_, i64>("no_cache")? != 0,
         github_pr: r.get::<_, Option<i64>>("github_pr")?.map(|v| v as u64),
+        trusted: r.get::<_, i64>("trusted")? != 0,
+        fresh: r.get::<_, i64>("fresh")? != 0,
+        debug: r.get::<_, i64>("debug")? != 0,
+        base_sha: r.get("base_sha")?,
+        kinds: r
+            .get::<_, Option<String>>("kinds")?
+            .and_then(|k| serde_json::from_str(&k).ok()),
+        no_secrets: r.get::<_, i64>("no_secrets")? != 0,
     })
 }
 
@@ -252,6 +515,27 @@ impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Space freed by deleted rows goes back to the filesystem
+        // (`reclaim_space`) instead of staying in the file forever. A new
+        // database gets it before its first table; an older one is rewritten
+        // once.
+        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        if auto_vacuum != 2 {
+            let fresh: bool =
+                conn.query_row("SELECT NOT EXISTS (SELECT 1 FROM sqlite_master)", [], |r| {
+                    r.get(0)
+                })?;
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
+            if !fresh {
+                tracing::info!(
+                    "rewriting {} once so it can give space back",
+                    path.display()
+                );
+                // In WAL mode the file shrinks only once a checkpoint copies the
+                // rewritten pages back.
+                conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+            }
+        }
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         Ok(Db {
@@ -270,10 +554,24 @@ impl Db {
 
     // ---- repos ----
 
+    /// Finds or registers a repo. With a URL, the URL decides identity: a
+    /// different repo that happens to share a name (two checkouts both called
+    /// `web`) gets its own row, named `<name>-<hash>`, instead of taking over
+    /// the existing one and its mirror.
     pub fn upsert_repo(&self, name: &str, url: Option<&str>, github: Option<&str>) -> Result<Repo> {
         let c = self.conn.lock();
-        let existing = c
-            .query_row(
+        let by_url = match url {
+            Some(u) => c
+                .query_row(
+                    "SELECT id, name, url, github FROM repos WHERE url = ?1 ORDER BY created_at LIMIT 1",
+                    params![u],
+                    |r| Ok(Repo { id: r.get(0)?, name: r.get(1)?, url: r.get(2)?, github: r.get(3)? }),
+                )
+                .optional()?,
+            None => None,
+        };
+        let by_name = || {
+            c.query_row(
                 "SELECT id, name, url, github FROM repos WHERE name = ?1",
                 params![name],
                 |r| {
@@ -285,23 +583,30 @@ impl Db {
                     })
                 },
             )
-            .optional()?;
+            .optional()
+        };
+        let existing = match by_url {
+            Some(repo) => Some(repo),
+            None => by_name()?,
+        };
+        let mut name = name.to_string();
         if let Some(mut repo) = existing {
-            if let Some(url) = url.filter(|u| *u != repo.url) {
-                c.execute(
-                    "UPDATE repos SET url = ?1 WHERE id = ?2",
-                    params![url, repo.id],
-                )?;
-                repo.url = url.to_string();
+            match url {
+                // Same name, different repository: register it separately.
+                Some(u) if u != repo.url => {
+                    name = format!("{name}-{}", &crate::cas::digest(u.as_bytes())[..6])
+                }
+                _ => {
+                    if let Some(gh) = github.filter(|g| repo.github.as_deref() != Some(*g)) {
+                        c.execute(
+                            "UPDATE repos SET github = ?1 WHERE id = ?2",
+                            params![gh, repo.id],
+                        )?;
+                        repo.github = Some(gh.to_string());
+                    }
+                    return Ok(repo);
+                }
             }
-            if let Some(gh) = github.filter(|g| repo.github.as_deref() != Some(*g)) {
-                c.execute(
-                    "UPDATE repos SET github = ?1 WHERE id = ?2",
-                    params![gh, repo.id],
-                )?;
-                repo.github = Some(gh.to_string());
-            }
-            return Ok(repo);
         }
         let url =
             url.with_context(|| format!("unknown repo {name:?}; pass its url to register it"))?;
@@ -312,16 +617,64 @@ impl Db {
         )?;
         Ok(Repo {
             id,
-            name: name.into(),
+            name,
             url: url.into(),
             github: github.map(String::from),
+        })
+    }
+
+    /// A new repo row for a GitHub repository, never one that exists: on a
+    /// shared server an API caller may have registered the same URL first,
+    /// and that row's runs and queue entries must not become the GitHub
+    /// repo's. Takes `name`, or `name-<suffix>` if it is in use.
+    pub fn insert_github_repo(&self, name: &str, url: &str, github: &str) -> Result<Repo> {
+        let c = self.conn.lock();
+        // Two webhooks for a new repo can race here.
+        let row = |r: &rusqlite::Row| {
+            Ok(Repo {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                url: r.get(2)?,
+                github: r.get(3)?,
+            })
+        };
+        if let Some(repo) = c
+            .query_row(
+                "SELECT id, name, url, github FROM repos WHERE github = ?1",
+                params![github],
+                row,
+            )
+            .optional()?
+        {
+            return Ok(repo);
+        }
+        let id = new_id("repo");
+        let taken: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM repos WHERE name = ?1)",
+            params![name],
+            |r| r.get(0),
+        )?;
+        let name = if taken {
+            format!("{name}-{}", &crate::cas::digest(id.as_bytes())[..6])
+        } else {
+            name.to_string()
+        };
+        c.execute(
+            "INSERT INTO repos (id, name, url, github, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, name, url, github, now_ms()],
+        )?;
+        Ok(Repo {
+            id,
+            name,
+            url: url.into(),
+            github: Some(github.into()),
         })
     }
 
     pub fn repo(&self, id: &str) -> Result<Repo> {
         let c = self.conn.lock();
         c.query_row(
-            "SELECT id, name, url, github FROM repos WHERE id = ?1 OR name = ?1",
+            "SELECT id, name, url, github FROM repos WHERE id = ?1 OR name = ?1 OR url = ?1 ORDER BY created_at LIMIT 1",
             params![id],
             |r| {
                 Ok(Repo {
@@ -382,12 +735,13 @@ impl Db {
         trigger: &str,
         no_cache: bool,
         github_pr: Option<u64>,
+        trusted: bool,
     ) -> Result<String> {
         let id = new_id("run");
         self.conn.lock().execute(
-            "INSERT INTO runs (id, repo_id, sha, ref, overlay, overlay_files, trigger, status, no_cache, github_pr, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, ?9, ?10)",
-            params![id, repo_id, sha, git_ref, overlay, overlay_files as i64, trigger, no_cache as i64, github_pr.map(|v| v as i64), now_ms()],
+            "INSERT INTO runs (id, repo_id, sha, ref, overlay, overlay_files, trigger, status, no_cache, github_pr, created_at, trusted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', ?8, ?9, ?10, ?11)",
+            params![id, repo_id, sha, git_ref, overlay, overlay_files as i64, trigger, no_cache as i64, github_pr.map(|v| v as i64), now_ms(), trusted as i64],
         )?;
         Ok(id)
     }
@@ -397,6 +751,49 @@ impl Db {
         c.query_row("SELECT * FROM runs WHERE id = ?1", params![id], run_row)
             .optional()?
             .with_context(|| format!("unknown run {id}"))
+    }
+
+    /// The newest run of a pull request's own commit (not a merge queue
+    /// candidate containing it).
+    pub fn latest_pr_run(&self, repo_id: &str, pr: u64) -> Result<Option<RunRow>> {
+        let c = self.conn.lock();
+        Ok(c.query_row(
+            "SELECT * FROM runs WHERE repo_id = ?1 AND github_pr = ?2 AND overlay IS NULL
+               AND ref = 'pull/' || ?2
+             ORDER BY created_at DESC LIMIT 1",
+            params![repo_id, pr as i64],
+            run_row,
+        )
+        .optional()?)
+    }
+
+    /// A pull request's runs still queued or running: of its pushes, its
+    /// `/retest`s and its re-runs, whatever ref they copied (a `/retest` of a
+    /// commit whose newest run was its branch's push takes that ref). Not
+    /// merge queue candidates.
+    pub fn active_pr_runs(&self, repo_id: &str, pr: u64) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT id FROM runs WHERE repo_id = ?1 AND github_pr = ?2 AND overlay IS NULL
+               AND trigger IN ('pr', 'retest', 'rerun') AND status IN ('queued', 'running')",
+        )?;
+        let ids = st
+            .query_map(params![repo_id, pr as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// The run a rerun of this commit copies its restrictions from: one
+    /// without secrets if any was (a fork's commit), else the newest.
+    pub fn prior_run(&self, repo_id: &str, sha: &str) -> Result<Option<RunRow>> {
+        let c = self.conn.lock();
+        Ok(c.query_row(
+            "SELECT * FROM runs WHERE repo_id = ?1 AND sha = ?2
+             ORDER BY no_secrets DESC, created_at DESC LIMIT 1",
+            params![repo_id, sha],
+            run_row,
+        )
+        .optional()?)
     }
 
     pub fn set_run_status(&self, id: &str, status: Status, message: Option<&str>) -> Result<()> {
@@ -486,6 +883,11 @@ impl Db {
                         message: r.get("message")?,
                         started_at: r.get("started_at")?,
                         finished_at: r.get("finished_at")?,
+                        summary: r.get("summary")?,
+                        artifacts: r
+                            .get::<_, Option<String>>("artifacts")?
+                            .and_then(|a| serde_json::from_str(&a).ok())
+                            .unwrap_or_default(),
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -504,13 +906,30 @@ impl Db {
         backends: &[Backend],
         tasks: &[(String, TaskDef)],
     ) -> Result<String> {
+        self.insert_locked_group(run_id, name, os, "any", backends, tasks, None)
+    }
+
+    /// `insert_group` with a lock (see `GroupDef::lock`) and a CPU
+    /// architecture (`any`, or what a worker must have), set in the same
+    /// statement so the group is never claimable without them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_locked_group(
+        &self,
+        run_id: &str,
+        name: &str,
+        os: &str,
+        arch: &str,
+        backends: &[Backend],
+        tasks: &[(String, TaskDef)],
+        lock: Option<&str>,
+    ) -> Result<String> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
         let gid = new_id("grp");
         let now = now_ms();
         tx.execute(
-            "INSERT INTO groups_ (id, run_id, name, os, backends, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
-            params![gid, run_id, name, os, serde_json::to_string(backends)?, now],
+            "INSERT INTO groups_ (id, run_id, name, os, backends, status, created_at, lock_name, arch) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8)",
+            params![gid, run_id, name, os, serde_json::to_string(backends)?, now, lock, arch],
         )?;
         for (pos, (tname, def)) in tasks.iter().enumerate() {
             tx.execute(
@@ -522,55 +941,204 @@ impl Db {
         Ok(gid)
     }
 
-    /// Atomically claims the oldest queued group this worker can run.
-    pub fn claim_group(&self, worker: &WorkerInfo) -> Result<Option<Job>> {
+    /// Inserts a group the server already answered from the cache: finished,
+    /// with every task's result, and never offered to a worker.
+    pub fn insert_cached_group(
+        &self,
+        run_id: &str,
+        name: &str,
+        os: &str,
+        tasks: &[(String, TaskDef)],
+        results: &[TaskResult],
+    ) -> Result<String> {
+        self.insert_finished_group(
+            run_id,
+            name,
+            os,
+            tasks,
+            results,
+            Some("cache"),
+            "every task came from the cache; no worker needed",
+        )
+    }
+
+    /// A group that is done without a worker: answered by the cache
+    /// (`worker` "cache"), or left out of this kind of run (no worker,
+    /// `left_out`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_finished_group(
+        &self,
+        run_id: &str,
+        name: &str,
+        os: &str,
+        tasks: &[(String, TaskDef)],
+        results: &[TaskResult],
+        worker: Option<&str>,
+        message: &str,
+    ) -> Result<String> {
         let mut c = self.conn.lock();
         let tx = c.transaction()?;
+        let gid = new_id("grp");
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO groups_ (id, run_id, name, os, backends, status, worker, prepare_ms, message, created_at, started_at, finished_at, left_out)
+             VALUES (?1, ?2, ?3, ?4, '[]', 'passed', ?6, 0, ?7, ?5, ?5, ?5, ?8)",
+            params![gid, run_id, name, os, now, worker, message, worker.is_none()],
+        )?;
+        for (pos, ((tname, def), r)) in tasks.iter().zip(results).enumerate() {
+            tx.execute(
+                "INSERT INTO tasks (id, group_id, run_id, name, position, def, status, action_key, exit_code, duration_ms,
+                   log_digest, message, started_at, finished_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                params![
+                    new_id("task"),
+                    gid,
+                    run_id,
+                    tname,
+                    pos as i64,
+                    serde_json::to_string(def)?,
+                    r.status.as_str(),
+                    r.action_key,
+                    r.exit_code,
+                    r.duration_ms as i64,
+                    r.log_digest,
+                    r.message,
+                    now
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(gid)
+    }
+
+    /// Claims the next queued group this worker can run (priority class, then
+    /// fewest groups running in its run, then oldest). Returns the job,
+    /// and whether some group was held back for another worker (see below),
+    /// so the caller knows to look again shortly.
+    ///
+    /// Affinity: a group waits up to `AFFINITY_MS` for the worker that last
+    /// ran the same group of the same repo, if that worker is online, because
+    /// that worker's workspace is warm (dependencies, build output, Docker
+    /// layers). After that any worker may take it.
+    pub fn claim_group(&self, worker: &WorkerInfo) -> Result<(Option<Job>, bool)> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let now = now_ms();
+        let mut held = false;
         // OS is filtered in SQL; backends (JSON) are checked row by row. The
         // scan is lazy and unbounded, so incompatible groups at the head of
         // the queue cannot hide a compatible one behind them.
+        //
+        // Merge queue runs go first: every change waiting to land waits on
+        // them. Then other trusted runs (main, post-merge), then the rest.
+        // Within each, the run with the fewest groups running now goes first,
+        // then the oldest group: a run that fans out into many groups shares
+        // the workers with the runs queued after it rather than holding all
+        // of them until it is done (one agent's run stalling everyone else's).
+        // Not merge queue runs: a lane's candidates (tip+A, tip+A+B, …) land
+        // in order, so the oldest should finish, and fail, first.
         let pick = {
             let mut st = tx.prepare(
-                "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends FROM groups_
+                "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends, groups_.created_at,
+                   (SELECT prev.worker FROM groups_ prev JOIN runs pr ON pr.id = prev.run_id
+                     WHERE pr.repo_id = runs.repo_id AND prev.name = groups_.name
+                       AND prev.worker IS NOT NULL AND prev.worker != 'cache' AND prev.status IN ('passed', 'failed')
+                     ORDER BY prev.finished_at DESC LIMIT 1) AS preferred,
+                   (SELECT w.last_seen FROM workers w WHERE w.name = (
+                     SELECT prev.worker FROM groups_ prev JOIN runs pr ON pr.id = prev.run_id
+                     WHERE pr.repo_id = runs.repo_id AND prev.name = groups_.name
+                       AND prev.worker IS NOT NULL AND prev.worker != 'cache' AND prev.status IN ('passed', 'failed')
+                     ORDER BY prev.finished_at DESC LIMIT 1)) AS preferred_seen
+                 FROM groups_
                  JOIN runs ON runs.id = groups_.run_id
                  WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                    AND (groups_.os = 'any' OR groups_.os = ?1)
-                 ORDER BY groups_.created_at",
+                   AND (groups_.arch = 'any' OR groups_.arch = ?3)
+                   AND (groups_.lock_name IS NULL OR (NOT EXISTS (
+                     SELECT 1 FROM groups_ held WHERE held.lock_name = groups_.lock_name
+                       AND (held.status = 'running' OR held.lock_until > ?2))
+                   -- A lock is taken in the order runs were created (a deploy of
+                   -- every commit, in push order): not before an older run's
+                   -- group waiting for it, nor while an older run of the repo is
+                   -- still being planned (for a minute at most). Only older runs
+                   -- of the same or a higher claim priority count, and not a
+                   -- group no online worker can run.
+                   AND NOT EXISTS (
+                     SELECT 1 FROM groups_ earlier JOIN runs er ON er.id = earlier.run_id
+                     WHERE earlier.lock_name = groups_.lock_name AND earlier.status = 'queued'
+                       AND er.status IN ('queued', 'running')
+                       AND (er.created_at, er.rowid) < (runs.created_at, runs.rowid)
+                       AND COALESCE(earlier.message, '') NOT LIKE 'waiting: no online worker%'
+                       AND (CASE WHEN er.trigger = 'queue' THEN 0 WHEN er.trusted = 1 THEN 1 ELSE 2 END)
+                         <= (CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END))
+                   AND NOT EXISTS (
+                     SELECT 1 FROM runs planning WHERE planning.repo_id = runs.repo_id
+                       AND planning.status = 'queued' AND planning.planned_at IS NULL
+                       AND (planning.created_at, planning.rowid) < (runs.created_at, runs.rowid)
+                       AND planning.created_at > ?2 - 60000
+                       AND (CASE WHEN planning.trigger = 'queue' THEN 0 WHEN planning.trusted = 1 THEN 1 ELSE 2 END)
+                         <= (CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END))))
+                 ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
+                   CASE WHEN runs.trigger = 'queue' THEN 0 ELSE (SELECT COUNT(*) FROM groups_ busy
+                     WHERE busy.run_id = groups_.run_id AND busy.status = 'running') END,
+                   groups_.created_at, groups_.rowid",
             )?;
-            let mut rows = st.query_map(params![worker.os], |r| {
+            let arch = crate::model::canonical_arch(&worker.arch);
+            let mut rows = st.query_map(params![worker.os, now, arch], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
                 ))
             })?;
             let mut pick = None;
             for row in rows.by_ref() {
-                let row = row?;
-                let needs: Vec<Backend> = serde_json::from_str(&row.3).unwrap_or_default();
-                if needs.iter().all(|b| worker.backends.contains(b)) {
-                    pick = Some(row);
-                    break;
+                let (gid, run_id, os, backends, created, preferred, preferred_seen) = row?;
+                let needs: Vec<Backend> = serde_json::from_str(&backends).unwrap_or_default();
+                if !needs.iter().all(|b| worker.backends.contains(b)) {
+                    continue;
                 }
+                let warm_elsewhere = preferred.as_deref().is_some_and(|p| p != worker.name)
+                    && preferred_seen.is_some_and(|seen| now - seen < WORKER_ONLINE_MS)
+                    && now - created < AFFINITY_MS;
+                if warm_elsewhere {
+                    held = true;
+                    continue;
+                }
+                pick = Some((gid, run_id, os));
+                break;
             }
             pick
         };
-        let Some((gid, run_id, os, _)) = pick else {
-            return Ok(None);
+        let Some((gid, run_id, os)) = pick else {
+            return Ok((None, held));
         };
-        let now = now_ms();
         let lease = new_id("lease");
+        // A bearer token: unguessable, unlike ids.
+        let cache_token = format!("pitc_{}", uuid::Uuid::new_v4().simple());
         tx.execute(
-            "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2, lease = ?4 WHERE id = ?3",
-            params![worker.name, now, gid, lease],
+            "UPDATE groups_ SET status = 'running', worker = ?1, started_at = ?2, heartbeat_at = ?2, lease = ?4,
+               cache_token = ?5,
+               message = CASE WHEN message LIKE 'waiting:%' THEN NULL ELSE message END
+             WHERE id = ?3",
+            params![worker.name, now, gid, lease, cache_token],
         )?;
-        let (run, repo_name, url, group_name): (RunRow, String, String, String) = tx.query_row(
-            "SELECT runs.*, repos.name AS repo_name, repos.url AS repo_url, groups_.name AS group_name
+        // A new attempt of these tasks: an earlier one's summary and artifacts are not its.
+        tx.execute(
+            "UPDATE tasks SET summary = NULL, artifacts = NULL WHERE group_id = ?1",
+            params![gid],
+        )?;
+        let (run, repo_name, url, group_name, github): (RunRow, String, String, String, bool) = tx.query_row(
+            "SELECT runs.*, repos.name AS repo_name, repos.url AS repo_url, groups_.name AS group_name,
+               repos.github IS NOT NULL AS repo_github
              FROM groups_ JOIN runs ON runs.id = groups_.run_id JOIN repos ON repos.id = runs.repo_id
              WHERE groups_.id = ?1",
             params![gid],
-            |r| Ok((run_row(r)?, r.get("repo_name")?, r.get("repo_url")?, r.get("group_name")?)),
+            |r| Ok((run_row(r)?, r.get("repo_name")?, r.get("repo_url")?, r.get("group_name")?, r.get("repo_github")?)),
         )?;
         let tasks = {
             let mut st = tx
@@ -588,7 +1156,7 @@ impl Db {
             rows
         };
         tx.commit()?;
-        Ok(Some(Job {
+        let job = Job {
             group_id: gid,
             lease,
             run_id,
@@ -599,14 +1167,25 @@ impl Db {
             group: group_name,
             os: if os == "any" { worker.os.clone() } else { os },
             no_cache: run.no_cache,
+            flake_retries: u32::from(run.trigger == "queue"),
+            trusted: run.trusted,
+            fresh: run.fresh,
+            no_secrets: run.no_secrets,
+            debug: run.debug,
+            base_sha: run.base_sha,
+            cache_token: Some(cache_token),
+            // A server without an API token clears the GitHub condition
+            // (see `api::claim`).
+            trusted_secrets: run.trusted && github,
             tasks,
-        }))
+        };
+        Ok((Some(job), held))
     }
 
     pub fn group(&self, id: &str) -> Result<GroupRow> {
         let c = self.conn.lock();
         c.query_row(
-            "SELECT id, run_id, name, os, status, check_run_id FROM groups_ WHERE id = ?1",
+            "SELECT id, run_id, name, os, status, check_run_id, left_out FROM groups_ WHERE id = ?1",
             params![id],
             |r| {
                 Ok(GroupRow {
@@ -616,6 +1195,7 @@ impl Db {
                     os: r.get(3)?,
                     status: Status::parse(&r.get::<_, String>(4)?),
                     check_run_id: opt_u64(r.get(5)?),
+                    left_out: r.get::<_, i64>(6)? != 0,
                 })
             },
         )
@@ -626,7 +1206,7 @@ impl Db {
     pub fn groups_for_run(&self, run_id: &str) -> Result<Vec<GroupRow>> {
         let c = self.conn.lock();
         let mut st = c.prepare(
-            "SELECT id, run_id, name, os, status, check_run_id FROM groups_ WHERE run_id = ?1",
+            "SELECT id, run_id, name, os, status, check_run_id, left_out FROM groups_ WHERE run_id = ?1",
         )?;
         let rows = st
             .query_map(params![run_id], |r| {
@@ -637,6 +1217,7 @@ impl Db {
                     os: r.get(3)?,
                     status: Status::parse(&r.get::<_, String>(4)?),
                     check_run_id: opt_u64(r.get(5)?),
+                    left_out: r.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -685,10 +1266,20 @@ impl Db {
     }
     /// Records a heartbeat if `lease` is still the group's current claim.
     pub fn heartbeat_group(&self, id: &str, lease: Option<&str>) -> Result<bool> {
-        Ok(self.conn.lock().execute(
+        let c = self.conn.lock();
+        let live = c.execute(
             "UPDATE groups_ SET heartbeat_at = ?1 WHERE id = ?2 AND status = 'running' AND lease = ?3",
             params![now_ms(), id, lease],
-        )? > 0)
+        )? > 0;
+        // A worker busy in every slot claims nothing for a long while; its
+        // heartbeats keep it online (`/metrics`, waiting reasons).
+        if live {
+            c.execute(
+                "UPDATE workers SET last_seen = ?1 WHERE name = (SELECT worker FROM groups_ WHERE id = ?2)",
+                params![now_ms(), id],
+            )?;
+        }
+        Ok(live)
     }
 
     /// Requeues running groups whose worker stopped heartbeating.
@@ -713,28 +1304,121 @@ impl Db {
         Ok(ids)
     }
 
+    /// Hands a running group back to the queue at once: its worker is
+    /// shutting down and will not finish it. False if the lease is not live.
+    pub fn requeue_group(&self, id: &str, lease: &str) -> Result<bool> {
+        let c = self.conn.lock();
+        let n = c.execute(
+            "UPDATE groups_ SET status = 'queued', worker = NULL, started_at = NULL, lease = NULL
+             WHERE id = ?1 AND lease = ?2 AND status = 'running'",
+            params![id, lease],
+        )?;
+        if n > 0 {
+            c.execute(
+                "UPDATE tasks SET status = 'queued', started_at = NULL WHERE group_id = ?1 AND status = 'running'",
+                params![id],
+            )?;
+        }
+        Ok(n > 0)
+    }
+
+    /// Whether no worker has picked up any part of the run yet.
+    pub fn run_untouched(&self, run_id: &str) -> Result<bool> {
+        Ok(!self
+            .conn
+            .lock()
+            .prepare_cached("SELECT 1 FROM groups_ WHERE run_id = ?1 AND status != 'queued'")?
+            .exists(params![run_id])?)
+    }
+
     /// Cancels a run: it ends `failed` with message `cancelled` at once, and
     /// its unclaimed groups are skipped. Groups already running finish on
     /// their workers, but their results no longer change the run. Returns
     /// whether the run was still active.
+    /// A task of the run that failed for good (after its retries; a
+    /// quarantined task's failure does not count), as `group.task`.
+    pub fn run_failed_task(&self, run_id: &str) -> Result<Option<String>> {
+        let c = self.conn.lock();
+        let rows: Vec<(String, String, String)> = {
+            let mut st = c.prepare_cached(
+                "SELECT g.name, t.name, t.def FROM tasks t JOIN groups_ g ON g.id = t.group_id
+                 WHERE t.run_id = ?1 AND t.status IN ('failed', 'error')",
+            )?;
+            let rows = st
+                .query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        Ok(rows.into_iter().find_map(|(g, t, def)| {
+            let def: TaskDef = serde_json::from_str(&def).ok()?;
+            (!def.quarantine).then(|| format!("{g}.{t}"))
+        }))
+    }
+
     pub fn cancel_run(&self, run_id: &str) -> Result<bool> {
+        self.cancel_run_because(run_id, "cancelled")
+    }
+
+    /// Cancels a run with a message (`cancelled`, `superseded by run_…`).
+    /// Running groups lose their lease, so their worker's next heartbeat is
+    /// refused and it stops the tasks.
+    pub fn cancel_run_because(&self, run_id: &str, message: &str) -> Result<bool> {
+        self.cancel_run_as(run_id, message, Status::Failed)
+    }
+
+    /// Cancels a run whose work is done elsewhere (a merge queue batch):
+    /// it ends as skipped, not failed.
+    pub fn skip_run_because(&self, run_id: &str, message: &str) -> Result<bool> {
+        self.cancel_run_as(run_id, message, Status::Skipped)
+    }
+
+    fn cancel_run_as(&self, run_id: &str, message: &str, status: Status) -> Result<bool> {
         let c = self.conn.lock();
         let now = now_ms();
-        c.execute(
-            "UPDATE groups_ SET status = 'skipped', finished_at = ?1 WHERE run_id = ?2 AND status = 'queued'",
-            params![now, run_id],
-        )?;
-        c.execute(
-            "UPDATE tasks SET status = 'skipped', finished_at = ?1 WHERE run_id = ?2 AND status = 'queued'
-               AND group_id IN (SELECT id FROM groups_ WHERE run_id = ?2 AND status = 'skipped')",
-            params![now, run_id],
-        )?;
         let changed = c.execute(
-            "UPDATE runs SET status = 'failed', message = 'cancelled', finished_at = ?1
+            "UPDATE runs SET status = ?4, message = ?3, finished_at = ?1
              WHERE id = ?2 AND status IN ('queued', 'running')",
+            params![now, run_id, message, status.as_str()],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        // A running group's worker learns of the cancel on its next
+        // heartbeat and then stops its tasks; keep its lock until then.
+        c.execute(
+            "UPDATE groups_ SET lock_until = ?1 + 10000
+             WHERE run_id = ?2 AND status = 'running' AND lock_name IS NOT NULL",
             params![now, run_id],
         )?;
-        Ok(changed > 0)
+        c.execute(
+            "UPDATE groups_ SET status = 'skipped', finished_at = ?1, lease = NULL
+             WHERE run_id = ?2 AND status IN ('queued', 'running')",
+            params![now, run_id],
+        )?;
+        c.execute(
+            "UPDATE tasks SET status = 'skipped', finished_at = ?1 WHERE run_id = ?2 AND status IN ('queued', 'running')",
+            params![now, run_id],
+        )?;
+        Ok(true)
+    }
+
+    /// Active runs that a new run of the same repo, trigger and ref replaces.
+    pub fn superseded_runs(
+        &self,
+        repo_id: &str,
+        trigger: &str,
+        git_ref: &str,
+        newer: &str,
+    ) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT id FROM runs WHERE repo_id = ?1 AND trigger = ?2 AND ref = ?3 AND id != ?4
+               AND status IN ('queued', 'running')",
+        )?;
+        let ids = st
+            .query_map(params![repo_id, trigger, git_ref, newer], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
     }
 
     pub fn task_group(&self, task_id: &str) -> Result<(String, String, String)> {
@@ -784,6 +1468,191 @@ impl Db {
                            WHERE tasks.id = ?1 AND groups_.status = 'running' AND groups_.lease = ?3)",
             params![task_id, text, lease],
         )? > 0)
+    }
+
+    /// Stores a running task's artifacts (see `TaskView::artifacts`).
+    pub fn set_artifacts(
+        &self,
+        task_id: &str,
+        lease: Option<&str>,
+        files: &[Artifact],
+    ) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE tasks SET artifacts = ?2 WHERE id = ?1 AND EXISTS (
+               SELECT 1 FROM groups_ WHERE groups_.id = tasks.group_id
+                 AND groups_.status = 'running' AND groups_.lease = ?3)",
+            params![task_id, serde_json::to_string(files)?, lease],
+        )? > 0)
+    }
+
+    /// A task's artifact by path: its digest.
+    pub fn artifact(&self, task_id: &str, path: &str) -> Result<Option<Artifact>> {
+        let c = self.conn.lock();
+        let json: Option<String> = c
+            .query_row(
+                "SELECT artifacts FROM tasks WHERE id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(json
+            .and_then(|j| serde_json::from_str::<Vec<Artifact>>(&j).ok())
+            .and_then(|all| all.into_iter().find(|a| a.path == path)))
+    }
+
+    #[cfg(test)]
+    fn view_task_artifact_for_test(&self, group_id: &str) -> Result<Option<Artifact>> {
+        let id: String = self.conn.lock().query_row(
+            "SELECT id FROM tasks WHERE group_id = ?1",
+            params![group_id],
+            |r| r.get(0),
+        )?;
+        self.artifact(&id, "report/a.png")
+    }
+
+    /// Stores a running task's summary (see `TaskView::summary`).
+    pub fn set_summary(&self, task_id: &str, lease: Option<&str>, markdown: &str) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE tasks SET summary = ?2 WHERE id = ?1 AND EXISTS (
+               SELECT 1 FROM groups_ WHERE groups_.id = tasks.group_id
+                 AND groups_.status = 'running' AND groups_.lease = ?3)",
+            params![task_id, markdown, lease],
+        )? > 0)
+    }
+
+    /// Stores a running task's annotations (see `Annotation`).
+    pub fn set_annotations(
+        &self,
+        task_id: &str,
+        lease: Option<&str>,
+        annotations: &[Annotation],
+    ) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE tasks SET annotations = ?2 WHERE id = ?1 AND EXISTS (
+               SELECT 1 FROM groups_ WHERE groups_.id = tasks.group_id
+                 AND groups_.status = 'running' AND groups_.lease = ?3)",
+            params![task_id, serde_json::to_string(annotations)?, lease],
+        )? > 0)
+    }
+
+    /// Records a running task's test outcomes (see `TestOutcomes`).
+    pub fn set_test_outcomes(
+        &self,
+        task_id: &str,
+        lease: Option<&str>,
+        outcomes: &TestOutcomes,
+    ) -> Result<bool> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let live: bool = tx
+            .prepare(
+                "SELECT 1 FROM tasks JOIN groups_ ON groups_.id = tasks.group_id
+                 WHERE tasks.id = ?1 AND groups_.status = 'running' AND groups_.lease = ?2",
+            )?
+            .exists(params![task_id, lease])?;
+        if !live {
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM test_results WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        for (tests, outcome) in [
+            (&outcomes.failed, "failed"),
+            (&outcomes.passed_on_retry, "retried"),
+        ] {
+            for t in tests {
+                tx.execute(
+                    "INSERT OR IGNORE INTO test_results (task_id, test, outcome) VALUES (?1, ?2, ?3)",
+                    params![task_id, t, outcome],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Tests that passed on a retry, or failed where the same inputs passed
+    /// elsewhere, over the window since `since`; worst first.
+    pub fn flaky_tests(&self, since: i64) -> Result<Vec<FlakyTest>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "WITH recent AS (
+               SELECT t.id, t.name AS task, g.name AS grp, repos.name AS repo, t.action_key,
+                      t.status, t.run_id, t.finished_at
+               FROM tasks t JOIN groups_ g ON g.id = t.group_id
+               JOIN runs r ON r.id = t.run_id JOIN repos ON repos.id = r.repo_id
+               WHERE t.finished_at > ?1
+             )
+             SELECT recent.repo, recent.grp, recent.task, x.test, x.outcome, recent.run_id,
+                    recent.finished_at,
+                    x.outcome = 'failed' AND recent.status IN ('failed', 'error')
+                      AND recent.action_key IS NOT NULL AND EXISTS (
+                      SELECT 1 FROM recent r2 WHERE r2.action_key = recent.action_key
+                        AND r2.id != recent.id AND r2.status IN ('passed', 'cached'))
+             FROM test_results x JOIN recent ON recent.id = x.task_id
+             ORDER BY recent.finished_at",
+        )?;
+        type Key = (String, String, String, String);
+        let mut by: std::collections::BTreeMap<Key, FlakyTest> = Default::default();
+        let rows = st.query_map(params![since], |r| {
+            Ok((
+                (
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ),
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, bool>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let ((repo, group, task, test), outcome, run, mixed) = row?;
+            let e = by
+                .entry((repo.clone(), group.clone(), task.clone(), test.clone()))
+                .or_insert_with(|| FlakyTest {
+                    repo,
+                    group,
+                    task,
+                    test,
+                    failures: 0,
+                    flaky_passes: 0,
+                    mixed_inputs: 0,
+                    last_run: String::new(),
+                });
+            match outcome.as_str() {
+                "failed" => e.failures += 1,
+                _ => e.flaky_passes += 1,
+            }
+            e.mixed_inputs += u64::from(mixed);
+            e.last_run = run;
+        }
+        let mut out: Vec<FlakyTest> = by
+            .into_values()
+            .filter(|t| t.flaky_passes > 0 || t.mixed_inputs > 0)
+            .collect();
+        out.sort_by_key(|t| std::cmp::Reverse(t.flaky_passes + t.mixed_inputs));
+        Ok(out)
+    }
+
+    /// Every annotation of a group's failed tasks (an attempt that was
+    /// requeued and then passed leaves its annotations behind).
+    pub fn group_annotations(&self, group_id: &str) -> Result<Vec<Annotation>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT annotations FROM tasks WHERE group_id = ?1 AND annotations IS NOT NULL
+               AND status IN ('failed', 'error') ORDER BY position",
+        )?;
+        let rows: Vec<String> = st
+            .query_map(params![group_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .iter()
+            .flat_map(|j| serde_json::from_str::<Vec<Annotation>>(j).unwrap_or_default())
+            .collect())
     }
 
     pub fn live_log(&self, task_id: &str) -> Result<String> {
@@ -836,37 +1705,553 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?;
-        if entry.is_some() {
+        let entry: Option<CacheEntry> = entry.and_then(|e| serde_json::from_str(&e).ok());
+        if let Some(e) = &entry {
             c.execute(
                 "UPDATE cache SET hits = hits + 1, last_hit_at = ?1 WHERE action_key = ?2",
                 params![now_ms(), key],
             )?;
+            // Totals live apart from the entry, so evicting it keeps the history.
+            for (name, by) in [("cacheHits", 1i64), ("timeSavedMs", e.duration_ms as i64)] {
+                c.execute(
+                    "INSERT INTO counters (name, value) VALUES (?1, ?2)
+                     ON CONFLICT(name) DO UPDATE SET value = value + ?2",
+                    params![name, by],
+                )?;
+            }
         }
+        Ok(entry)
+    }
+
+    /// Reads a cache entry without counting it as a hit.
+    pub fn cache_peek(&self, key: &str) -> Result<Option<CacheEntry>> {
+        let c = self.conn.lock();
+        let entry: Option<String> = c
+            .query_row(
+                "SELECT entry FROM cache WHERE action_key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
         Ok(entry.and_then(|e| serde_json::from_str(&e).ok()))
     }
 
-    pub fn cache_put(&self, key: &str, entry: &CacheEntry) -> Result<()> {
+    /// Stores a result and returns the row key it went under (see
+    /// `CacheScope::write_key`).
+    pub fn cache_put(&self, key: &str, scope: &CacheScope, entry: &CacheEntry) -> Result<String> {
+        let stored = scope.write_key(key);
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO cache (action_key, entry, created_at) VALUES (?1, ?2, ?3)",
-            params![key, serde_json::to_string(entry)?, now_ms()],
+            params![stored, serde_json::to_string(entry)?, now_ms()],
+        )?;
+        Ok(stored)
+    }
+
+    pub fn set_run_no_secrets(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("UPDATE runs SET no_secrets = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Marks a run's groups as all inserted (see the lock rule in claims).
+    pub fn set_run_planned(&self, id: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE runs SET planned_at = ?2 WHERE id = ?1",
+            params![id, now_ms()],
         )?;
         Ok(())
     }
 
+    pub fn set_run_kinds(&self, id: &str, kinds: &[&str]) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE runs SET kinds = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(kinds)?],
+        )?;
+        Ok(())
+    }
+
+    /// Whether another run of this commit has a group of this name that is
+    /// really run (not left out): its check is the one that counts.
+    pub fn real_group_on_commit(
+        &self,
+        repo_id: &str,
+        sha: &str,
+        name: &str,
+        run_id: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .prepare_cached(
+                "SELECT 1 FROM groups_ g JOIN runs r ON r.id = g.run_id
+                 WHERE r.repo_id = ?1 AND r.sha = ?2 AND g.name = ?3 AND r.id != ?4 AND g.left_out = 0
+                   AND r.overlay IS NULL",
+            )?
+            .exists(params![repo_id, sha, name, run_id])?)
+    }
+
+    /// Runs of this commit, other than `run_id`, cancelled because their
+    /// pull request was closed (see `github::PR_CLOSED`).
+    pub fn closed_pr_runs_on_commit(
+        &self,
+        repo_id: &str,
+        sha: &str,
+        run_id: &str,
+    ) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT id FROM runs WHERE repo_id = ?1 AND sha = ?2 AND id != ?3
+               AND overlay IS NULL AND message = 'pull request closed'",
+        )?;
+        let ids = st
+            .query_map(params![repo_id, sha, run_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(ids)
+    }
+
+    /// The other run of this commit whose group of this name most recently
+    /// finished with a result (passed, failed or error: not cancelled).
+    pub fn newest_result_elsewhere(
+        &self,
+        repo_id: &str,
+        sha: &str,
+        name: &str,
+        run_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .prepare_cached(
+                "SELECT r.id FROM groups_ g JOIN runs r ON r.id = g.run_id
+                 WHERE r.repo_id = ?1 AND r.sha = ?2 AND g.name = ?3 AND r.id != ?4 AND g.left_out = 0
+                   AND r.overlay IS NULL AND g.status IN ('passed', 'failed', 'error')
+                 ORDER BY g.finished_at DESC LIMIT 1",
+            )?
+            .query_row(params![repo_id, sha, name, run_id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Runs of this commit that really run a group of this name.
+    pub fn real_group_runs(&self, repo_id: &str, sha: &str, name: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT DISTINCT r.id FROM groups_ g JOIN runs r ON r.id = g.run_id
+             WHERE r.repo_id = ?1 AND r.sha = ?2 AND g.name = ?3 AND g.left_out = 0 AND r.overlay IS NULL",
+        )?;
+        let rows = st
+            .query_map(params![repo_id, sha, name], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The newest check run a left-out copy of this group posted on this
+    /// commit (`GroupDef::on`).
+    pub fn newest_left_out_check(
+        &self,
+        repo_id: &str,
+        sha: &str,
+        name: &str,
+    ) -> Result<Option<u64>> {
+        let c = self.conn.lock();
+        let id: Option<i64> = c.query_row(
+            "SELECT MAX(g.check_run_id) FROM groups_ g JOIN runs r ON r.id = g.run_id
+             WHERE r.repo_id = ?1 AND r.sha = ?2 AND g.name = ?3 AND g.left_out = 1",
+            params![repo_id, sha, name],
+            |r| r.get(0),
+        )?;
+        Ok(id.map(|v| v as u64))
+    }
+
+    /// Every kind (`GroupDef::on`) the runs of this commit counted as.
+    pub fn commit_kinds(&self, repo_id: &str, sha: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT kinds FROM runs WHERE repo_id = ?1 AND sha = ?2 AND overlay IS NULL AND kinds IS NOT NULL",
+        )?;
+        let mut out: Vec<String> = Vec::new();
+        for k in st.query_map(params![repo_id, sha], |r| r.get::<_, String>(0))? {
+            for kind in serde_json::from_str::<Vec<String>>(&k?).unwrap_or_default() {
+                if !out.contains(&kind) {
+                    out.push(kind);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn set_run_base(&self, id: &str, base: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE runs SET base_sha = ?2 WHERE id = ?1",
+            params![id, base],
+        )?;
+        Ok(())
+    }
+
+    /// Commits of `branch` whose trusted run passed, newest first. Only
+    /// pushes and post-merge backstops count: a scheduled run of one task
+    /// passing says nothing about the rest. (Groups their kind leaves out,
+    /// `on`, did not run there either.)
+    pub fn green_commits(&self, repo_id: &str, branch: &str, limit: usize) -> Result<Vec<String>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT sha FROM runs WHERE repo_id = ?1 AND ref = ?2 AND trusted = 1
+               AND status = 'passed' AND overlay IS NULL
+               AND trigger IN ('push', 'post-merge')
+             ORDER BY created_at DESC LIMIT ?3",
+        )?;
+        let rows = st
+            .query_map(params![repo_id, branch, limit as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_run_debug(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("UPDATE runs SET debug = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn set_run_fresh(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("UPDATE runs SET fresh = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// The row a run of this scope may use for an action key, most trusted
+    /// first (see `CacheScope::read_keys`).
+    pub fn cache_find(&self, key: &str, scope: &CacheScope) -> Result<Option<String>> {
+        let c = self.conn.lock();
+        for k in &scope.read_keys(key) {
+            if c.prepare_cached("SELECT 1 FROM cache WHERE action_key = ?1")?
+                .exists(params![k])?
+            {
+                return Ok(Some(k.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn shard_timings(
+        &self,
+        repo_id: &str,
+        task: &str,
+    ) -> Result<std::collections::HashMap<String, f64>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT path, secs FROM shard_timings WHERE repo_id = ?1 AND task = ?2",
+        )?;
+        let rows = st
+            .query_map(params![repo_id, task], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<std::collections::HashMap<String, f64>>>()?;
+        Ok(rows)
+    }
+
+    /// Folds new durations into the smoothed ones (half old, half new).
+    pub fn record_shard_timings(
+        &self,
+        repo_id: &str,
+        task: &str,
+        times: &std::collections::HashMap<String, f64>,
+    ) -> Result<()> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        for (path, secs) in times {
+            tx.execute(
+                "INSERT INTO shard_timings (repo_id, task, path, secs) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(repo_id, task, path) DO UPDATE SET secs = (secs + ?4) / 2",
+                params![repo_id, task, path, secs],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Queued groups of active runs per OS: count and when the oldest was
+    /// created. What an autoscaler needs.
+    pub fn queue_depth(&self) -> Result<Vec<(String, i64, i64)>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT groups_.os, COUNT(*), MIN(groups_.created_at) FROM groups_
+             JOIN runs ON runs.id = groups_.run_id
+             WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
+             GROUP BY groups_.os ORDER BY groups_.os",
+        )?;
+        let rows = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Groups running now.
+    pub fn running_groups(&self) -> Result<i64> {
+        Ok(self.conn.lock().query_row(
+            "SELECT COUNT(*) FROM groups_ WHERE status = 'running'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The run of the group holding this live lease.
+    pub fn lease_run(&self, lease: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT run_id FROM groups_ WHERE lease = ?1 AND status = 'running'",
+                params![lease],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// For a task of the group holding this live lease: its repo, the
+    /// group's name, and whether the run withholds secrets (a fork's).
+    pub fn lease_task(&self, lease: &str, task: &str) -> Result<Option<(String, String, bool)>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT runs.repo_id, groups_.name, runs.no_secrets FROM groups_
+                 JOIN runs ON runs.id = groups_.run_id
+                 JOIN tasks ON tasks.group_id = groups_.id
+                 WHERE groups_.lease = ?1 AND groups_.status = 'running' AND tasks.name = ?2",
+                params![lease, task],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+            )
+            .optional()?)
+    }
+
+    /// Like `lease_trust`, for a running group's cache token.
+    pub fn cache_token_trust(&self, token: &str) -> Result<Option<(bool, String, bool)>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT runs.trusted, repos.id, repos.github IS NOT NULL FROM groups_
+                 JOIN runs ON runs.id = groups_.run_id
+                 JOIN repos ON repos.id = runs.repo_id
+                 WHERE groups_.cache_token = ?1 AND groups_.status = 'running'",
+                params![token],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? != 0,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
+    /// The trust and repo of the run whose group holds this live lease:
+    /// `(trusted, repo id, whether the repo came from the GitHub webhook)`;
+    /// `None` if no running group holds it.
+    pub fn lease_trust(&self, lease: &str) -> Result<Option<(bool, String, bool)>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT runs.trusted, repos.id, repos.github IS NOT NULL FROM groups_
+                 JOIN runs ON runs.id = groups_.run_id
+                 JOIN repos ON repos.id = runs.repo_id
+                 WHERE groups_.lease = ?1 AND groups_.status = 'running'",
+                params![lease],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)? != 0,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
     pub fn kv_get(&self, ns: &str, key: &str) -> Result<Option<String>> {
         let c = self.conn.lock();
-        Ok(c.query_row(
-            "SELECT digest FROM kv WHERE ns = ?1 AND key = ?2",
-            params![ns, key],
+        let digest: Option<String> = c
+            .query_row(
+                "SELECT digest FROM kv WHERE ns = ?1 AND key = ?2",
+                params![ns, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if digest.is_some() {
+            // Least-recently-used eviction needs to know what is still read.
+            c.execute(
+                "UPDATE kv SET last_used_at = ?1 WHERE ns = ?2 AND key = ?3",
+                params![now_ms(), ns, key],
+            )?;
+        }
+        Ok(digest)
+    }
+
+    /// Deletes the `n` least recently used cache entries (task results and
+    /// Turborepo/Bazel artifacts). Returns how many were deleted.
+    pub fn evict_lru(&self, n: usize) -> Result<usize> {
+        let c = self.conn.lock();
+        let victims: Vec<(String, String, String)> = {
+            let mut st = c.prepare(concat!(
+                "SELECT 'cache', '', action_key, COALESCE(last_hit_at, created_at) AS used FROM cache
+                 UNION ALL
+                 SELECT 'kv', ns, key, COALESCE(last_used_at, created_at) AS used FROM kv WHERE ns NOT IN ",
+                internal_kv!(),
+                " ORDER BY used LIMIT ?1"
+            ))?;
+            let rows = st
+                .query_map(params![n as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (kind, ns, key) in &victims {
+            if kind == "cache" {
+                c.execute("DELETE FROM cache WHERE action_key = ?1", params![key])?;
+            } else {
+                c.execute(
+                    "DELETE FROM kv WHERE ns = ?1 AND key = ?2",
+                    params![ns, key],
+                )?;
+            }
+        }
+        Ok(victims.len())
+    }
+
+    pub fn evictable_entries(&self) -> Result<usize> {
+        let c = self.conn.lock();
+        let n: i64 = c.query_row(
+            concat!(
+                "SELECT (SELECT COUNT(*) FROM cache) + (SELECT COUNT(*) FROM kv WHERE ns NOT IN ",
+                internal_kv!(),
+                ")"
+            ),
+            [],
             |r| r.get(0),
-        )
-        .optional()?)
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Blobs that must survive a sweep: everything a cache entry or remote
+    /// cache artifact points to, plus logs and overlays of runs that are
+    /// active or newer than `keep_runs_since` (ms). Overlay manifests are
+    /// returned separately: the files they list must be kept too.
+    /// Blobs to keep. Artifacts of runs since `keep_runs_since` count only
+    /// up to `artifact_budget` bytes (0: no limit), newest runs first, so
+    /// they never push the build cache out.
+    pub fn referenced_blobs(
+        &self,
+        keep_runs_since: i64,
+        artifact_budget: u64,
+    ) -> Result<(std::collections::HashSet<String>, Vec<String>)> {
+        let c = self.conn.lock();
+        let mut keep = std::collections::HashSet::new();
+        {
+            let mut st = c.prepare("SELECT entry FROM cache")?;
+            for entry in st.query_map([], |r| r.get::<_, String>(0))? {
+                if let Ok(e) = serde_json::from_str::<CacheEntry>(&entry?) {
+                    keep.extend(e.outputs.into_iter().map(|o| o.digest));
+                    keep.extend(e.log_digest);
+                    keep.extend(e.inputs);
+                }
+            }
+        }
+        {
+            let mut st = c.prepare(concat!(
+                "SELECT digest FROM kv WHERE ns NOT IN ",
+                internal_kv!(),
+                ""
+            ))?;
+            for d in st.query_map([], |r| r.get::<_, String>(0))? {
+                // Turborepo entries are `<digest>:<duration>`.
+                keep.insert(d?.split(':').next().unwrap_or_default().to_string());
+            }
+        }
+        let recent = "(runs.created_at >= ?1 OR runs.status IN ('queued', 'running'))";
+        {
+            let mut st = c.prepare(&format!(
+                "SELECT tasks.log_digest FROM tasks JOIN runs ON runs.id = tasks.run_id
+                 WHERE tasks.log_digest IS NOT NULL AND {recent}"
+            ))?;
+            for d in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
+                keep.insert(d?);
+            }
+        }
+        {
+            let mut st = c.prepare(&format!(
+                "SELECT tasks.artifacts FROM tasks JOIN runs ON runs.id = tasks.run_id
+                 WHERE tasks.artifacts IS NOT NULL AND {recent} ORDER BY runs.created_at DESC"
+            ))?;
+            let mut kept = 0u64;
+            'runs: for a in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
+                for f in serde_json::from_str::<Vec<Artifact>>(&a?).unwrap_or_default() {
+                    if artifact_budget > 0 && kept + f.size > artifact_budget {
+                        break 'runs;
+                    }
+                    kept += f.size;
+                    keep.insert(f.digest);
+                }
+            }
+        }
+        let mut overlays = Vec::new();
+        {
+            let mut st = c.prepare(&format!(
+                "SELECT overlay FROM runs WHERE overlay IS NOT NULL AND {recent}"
+            ))?;
+            for d in st.query_map(params![keep_runs_since], |r| r.get::<_, String>(0))? {
+                let d = d?;
+                keep.insert(d.clone());
+                overlays.push(d);
+            }
+        }
+        Ok((keep, overlays))
+    }
+
+    pub fn kv_delete(&self, ns: &str, key: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "DELETE FROM kv WHERE ns = ?1 AND key = ?2",
+            params![ns, key],
+        )?;
+        Ok(())
+    }
+
+    /// Marks the groups of a run that hold a failed task as failed (a run
+    /// stopped early leaves them skipped, and their check would read
+    /// "cancelled").
+    pub fn fail_groups_with_failures(&self, run_id: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE groups_ SET status = 'failed' WHERE run_id = ?1 AND EXISTS (
+               SELECT 1 FROM tasks WHERE tasks.group_id = groups_.id AND tasks.status IN ('failed', 'error'))",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Sets a key unless it is already set; true if this call set it.
+    pub fn kv_claim(&self, ns: &str, key: &str) -> Result<bool> {
+        Ok(self.conn.lock().execute(
+            "INSERT OR IGNORE INTO kv (ns, key, digest, created_at) VALUES (?1, ?2, '1', ?3)",
+            params![ns, key, now_ms()],
+        )? > 0)
     }
 
     pub fn kv_put(&self, ns: &str, key: &str, digest: &str) -> Result<()> {
         self.conn.lock().execute(
             "INSERT OR REPLACE INTO kv (ns, key, digest, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![ns, key, digest, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Stores a number under a key unless a larger one is there, in one
+    /// statement, so two writers at once can't leave the smaller.
+    pub fn kv_put_max(&self, ns: &str, key: &str, value: u64) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO kv (ns, key, digest, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(ns, key) DO UPDATE SET digest = excluded.digest
+             WHERE CAST(excluded.digest AS INTEGER) > CAST(kv.digest AS INTEGER)",
+            params![ns, key, value.to_string(), now_ms()],
         )?;
         Ok(())
     }
@@ -879,10 +2264,13 @@ impl Db {
             "tasks": count("SELECT COUNT(*) FROM tasks")?,
             "tasksCached": count("SELECT COUNT(*) FROM tasks WHERE status = 'cached'")?,
             "tasksRun": count("SELECT COUNT(*) FROM tasks WHERE status IN ('passed', 'failed')")?,
+            "tasksFlaky": count("SELECT COUNT(*) FROM tasks WHERE message LIKE 'flaky:%'")?,
             "cacheEntries": count("SELECT COUNT(*) FROM cache")?,
-            "cacheHits": count("SELECT COALESCE(SUM(hits), 0) FROM cache")?,
-            "timeSavedMs": count("SELECT COALESCE(SUM(json_extract(entry, '$.durationMs') * hits), 0) FROM cache")?,
-            "remoteCacheArtifacts": count("SELECT COUNT(*) FROM kv")?,
+            "cacheHits": count("SELECT COALESCE((SELECT value FROM counters WHERE name = 'cacheHits'), 0)")?,
+            "timeSavedMs": count("SELECT COALESCE((SELECT value FROM counters WHERE name = 'timeSavedMs'), 0)")?,
+            "workerTimeMs": count("SELECT COALESCE(SUM(duration_ms), 0) FROM tasks WHERE status IN ('passed', 'failed')")?,
+            "supersededRuns": count("SELECT COUNT(*) FROM runs WHERE message LIKE 'superseded by %'")?,
+            "remoteCacheArtifacts": count(concat!("SELECT COUNT(*) FROM kv WHERE ns NOT IN ", internal_kv!()))?,
         }))
     }
 
@@ -915,6 +2303,394 @@ impl Db {
             .collect())
     }
 
+    /// Queued groups of active runs created before `before`.
+    pub fn waiting_groups(&self, before: i64) -> Result<Vec<WaitingGroup>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "SELECT groups_.id, groups_.run_id, groups_.name, groups_.os, groups_.backends, groups_.message,
+               groups_.lock_name,
+               (SELECT held.run_id FROM groups_ held WHERE held.lock_name = groups_.lock_name
+                  AND (held.status = 'running' OR held.lock_until > ?2) LIMIT 1),
+               groups_.arch
+             FROM groups_ JOIN runs ON runs.id = groups_.run_id
+             WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
+               AND groups_.created_at < ?1",
+        )?;
+        let rows = st
+            .query_map(params![before, now_ms()], |r| {
+                let backends: String = r.get(4)?;
+                Ok(WaitingGroup {
+                    id: r.get(0)?,
+                    run_id: r.get(1)?,
+                    name: r.get(2)?,
+                    os: r.get(3)?,
+                    needs: serde_json::from_str(&backends).unwrap_or_default(),
+                    message: r.get(5)?,
+                    lock: r.get(6)?,
+                    lock_holder: r.get(7)?,
+                    arch: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Sets the message of a group that is still queued.
+    pub fn set_queued_group_message(&self, id: &str, message: Option<&str>) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE groups_ SET message = ?1 WHERE id = ?2 AND status = 'queued'",
+            params![message, id],
+        )?;
+        Ok(())
+    }
+
+    /// Tasks that passed only on a retry, or both passed and failed with the
+    /// same inputs, since `since` (ms).
+    /// Durations of the task's last passing executions (same repo, group,
+    /// OS and name; not cached, not passed on a retry), newest first.
+    pub fn recent_durations(&self, task_id: &str, limit: usize) -> Result<Vec<i64>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare_cached(
+            "SELECT t2.duration_ms FROM tasks t
+             JOIN groups_ g ON g.id = t.group_id JOIN runs r ON r.id = t.run_id
+             JOIN tasks t2 ON t2.name = t.name
+             JOIN groups_ g2 ON g2.id = t2.group_id AND g2.name = g.name AND g2.os = g.os
+             JOIN runs r2 ON r2.id = t2.run_id AND r2.repo_id = r.repo_id
+               AND r2.fresh = 0 AND r2.no_secrets = 0
+             WHERE t.id = ?1 AND t2.id != t.id AND t2.status = 'passed'
+               AND t2.finished_at > ?3
+               AND t2.duration_ms IS NOT NULL AND COALESCE(t2.message, '') NOT LIKE 'flaky:%'
+             ORDER BY t2.finished_at DESC LIMIT ?2",
+        )?;
+        // A month back at most: a common task name (`test`) in a new group
+        // would otherwise scan that name's whole history.
+        let since = now_ms() - 30 * 86_400_000;
+        let rows = st
+            .query_map(params![task_id, limit as i64, since], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Tasks whose recent passing runs take much longer than the ones
+    /// before them, over the window since `since`.
+    pub fn slow_tasks(&self, since: i64) -> Result<Vec<SlowTask>> {
+        let rows: Vec<(String, String, String, String, i64, String)> = {
+            let c = self.conn.lock();
+            let mut st = c.prepare(
+                "SELECT repos.name, g.name, g.os, t.name, t.duration_ms, t.run_id FROM tasks t
+                 JOIN groups_ g ON g.id = t.group_id JOIN runs r ON r.id = t.run_id
+                 JOIN repos ON repos.id = r.repo_id
+                 WHERE t.finished_at > ?1 AND t.status = 'passed' AND t.duration_ms IS NOT NULL
+                   AND r.fresh = 0 AND r.no_secrets = 0
+                   AND COALESCE(t.message, '') NOT LIKE 'flaky:%'
+                 ORDER BY t.finished_at",
+            )?;
+            let rows = st
+                .query_map(params![since], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        // (repo, group, os, task) -> (duration, run), oldest first.
+        type Series =
+            std::collections::BTreeMap<(String, String, String, String), Vec<(i64, String)>>;
+        let mut series: Series = Default::default();
+        for (repo, group, os, task, ms, run) in rows {
+            series
+                .entry((repo, group, os, task))
+                .or_default()
+                .push((ms, run));
+        }
+        let mut out = Vec::new();
+        for ((repo, group, os, task), runs) in series {
+            let durations: Vec<i64> = runs.iter().map(|(d, _)| *d).collect();
+            if let Some((recent, before)) = crate::slow::trend(&durations) {
+                out.push(SlowTask {
+                    repo,
+                    group,
+                    os,
+                    task,
+                    recent_ms: recent as u64,
+                    before_ms: before as u64,
+                    samples: durations.len() as u64,
+                    last_run: runs.last().map(|(_, r)| r.clone()).unwrap_or_default(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            (b.recent_ms as f64 / b.before_ms.max(1) as f64)
+                .total_cmp(&(a.recent_ms as f64 / a.before_ms.max(1) as f64))
+        });
+        Ok(out)
+    }
+
+    pub fn flaky_tasks(&self, since: i64) -> Result<Vec<FlakyTask>> {
+        let c = self.conn.lock();
+        let mut st = c.prepare(
+            "WITH recent AS (
+               SELECT t.name AS task, g.name AS grp, repos.name AS repo, t.status, t.message,
+                      t.action_key, t.run_id, t.finished_at
+               FROM tasks t JOIN groups_ g ON g.id = t.group_id
+               JOIN runs r ON r.id = t.run_id JOIN repos ON repos.id = r.repo_id
+               WHERE t.finished_at > ?1 AND t.status IN ('passed', 'cached', 'failed', 'error')
+             ),
+             mixed AS (
+               SELECT repo, grp, task, COUNT(*) AS n FROM (
+                 SELECT repo, grp, task, action_key FROM recent WHERE action_key IS NOT NULL
+                 GROUP BY repo, grp, task, action_key
+                 HAVING SUM(status IN ('failed', 'error')) > 0 AND SUM(status IN ('passed', 'cached')) > 0
+               ) GROUP BY repo, grp, task
+             )
+             SELECT recent.repo, recent.grp, recent.task, COUNT(*),
+                    SUM(recent.status IN ('failed', 'error')),
+                    SUM(COALESCE(recent.message, '') LIKE 'flaky:%'),
+                    COALESCE(MAX(mixed.n), 0),
+                    (SELECT run_id FROM recent r2 WHERE r2.repo = recent.repo AND r2.grp = recent.grp
+                       AND r2.task = recent.task ORDER BY finished_at DESC LIMIT 1)
+             FROM recent LEFT JOIN mixed
+               ON mixed.repo = recent.repo AND mixed.grp = recent.grp AND mixed.task = recent.task
+             GROUP BY recent.repo, recent.grp, recent.task
+             HAVING SUM(COALESCE(recent.message, '') LIKE 'flaky:%') > 0 OR COALESCE(MAX(mixed.n), 0) > 0
+             ORDER BY SUM(COALESCE(recent.message, '') LIKE 'flaky:%') + COALESCE(MAX(mixed.n), 0) DESC",
+        )?;
+        let rows = st
+            .query_map(params![since], |r| {
+                Ok(FlakyTask {
+                    repo: r.get(0)?,
+                    group: r.get(1)?,
+                    task: r.get(2)?,
+                    runs: r.get::<_, i64>(3)? as u64,
+                    failures: r.get::<_, i64>(4)? as u64,
+                    flaky_passes: r.get::<_, i64>(5)? as u64,
+                    mixed_inputs: r.get::<_, i64>(6)? as u64,
+                    last_run: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The run of a task, if the task is running now.
+    pub fn running_task_run(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT run_id FROM tasks WHERE id = ?1 AND status = 'running'",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The run in which a task with this action key last failed, if any.
+    pub fn last_failure(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT run_id FROM tasks WHERE action_key = ?1 AND status IN ('failed', 'error')
+                 ORDER BY finished_at DESC LIMIT 1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// A line's last recorded result and the creation time of its run.
+    pub fn notify_state(&self, key: &str) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT status, run_created_at FROM notify_state WHERE key = ?1",
+                params![key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Records a line's result, unless a newer run already did.
+    pub fn record_notify_state(&self, key: &str, status: &str, run_created_at: i64) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO notify_state (key, status, run_created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET status = ?2, run_created_at = ?3
+             WHERE run_created_at <= ?3",
+            params![key, status, run_created_at],
+        )?;
+        Ok(())
+    }
+
+    /// The newest run of a repo started by `trigger`: id, status, created at.
+    pub fn latest_run_by_trigger(
+        &self,
+        repo_id: &str,
+        trigger: &str,
+    ) -> Result<Option<(String, String, i64)>> {
+        let c = self.conn.lock();
+        Ok(c.query_row(
+            "SELECT id, status, created_at FROM runs WHERE repo_id = ?1 AND trigger = ?2
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![repo_id, trigger],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?)
+    }
+
+    /// On a shared server, results that trusted runs stored before each
+    /// repo got its own trusted namespace (P66) may have come from a repo
+    /// anyone with the API token registered. Keep them, but only for
+    /// untrusted runs, once. Costs every repo one cold trusted run.
+    pub fn demote_shared_trusted_results_once(&self) -> Result<bool> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        let done = tx.execute(
+            "INSERT OR IGNORE INTO meta (key) VALUES ('p66-shared-trusted-demoted')",
+            [],
+        )? == 0;
+        if done {
+            return Ok(false);
+        }
+        // `OR REPLACE`: an untrusted result under the same key gives way;
+        // both are untrusted now. `r:` rows included: the first time, any is
+        // one a caller named directly (keys were not checked yet); after a
+        // tokenless spell, repos' own results go cold too, which is safe.
+        tx.execute(
+            "UPDATE OR REPLACE cache SET action_key = 'u:' || action_key
+             WHERE substr(action_key, 1, 2) <> 'u:'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE kv SET digest = 'u:' || digest
+             WHERE ns = 'last' AND substr(digest, 1, 2) <> 'u:'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Started without an API token: whatever trusted runs store now is
+    /// demoted again if the server is shared later.
+    pub fn forget_shared_trusted_demotion(&self) -> Result<()> {
+        self.conn.lock().execute(
+            "DELETE FROM meta WHERE key = 'p66-shared-trusted-demoted'",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// The last minute the scheduler evaluated, kept across restarts under a
+    /// key no schedule can have (theirs are `<repo id>:<name>`).
+    pub fn schedule_tick(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT last_minute FROM schedules WHERE key = ':tick'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_schedule_tick(&self, minute: i64) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO schedules (key, last_minute) VALUES (':tick', ?1)
+             ON CONFLICT(key) DO UPDATE SET last_minute = MAX(last_minute, ?1)",
+            params![minute],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes finished runs created before `before_ms`, with their groups,
+    /// tasks, test results and live logs. Their logs and artifacts are then
+    /// unreferenced, and the CAS collects them. Returns how many runs.
+    pub fn prune_runs(&self, before_ms: i64) -> Result<usize> {
+        let mut c = self.conn.lock();
+        let tx = c.transaction()?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS pruned (id TEXT PRIMARY KEY);
+             DELETE FROM pruned;",
+        )?;
+        let n = tx.execute(
+            // At most 1000 a pass, oldest first: the lock is held throughout.
+            "INSERT INTO pruned (id) SELECT id FROM runs
+             WHERE created_at < ?1 AND status NOT IN ('queued', 'running')
+             ORDER BY created_at LIMIT 1000",
+            params![before_ms],
+        )?;
+        if n > 0 {
+            tx.execute_batch(
+                "DELETE FROM test_results WHERE task_id IN
+                   (SELECT id FROM tasks WHERE run_id IN (SELECT id FROM pruned));
+                 DELETE FROM task_logs WHERE task_id IN
+                   (SELECT id FROM tasks WHERE run_id IN (SELECT id FROM pruned));
+                 DELETE FROM tasks WHERE run_id IN (SELECT id FROM pruned);
+                 DELETE FROM groups_ WHERE run_id IN (SELECT id FROM pruned);
+                 DELETE FROM runs WHERE id IN (SELECT id FROM pruned);",
+            )?;
+        }
+        tx.execute_batch("DELETE FROM pruned;")?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Gives free pages back to the filesystem (see `Db::open`). Bytes freed.
+    pub fn reclaim_space(&self) -> Result<u64> {
+        let c = self.conn.lock();
+        let (free, size): (i64, i64) = c.query_row(
+            "SELECT freelist_count, page_size FROM pragma_freelist_count, pragma_page_size",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if free > 0 {
+            // It frees a page per step, so step it to the end.
+            let mut st = c.prepare("PRAGMA incremental_vacuum")?;
+            let mut rows = st.query([])?;
+            while rows.next()?.is_some() {}
+            drop(rows);
+            drop(st);
+            c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
+        Ok((free * size) as u64)
+    }
+
+    /// Whether the repo has any run at all.
+    pub fn repo_has_runs(&self, repo_id: &str) -> Result<bool> {
+        Ok(self.conn.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE repo_id = ?1)",
+            params![repo_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Whether a run of this commit on this ref exists, whatever its state.
+    pub fn has_run(&self, repo_id: &str, sha: &str, git_ref: &str) -> Result<bool> {
+        Ok(self.conn.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE repo_id = ?1 AND sha = ?2 AND ref = ?3)",
+            params![repo_id, sha, git_ref],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Claims a schedule slot. False if this minute already fired.
+    pub fn claim_schedule_slot(&self, key: &str, minute: i64) -> Result<bool> {
+        let n = self.conn.lock().execute(
+            "INSERT INTO schedules (key, last_minute) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET last_minute = ?2 WHERE last_minute < ?2",
+            params![key, minute],
+        )?;
+        Ok(n > 0)
+    }
+
     // ---- merge queue ----
 
     pub fn queue_insert(
@@ -924,13 +2700,14 @@ impl Db {
         pr: Option<u64>,
         head_sha: &str,
         target: &str,
+        pinned: bool,
     ) -> Result<String> {
         let id = new_id("q");
         let now = now_ms();
         self.conn.lock().execute(
-            "INSERT INTO queue (id, repo_id, source, pr, head_sha, target, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?7)",
-            params![id, repo_id, source, pr.map(|v| v as i64), head_sha, target, now],
+            "INSERT INTO queue (id, repo_id, source, pr, head_sha, target, status, pinned, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?8)",
+            params![id, repo_id, source, pr.map(|v| v as i64), head_sha, target, pinned, now],
         )?;
         Ok(id)
     }
@@ -1012,7 +2789,7 @@ mod tests {
         let db = Db::memory().unwrap();
         let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
         let run = db
-            .insert_run(&repo.id, "sha", None, None, 0, "test", false, None)
+            .insert_run(&repo.id, "sha", None, None, 0, "test", false, None, false)
             .unwrap();
         let task = vec![(
             "t".to_string(),
@@ -1032,13 +2809,821 @@ mod tests {
             cpus: 1,
             backends: vec![Backend::Host],
             kvm: false,
+            protocol: crate::model::PROTOCOL,
         };
         let job = db
             .claim_group(&worker)
             .unwrap()
+            .0
             .expect("linux group was starved");
         assert_eq!(job.group_id, linux);
         assert!(db.heartbeat_group(&job.group_id, Some(&job.lease)).unwrap());
         assert!(!db.heartbeat_group(&job.group_id, Some("stale")).unwrap());
+    }
+
+    #[test]
+    fn a_pull_requests_active_runs_are_found_by_number_not_ref() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = |r: &str, trigger: &str, pr: Option<u64>| {
+            db.insert_run(&repo.id, "sha", Some(r), None, 0, trigger, false, pr, false)
+                .unwrap()
+        };
+        let pr = run("pull/7", "pr", Some(7));
+        // A `/retest` that copied the ref of the commit's newest run, its
+        // branch's push.
+        let retest = run("feature", "retest", Some(7));
+        run("feature", "push", None);
+        run("pull/7", "queue", Some(7));
+        run("pull/8", "pr", Some(8));
+        let done = run("pull/7", "pr", Some(7));
+        assert!(db.cancel_run_because(&done, "x").unwrap());
+        let mut found = db.active_pr_runs(&repo.id, 7).unwrap();
+        found.sort();
+        let mut want = vec![pr, retest];
+        want.sort();
+        assert_eq!(found, want);
+    }
+
+    #[test]
+    fn a_group_pinned_to_an_arch_goes_only_to_a_worker_with_it() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = db
+            .insert_run(&repo.id, "sha", None, None, 0, "test", false, None, false)
+            .unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let arm = db
+            .insert_locked_group(&run, "b@aarch64", "linux", "aarch64", &[], &task, None)
+            .unwrap();
+        let worker = |arch: &str| WorkerInfo {
+            name: arch.into(),
+            os: "linux".into(),
+            arch: arch.into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+            protocol: crate::model::PROTOCOL,
+        };
+        assert!(db.claim_group(&worker("x86_64")).unwrap().0.is_none());
+        let job = db
+            .claim_group(&worker("arm64"))
+            .unwrap()
+            .0
+            .expect("arm64 is aarch64");
+        assert_eq!(job.group_id, arm);
+    }
+
+    #[test]
+    fn a_run_that_fans_out_shares_workers_with_later_runs() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let run = |trigger: &str| {
+            db.insert_run(&repo.id, "sha", None, None, 0, trigger, false, None, false)
+                .unwrap()
+        };
+        let big = run("local");
+        let big_groups: Vec<String> = (0..4)
+            .map(|i| {
+                db.insert_group(&big, &format!("g{i}"), "linux", &[], &task)
+                    .unwrap()
+            })
+            .collect();
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+            protocol: crate::model::PROTOCOL,
+        };
+        let claim = || db.claim_group(&worker).unwrap().0.unwrap().group_id;
+        assert_eq!(claim(), big_groups[0]);
+        // Another agent's one-group run, queued behind the big run's other
+        // three groups, goes next; a merge queue run still goes before both.
+        let small = run("local");
+        let small_group = db.insert_group(&small, "s", "linux", &[], &task).unwrap();
+        let queue = run("queue");
+        let queue_group = db.insert_group(&queue, "q", "linux", &[], &task).unwrap();
+        assert_eq!(claim(), queue_group);
+        // Merge queue runs stay oldest first: a lane's next candidate waits
+        // for the earlier one's groups, even with one of them running.
+        let queue_2 = db.insert_group(&queue, "q2", "linux", &[], &task).unwrap();
+        let later_queue = run("queue");
+        let later_queue_group = db
+            .insert_group(&later_queue, "q", "linux", &[], &task)
+            .unwrap();
+        assert_eq!(claim(), queue_2);
+        assert_eq!(claim(), later_queue_group);
+        assert_eq!(claim(), small_group);
+        // Then the big run's groups, oldest first.
+        assert_eq!(claim(), big_groups[1]);
+        assert_eq!(claim(), big_groups[2]);
+    }
+
+    #[test]
+    fn groups_sharing_a_lock_run_one_at_a_time() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let mut ids = vec![];
+        for _ in 0..2 {
+            let run = db
+                .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
+                .unwrap();
+            let g = db
+                .insert_locked_group(&run, "it", "linux", "any", &[], &task, Some("r:staging-db"))
+                .unwrap();
+            db.set_run_planned(&run).unwrap();
+            ids.push(g);
+        }
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+            protocol: crate::model::PROTOCOL,
+        };
+        let first = db.claim_group(&worker).unwrap().0.unwrap();
+        assert_eq!(first.group_id, ids[0]);
+        assert!(
+            db.claim_group(&worker).unwrap().0.is_none(),
+            "the lock is held"
+        );
+        let done = GroupResult {
+            status: Status::Passed,
+            message: None,
+            prepare_ms: 0,
+        };
+        assert!(db
+            .finish_group(&first.group_id, Some(&first.lease), &done)
+            .unwrap());
+        let second = db.claim_group(&worker).unwrap().0.unwrap();
+        assert_eq!(second.group_id, ids[1]);
+
+        // Cancelling a holder does not free the lock at once: its worker
+        // is still stopping the tasks.
+        let run = db
+            .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
+            .unwrap();
+        let third = db
+            .insert_locked_group(&run, "it", "linux", "any", &[], &task, Some("r:staging-db"))
+            .unwrap();
+        assert!(db.cancel_run_because(&second.run_id, "cancelled").unwrap());
+        assert!(db.claim_group(&worker).unwrap().0.is_none(), "still held");
+        db.conn
+            .lock()
+            .execute("UPDATE groups_ SET lock_until = 0", [])
+            .unwrap();
+        assert_eq!(db.claim_group(&worker).unwrap().0.unwrap().group_id, third);
+    }
+
+    #[test]
+    fn an_older_run_cannot_overwrite_a_newer_notify_state() {
+        let db = Db::memory().unwrap();
+        db.record_notify_state("k", "passed", 200).unwrap();
+        db.record_notify_state("k", "failed", 100).unwrap();
+        assert_eq!(db.notify_state("k").unwrap(), Some(("passed".into(), 200)));
+        db.record_notify_state("k", "failed", 300).unwrap();
+        assert_eq!(db.notify_state("k").unwrap(), Some(("failed".into(), 300)));
+    }
+
+    #[test]
+    fn left_out_copies_defer_to_reported_real_groups_only() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let results = vec![TaskResult {
+            status: Status::Passed,
+            exit_code: Some(0),
+            action_key: None,
+            duration_ms: 0,
+            log_digest: None,
+            message: None,
+        }];
+        let left = db
+            .insert_run(
+                &repo.id,
+                "x",
+                Some("feature"),
+                None,
+                0,
+                "push",
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        db.set_run_kinds(&left, &["push"]).unwrap();
+        // A local run with uncommitted changes is never reported: it does not count.
+        let local = db
+            .insert_run(
+                &repo.id,
+                "x",
+                None,
+                Some("ov"),
+                1,
+                "local",
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        db.insert_finished_group(&local, "lint", "any", &task, &results, Some("w"), "")
+            .unwrap();
+        assert!(!db
+            .real_group_on_commit(&repo.id, "x", "lint", &left)
+            .unwrap());
+        let pr = db
+            .insert_run(
+                &repo.id,
+                "x",
+                Some("pull/1"),
+                None,
+                0,
+                "pr",
+                false,
+                Some(1),
+                false,
+            )
+            .unwrap();
+        db.set_run_kinds(&pr, &["pr"]).unwrap();
+        db.insert_finished_group(&pr, "lint", "any", &task, &results, Some("w"), "")
+            .unwrap();
+        assert!(db
+            .real_group_on_commit(&repo.id, "x", "lint", &left)
+            .unwrap());
+        // "Re-run all checks" counts as every kind the commit ran as.
+        let mut kinds = db.commit_kinds(&repo.id, "x").unwrap();
+        kinds.sort();
+        assert_eq!(kinds, ["pr", "push"]);
+    }
+
+    #[test]
+    fn artifacts_of_recent_runs_survive_cas_gc() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = db
+            .insert_run(&repo.id, "x", None, None, 0, "local", false, None, false)
+            .unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let g = db
+            .insert_locked_group(&run, "g", "any", "any", &[], &task, None)
+            .unwrap();
+        let files = vec![Artifact {
+            path: "report/a.png".into(),
+            digest: "d1".into(),
+            size: 1,
+        }];
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE tasks SET artifacts = ?2 WHERE group_id = ?1",
+                params![g, serde_json::to_string(&files).unwrap()],
+            )
+            .unwrap();
+        let (keep, _) = db.referenced_blobs(0, 0).unwrap();
+        assert!(keep.contains("d1"));
+        assert_eq!(
+            db.view_task_artifact_for_test(&g)
+                .unwrap()
+                .map(|a| a.digest),
+            Some("d1".into())
+        );
+    }
+
+    #[test]
+    fn retest_picks_the_pull_requests_own_commit() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        db.insert_run(
+            &repo.id,
+            "head",
+            Some("pull/9"),
+            None,
+            0,
+            "pr",
+            false,
+            Some(9),
+            false,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Queued later: a candidate merge commit, also tagged with the PR.
+        db.insert_run(
+            &repo.id,
+            "candidate",
+            Some("queue/pr/9"),
+            None,
+            0,
+            "queue",
+            false,
+            Some(9),
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.latest_pr_run(&repo.id, 9).unwrap().unwrap().sha, "head");
+    }
+
+    #[test]
+    fn a_released_group_is_queued_again_at_once() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = db
+            .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
+            .unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let g = db.insert_group(&run, "g", "linux", &[], &task).unwrap();
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+            protocol: crate::model::PROTOCOL,
+        };
+        let job = db.claim_group(&worker).unwrap().0.unwrap();
+        assert!(!db.requeue_group(&g, "not-the-lease").unwrap());
+        assert!(db.requeue_group(&g, &job.lease).unwrap());
+        // The old lease is dead; the group can be claimed again right away.
+        assert!(!db.heartbeat_group(&g, Some(&job.lease)).unwrap());
+        assert_eq!(db.claim_group(&worker).unwrap().0.unwrap().group_id, g);
+    }
+
+    #[test]
+    fn merge_queue_runs_are_claimed_before_older_runs() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let mut groups = vec![];
+        for (trigger, trusted) in [
+            ("pr", false),
+            ("local", false),
+            ("push", true),
+            ("queue", true),
+        ] {
+            let run = db
+                .insert_run(
+                    &repo.id, "sha", None, None, 0, trigger, false, None, trusted,
+                )
+                .unwrap();
+            groups.push(db.insert_group(&run, "g", "linux", &[], &task).unwrap());
+        }
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+            protocol: crate::model::PROTOCOL,
+        };
+        let order: Vec<String> = (0..4)
+            .map(|_| db.claim_group(&worker).unwrap().0.unwrap().group_id)
+            .collect();
+        // Queue, then main, then the rest oldest first.
+        assert_eq!(
+            order,
+            [
+                groups[3].clone(),
+                groups[2].clone(),
+                groups[0].clone(),
+                groups[1].clone()
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod repo_identity_tests {
+    use super::*;
+
+    #[test]
+    fn same_name_different_url_is_a_different_repo() {
+        let db = Db::memory().unwrap();
+        let a = db
+            .upsert_repo("work", Some("/tmp/a/origin.git"), None)
+            .unwrap();
+        let b = db
+            .upsert_repo("work", Some("/tmp/b/origin.git"), None)
+            .unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(
+            a.url, "/tmp/a/origin.git",
+            "first repo's URL must not be overwritten"
+        );
+        assert!(b.name.starts_with("work-"));
+        // The same URL finds the same repo again, whatever name it is given.
+        assert_eq!(
+            db.upsert_repo("work", Some("/tmp/b/origin.git"), None)
+                .unwrap()
+                .id,
+            b.id
+        );
+        assert_eq!(db.repo("/tmp/b/origin.git").unwrap().id, b.id);
+        // Without a URL, the name is enough.
+        assert_eq!(db.upsert_repo("work", None, None).unwrap().id, a.id);
+    }
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+
+    fn worker(name: &str) -> WorkerInfo {
+        WorkerInfo {
+            name: name.into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+            protocol: crate::model::PROTOCOL,
+        }
+    }
+
+    #[test]
+    fn a_group_waits_briefly_for_its_warm_worker() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        // `warm` ran this group last.
+        let (warm, cold) = (worker("warm"), worker("cold"));
+        db.touch_worker(&warm).unwrap();
+        db.touch_worker(&cold).unwrap();
+        let run1 = db
+            .insert_run(&repo.id, "a", None, None, 0, "t", false, None, false)
+            .unwrap();
+        db.insert_group(&run1, "ci", "linux", &[], &task).unwrap();
+        let job = db.claim_group(&warm).unwrap().0.unwrap();
+        let done = GroupResult {
+            status: Status::Passed,
+            message: None,
+            prepare_ms: 0,
+        };
+        assert!(db
+            .finish_group(&job.group_id, Some(&job.lease), &done)
+            .unwrap());
+
+        // The next run of that group is held for `warm`...
+        let run2 = db
+            .insert_run(&repo.id, "b", None, None, 0, "t", false, None, false)
+            .unwrap();
+        db.insert_group(&run2, "ci", "linux", &[], &task).unwrap();
+        let (job, held) = db.claim_group(&cold).unwrap();
+        assert!(
+            job.is_none() && held,
+            "a cold worker took a group its warm worker could run"
+        );
+        // ...which gets it.
+        assert_eq!(db.claim_group(&warm).unwrap().0.unwrap().run_id, run2);
+
+        // Once the hold expires, any worker may take it.
+        let run3 = db
+            .insert_run(&repo.id, "c", None, None, 0, "t", false, None, false)
+            .unwrap();
+        db.insert_group(&run3, "ci", "linux", &[], &task).unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE groups_ SET created_at = created_at - ?1 WHERE run_id = ?2",
+                params![AFFINITY_MS + 1, run3],
+            )
+            .unwrap();
+        assert_eq!(db.claim_group(&cold).unwrap().0.unwrap().run_id, run3);
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn a_schedule_slot_fires_once() {
+        let db = Db::memory().unwrap();
+        assert!(db.claim_schedule_slot("r:nightly", 100).unwrap());
+        assert!(!db.claim_schedule_slot("r:nightly", 100).unwrap());
+        assert!(!db.claim_schedule_slot("r:nightly", 99).unwrap());
+        assert!(db.claim_schedule_slot("r:nightly", 101).unwrap());
+        assert!(db.claim_schedule_slot("other:nightly", 100).unwrap());
+    }
+
+    #[test]
+    fn untrusted_results_are_never_served_to_trusted_runs() {
+        let db = Db::memory().unwrap();
+        let entry = |ms| CacheEntry {
+            log_digest: None,
+            outputs: vec![],
+            duration_ms: ms,
+            inputs: None,
+        };
+        let trusted = CacheScope {
+            trusted: true,
+            repo: None,
+        };
+        // A branch caches a result under the key main will compute.
+        assert_eq!(
+            db.cache_put("k", &CacheScope::UNTRUSTED, &entry(1))
+                .unwrap(),
+            "u:k"
+        );
+        assert_eq!(db.cache_find("k", &trusted).unwrap(), None);
+        assert_eq!(
+            db.cache_find("k", &CacheScope::UNTRUSTED)
+                .unwrap()
+                .as_deref(),
+            Some("u:k")
+        );
+        // Main's own result is shared with everyone and preferred.
+        assert_eq!(db.cache_put("k", &trusted, &entry(2)).unwrap(), "k");
+        assert_eq!(db.cache_find("k", &trusted).unwrap().as_deref(), Some("k"));
+        assert_eq!(
+            db.cache_find("k", &CacheScope::UNTRUSTED)
+                .unwrap()
+                .as_deref(),
+            Some("k")
+        );
+        // A lease no running group holds proves nothing.
+        assert_eq!(db.lease_trust("forged").unwrap(), None);
+
+        // A repo with its own trusted namespace (P66): its trusted runs
+        // write there, and read the shared trusted results but never a
+        // branch's; nobody else reads its namespace.
+        let own = |trusted| CacheScope {
+            trusted,
+            repo: Some("repo_a".into()),
+        };
+        assert_eq!(
+            db.cache_put("j", &CacheScope::UNTRUSTED, &entry(1))
+                .unwrap(),
+            "u:j"
+        );
+        assert_eq!(db.cache_find("j", &own(true)).unwrap(), None);
+        assert_eq!(
+            db.cache_put("j", &own(true), &entry(2)).unwrap(),
+            "r:repo_a:j"
+        );
+        assert_eq!(
+            db.cache_find("j", &own(true)).unwrap().as_deref(),
+            Some("r:repo_a:j")
+        );
+        assert_eq!(
+            db.cache_find("j", &own(false)).unwrap().as_deref(),
+            Some("r:repo_a:j")
+        );
+        assert_eq!(db.cache_find("j", &trusted).unwrap(), None);
+        assert_eq!(
+            db.cache_find("j", &CacheScope::UNTRUSTED)
+                .unwrap()
+                .as_deref(),
+            Some("u:j")
+        );
+        assert_eq!(
+            db.cache_find("k", &own(true)).unwrap().as_deref(),
+            Some("k")
+        );
+    }
+
+    #[test]
+    fn shared_trusted_results_are_demoted_once() {
+        let db = Db::memory().unwrap();
+        let entry = CacheEntry {
+            log_digest: None,
+            outputs: vec![],
+            duration_ms: 1,
+            inputs: None,
+        };
+        let shared = CacheScope {
+            trusted: true,
+            repo: None,
+        };
+        db.cache_put("a", &shared, &entry).unwrap();
+        db.cache_put("b", &shared, &entry).unwrap();
+        db.cache_put("b", &CacheScope::UNTRUSTED, &entry).unwrap();
+        db.kv_put("last", "scope", "a").unwrap();
+        // Planted before per-repo namespaces existed, by naming the row.
+        db.cache_put("r:repo_z:d", &shared, &entry).unwrap();
+        assert!(db.demote_shared_trusted_results_once().unwrap());
+        let own_z = CacheScope {
+            trusted: true,
+            repo: Some("repo_z".into()),
+        };
+        assert_eq!(db.cache_find("d", &own_z).unwrap(), None);
+        assert_eq!(db.cache_find("a", &shared).unwrap(), None);
+        assert_eq!(db.cache_find("b", &shared).unwrap(), None);
+        assert_eq!(
+            db.cache_find("a", &CacheScope::UNTRUSTED)
+                .unwrap()
+                .as_deref(),
+            Some("u:a")
+        );
+        assert_eq!(db.kv_get("last", "scope").unwrap().as_deref(), Some("u:a"));
+        // Once: results stored after it stay trusted.
+        db.cache_put("c", &shared, &entry).unwrap();
+        assert!(!db.demote_shared_trusted_results_once().unwrap());
+        assert_eq!(db.cache_find("c", &shared).unwrap().as_deref(), Some("c"));
+        // A tokenless spell, then shared again: demoted again.
+        db.forget_shared_trusted_demotion().unwrap();
+        assert!(db.demote_shared_trusted_results_once().unwrap());
+        assert_eq!(db.cache_find("c", &shared).unwrap(), None);
+    }
+
+    #[test]
+    fn a_database_gives_freed_space_back_to_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pit.db");
+        // A database from before: no auto-vacuum, 5 MB written then deleted.
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE junk (v BLOB);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                   INSERT INTO junk SELECT zeroblob(1000) FROM n;
+                 DELETE FROM junk;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        }
+        let size = || std::fs::metadata(&path).unwrap().len();
+        assert!(size() > 4_000_000, "{}", size());
+        let db = Db::open(&path).unwrap();
+        assert!(size() < 1_000_000, "the rewrite left {} bytes", size());
+        // From then on, rows deleted later are given back by `reclaim_space`.
+        db.conn
+            .lock()
+            .execute_batch(
+                "CREATE TABLE junk2 (v BLOB);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+                   INSERT INTO junk2 SELECT zeroblob(1000) FROM n;
+                 DELETE FROM junk2;",
+            )
+            .unwrap();
+        assert!(db.reclaim_space().unwrap() > 4_000_000);
+        assert!(size() < 1_000_000, "reclaim left {} bytes", size());
+    }
+
+    #[test]
+    fn old_finished_runs_are_pruned_with_everything_under_them() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let run = |status: &str, created: i64| {
+            let id = db
+                .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
+                .unwrap();
+            db.insert_group(&id, "g", "linux", &[], &task).unwrap();
+            db.conn
+                .lock()
+                .execute(
+                    "UPDATE runs SET status = ?2, created_at = ?3 WHERE id = ?1",
+                    params![id, status, created],
+                )
+                .unwrap();
+            id
+        };
+        let old = run("passed", 1_000);
+        let old_running = run("running", 1_000);
+        let recent = run("failed", 10_000);
+        {
+            let c = db.conn.lock();
+            let t: String = c
+                .query_row(
+                    "SELECT id FROM tasks WHERE run_id = ?1",
+                    params![old],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            c.execute(
+                "INSERT INTO task_logs (task_id, seq, text) VALUES (?1, 1, 'x')",
+                params![t],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.prune_runs(5_000).unwrap(), 1);
+        let count = |table: &str, run: &str| -> i64 {
+            db.conn
+                .lock()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE run_id = ?1"),
+                    params![run],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        for table in ["groups_", "tasks"] {
+            assert_eq!(count(table, &old), 0, "{table}");
+            assert_eq!(count(table, &old_running), 1, "{table}");
+            assert_eq!(count(table, &recent), 1, "{table}");
+        }
+        let logs: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM task_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(logs, 0);
+        assert!(db.run(&old).is_err());
+        assert!(db.run(&recent).is_ok());
+        assert_eq!(db.prune_runs(5_000).unwrap(), 0);
+    }
+
+    #[test]
+    fn kv_put_max_keeps_the_larger() {
+        let db = Db::memory().unwrap();
+        db.kv_put_max("shard-check", "k", 105).unwrap();
+        db.kv_put_max("shard-check", "k", 104).unwrap();
+        assert_eq!(
+            db.kv_get("shard-check", "k").unwrap().as_deref(),
+            Some("105")
+        );
+        db.kv_put_max("shard-check", "k", 1000).unwrap();
+        assert_eq!(
+            db.kv_get("shard-check", "k").unwrap().as_deref(),
+            Some("1000")
+        );
+    }
+
+    #[test]
+    fn time_saved_survives_eviction() {
+        let db = Db::memory().unwrap();
+        db.cache_put(
+            "k",
+            &CacheScope {
+                trusted: true,
+                repo: None,
+            },
+            &CacheEntry {
+                log_digest: None,
+                outputs: vec![],
+                duration_ms: 90_000,
+                inputs: None,
+            },
+        )
+        .unwrap();
+        db.cache_get("k").unwrap().unwrap();
+        db.cache_get("k").unwrap().unwrap();
+        assert_eq!(db.evict_lru(10).unwrap(), 1);
+        let s = db.stats().unwrap();
+        assert_eq!(s["cacheHits"], 2);
+        assert_eq!(s["timeSavedMs"], 180_000);
     }
 }

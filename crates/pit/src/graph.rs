@@ -21,7 +21,26 @@ pub fn validate(config: &PitConfig) -> Result<()> {
                     );
                 }
             }
-            for pattern in task.inputs.iter().flatten().chain(&task.outputs) {
+            // A sharded task is spread over several groups, so nothing in
+            // its own group can wait for all of its shards.
+            if task.shards.unwrap_or(1) > 1 {
+                if let Some((other, _)) = group.tasks.iter().find(|(_, t)| t.deps.contains(tname)) {
+                    bail!(
+                        "task {gname}.{other} depends on {tname}, which is sharded; \
+                         tasks cannot depend on a sharded task"
+                    );
+                }
+            }
+            if task.shards == Some(0) {
+                bail!("task {gname}.{tname}: shards must be at least 1");
+            }
+            for pattern in task
+                .inputs
+                .iter()
+                .flatten()
+                .chain(&task.outputs)
+                .chain(&task.artifacts)
+            {
                 Glob::new(pattern.strip_prefix('!').unwrap_or(pattern)).map_err(|e| {
                     anyhow::anyhow!("task {gname}.{tname}: bad glob {pattern:?}: {e}")
                 })?;
@@ -74,16 +93,40 @@ pub fn topo_order(tasks: &BTreeMap<String, TaskDef>) -> Result<Vec<String>> {
 pub struct PlannedGroup {
     pub name: String,
     pub os: String,
+    /// `any`, or the CPU architecture a worker must have.
+    pub arch: String,
     /// Task name and definition, in dependency order.
     pub tasks: Vec<(String, TaskDef)>,
+    /// See `GroupDef::lock`.
+    pub lock: Option<String>,
+    /// Why the group is not run in this kind of run (`GroupDef::on`). It is
+    /// still recorded, so its check reports and a required one never waits.
+    pub not_in: Option<String>,
 }
 
 /// Expands the config into schedulable groups. `selected` filters tasks by
 /// name (`task` or `group.task`); their deps are always included.
 pub fn plan(config: &PitConfig, selected: &[String]) -> Result<Vec<PlannedGroup>> {
+    plan_for(config, selected, &[])
+}
+
+/// The kinds of run a group's `on` can name.
+pub const RUN_KINDS: &[&str] = &["pr", "push", "main", "queue", "schedule", "local"];
+
+/// `plan` for a run of these kinds (see `GroupDef::on`); groups that do
+/// not run in any of them are left out. No kinds means no filtering.
+pub fn plan_for(
+    config: &PitConfig,
+    selected: &[String],
+    kinds: &[&str],
+) -> Result<Vec<PlannedGroup>> {
     let mut groups = Vec::new();
     let mut matched: BTreeSet<&str> = BTreeSet::new();
     for (gname, group) in &config.groups {
+        let not_in = (!kinds.is_empty()
+            && !group.on.is_empty()
+            && !group.on.iter().any(|o| kinds.contains(&o.as_str())))
+        .then(|| format!("runs only in {} runs (`on`)", group.on.join(", ")));
         let mut keep: BTreeSet<String> = BTreeSet::new();
         if selected.is_empty() {
             keep.extend(group.tasks.keys().cloned());
@@ -109,23 +152,111 @@ pub fn plan(config: &PitConfig, selected: &[String]) -> Result<Vec<PlannedGroup>
             .filter(|t| keep.contains(t))
             .map(|t| (t.clone(), group.tasks[&t].clone()))
             .collect();
+        let any = vec!["any".to_string()];
+        let archs = if group.arch.is_empty() {
+            &any
+        } else {
+            &group.arch
+        };
         for os in &group.os {
-            let name = if group.os.len() > 1 {
-                format!("{gname}@{os}")
-            } else {
-                gname.clone()
-            };
-            groups.push(PlannedGroup {
-                name,
-                os: os.clone(),
-                tasks: tasks.clone(),
-            });
+            for arch in archs {
+                // One instance per entry: `build@macos`, `build@aarch64`,
+                // `build@linux-aarch64`.
+                let mut tags = Vec::new();
+                if group.os.len() > 1 {
+                    tags.push(os.as_str());
+                }
+                if archs.len() > 1 {
+                    tags.push(arch.as_str());
+                }
+                let name = if tags.is_empty() {
+                    gname.clone()
+                } else {
+                    format!("{gname}@{}", tags.join("-"))
+                };
+                groups.extend(
+                    shard_groups(&name, os, &tasks)
+                        .into_iter()
+                        .map(|g| PlannedGroup {
+                            arch: arch.clone(),
+                            lock: group.lock.clone(),
+                            not_in: not_in.clone(),
+                            ..g
+                        }),
+                );
+            }
         }
     }
     if let Some(missing) = selected.iter().find(|s| !matched.contains(s.as_str())) {
         bail!("no task named {missing:?} in the pit config");
     }
     Ok(groups)
+}
+
+/// Expands a group with sharded tasks into one group per shard (`ci#1`,
+/// `ci#2`, ...). Each shard group gets the shard of every sharded task plus
+/// their deps (setup is repeated per shard, and shared through the cache);
+/// the group's other tasks go into the first shard.
+fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<PlannedGroup> {
+    let count = tasks
+        .iter()
+        .map(|(_, t)| t.shards.unwrap_or(1))
+        .max()
+        .unwrap_or(1);
+    if count <= 1 {
+        return vec![PlannedGroup {
+            name: name.to_string(),
+            os: os.to_string(),
+            arch: "any".into(),
+            tasks: tasks.to_vec(),
+            lock: None,
+            not_in: None,
+        }];
+    }
+    let by_name: BTreeMap<String, TaskDef> = tasks.iter().cloned().collect();
+    let sharded: Vec<&(String, TaskDef)> = tasks
+        .iter()
+        .filter(|(_, t)| t.shards.unwrap_or(1) > 1)
+        .collect();
+    let mut setup = BTreeSet::new();
+    for (_, t) in &sharded {
+        for d in &t.deps {
+            add_with_deps(d, &by_name, &mut setup);
+        }
+    }
+    (1..=count)
+        .map(|k| {
+            let tasks = tasks
+                .iter()
+                .filter_map(|(n, t)| {
+                    let shards = t.shards.unwrap_or(1);
+                    if shards > 1 {
+                        (k <= shards).then(|| {
+                            (
+                                n.clone(),
+                                TaskDef {
+                                    shard: Some(k),
+                                    ..t.clone()
+                                },
+                            )
+                        })
+                    } else if setup.contains(n) || k == 1 {
+                        Some((n.clone(), t.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            PlannedGroup {
+                name: format!("{name}#{k}"),
+                os: os.to_string(),
+                arch: "any".into(),
+                tasks,
+                lock: None,
+                not_in: None,
+            }
+        })
+        .collect()
 }
 
 fn add_with_deps(name: &str, tasks: &BTreeMap<String, TaskDef>, keep: &mut BTreeSet<String>) {
@@ -217,17 +348,9 @@ pub fn affected(config: &PitConfig, changed: &[String]) -> Result<BTreeSet<Strin
     Ok(out)
 }
 
-/// Identity of one input file: a git blob oid for tracked files, or a BLAKE3
-/// digest for overlay files.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-pub struct InputFile<'a> {
-    pub path: &'a str,
-    pub id: &'a str,
-}
-
+/// Everything about a task except its input files and deps.
 #[derive(Serialize)]
-struct KeyMaterial<'a> {
-    v: u32,
+struct ConfigMaterial<'a> {
     run: &'a str,
     os: &'a str,
     arch: &'a str,
@@ -237,24 +360,88 @@ struct KeyMaterial<'a> {
     image: Option<&'a str>,
     network: Option<bool>,
     timeout: Option<u64>,
+    shard: Option<(u32, u32)>,
     env: Vec<(&'a str, String)>,
-    deps: Vec<&'a str>,
-    files: Vec<InputFile<'a>>,
+    /// Names only: secret values never enter the key.
+    secrets: &'a [String],
+    /// The files a shard was dealt: a different split is a different job.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    shard_assigned: &'a [String],
 }
 
-/// The action key: a hash of everything that can change a task's result.
-pub fn action_key(
+/// What an action key is made of, kept so a cache miss can say what changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct KeyInputs {
+    pub v: u32,
+    /// Digest of the task definition, OS, arch and env values.
+    pub config: String,
+    /// Action keys of the task's deps, sorted.
+    pub deps: Vec<String>,
+    /// Matching input files as (path, git blob id or overlay digest), sorted.
+    pub files: Vec<(String, String)>,
+    /// Output of the task's `runtime` commands on the worker that ran it.
+    /// Left out when empty, so keys of tasks without `runtime` do not change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime: Vec<(String, String)>,
+}
+
+impl KeyInputs {
+    /// The action key: a hash of everything that can change a task's result.
+    pub fn key(&self) -> String {
+        crate::cas::digest(&serde_json::to_vec(self).unwrap_or_default())
+    }
+}
+
+/// Like `key_inputs`, with the outputs of the task's `runtime` commands.
+pub fn key_inputs_with_runtime(
     task: &TaskDef,
     os: &str,
     files: &[(String, String)],
     dep_keys: &[String],
-) -> Result<String> {
+    runtime: &std::collections::HashMap<String, String>,
+) -> Result<KeyInputs> {
+    let mut inputs = key_inputs(task, os, files, dep_keys)?;
+    inputs.runtime = task
+        .runtime
+        .iter()
+        .map(|cmd| {
+            (
+                cmd.clone(),
+                runtime
+                    .get(cmd)
+                    .cloned()
+                    .unwrap_or_else(|| "<not measured>".into()),
+            )
+        })
+        .collect();
+    // Measured by the worker without being asked: the image a container
+    // task really ran in (see `worker::Worker::measure_runtime`).
+    let mut implicit: Vec<(String, String)> = runtime
+        .iter()
+        .filter(|(k, _)| k.starts_with(IMAGE_INPUT))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    implicit.sort();
+    inputs.runtime.extend(implicit);
+    Ok(inputs)
+}
+
+/// Runtime input naming a container image; its value is the local image ID,
+/// so a moved tag (`node:22`) never reuses results built with the old one.
+pub const IMAGE_INPUT: &str = "docker image ";
+
+pub fn key_inputs(
+    task: &TaskDef,
+    os: &str,
+    files: &[(String, String)],
+    dep_keys: &[String],
+) -> Result<KeyInputs> {
     let inputs = input_globs(task);
     let set = InputMatcher::new(&inputs)?;
-    let mut matched: Vec<InputFile> = files
+    let mut matched: Vec<(String, String)> = files
         .iter()
         .filter(|(p, _)| set.is_match(p))
-        .map(|(p, id)| InputFile { path: p, id })
+        .cloned()
         .collect();
     matched.sort();
     let mut env: Vec<(&str, String)> = task
@@ -263,10 +450,9 @@ pub fn action_key(
         .map(|k| (k.as_str(), std::env::var(k).unwrap_or_default()))
         .collect();
     env.sort();
-    let mut deps: Vec<&str> = dep_keys.iter().map(String::as_str).collect();
+    let mut deps = dep_keys.to_vec();
     deps.sort();
-    let material = KeyMaterial {
-        v: 2,
+    let config = ConfigMaterial {
         run: &task.run,
         os,
         arch: std::env::consts::ARCH,
@@ -276,11 +462,97 @@ pub fn action_key(
         image: task.image.as_deref(),
         network: task.network,
         timeout: task.timeout,
+        shard: task.shard.map(|k| (k, task.shards.unwrap_or(1))),
         env,
+        secrets: &task.secrets,
+        shard_assigned: &task.shard_assigned,
+    };
+    Ok(KeyInputs {
+        // 4: tasks run with `-e` and pipefail, so a result that passed
+        // without them may not pass now. 5: tasks run in UTC (and C.UTF-8 on
+        // Linux), so a result from a worker in another zone may not hold.
+        // 6: checkouts ignore the worker's line-ending config, so a result
+        // built from a CRLF checkout may not hold.
+        v: 6,
+        config: crate::cas::digest(&serde_json::to_vec(&config)?),
         deps,
         files: matched,
-    };
-    Ok(crate::cas::digest(&serde_json::to_vec(&material)?))
+        runtime: vec![],
+    })
+}
+
+/// The action key: a hash of everything that can change a task's result.
+pub fn action_key(
+    task: &TaskDef,
+    os: &str,
+    files: &[(String, String)],
+    dep_keys: &[String],
+) -> Result<String> {
+    Ok(key_inputs(task, os, files, dep_keys)?.key())
+}
+
+/// Why a task's key differs from its previous cached run, in a few words:
+/// `"src/a.ts changed; build changed"`. `deps` names the current dep keys.
+pub fn explain_miss(prev: &KeyInputs, cur: &KeyInputs, deps: &[(String, String)]) -> String {
+    let mut reasons = Vec::new();
+    let before_rt: BTreeMap<&str, &str> = prev
+        .runtime
+        .iter()
+        .map(|(c, o)| (c.as_str(), o.as_str()))
+        .collect();
+    for (cmd, out) in &cur.runtime {
+        match before_rt.get(cmd.as_str()) {
+            Some(old) if old != out => reasons.push(format!("`{cmd}` changed ({old} → {out})")),
+            Some(_) => {}
+            None => reasons.push(format!("`{cmd}` is now part of the key ({out})")),
+        }
+    }
+    if prev.config != cur.config {
+        reasons.push("task definition or environment changed".to_string());
+    }
+    let before: std::collections::BTreeMap<&str, &str> = prev
+        .files
+        .iter()
+        .map(|(p, i)| (p.as_str(), i.as_str()))
+        .collect();
+    let after: std::collections::BTreeMap<&str, &str> = cur
+        .files
+        .iter()
+        .map(|(p, i)| (p.as_str(), i.as_str()))
+        .collect();
+    let mut changed: Vec<String> = Vec::new();
+    for (path, id) in &after {
+        match before.get(path) {
+            None => changed.push(format!("{path} added")),
+            Some(old) if old != id => changed.push(format!("{path} changed")),
+            _ => {}
+        }
+    }
+    for path in before.keys().filter(|p| !after.contains_key(*p)) {
+        changed.push(format!("{path} removed"));
+    }
+    if !changed.is_empty() {
+        let shown = changed.len().min(3);
+        let mut text = changed[..shown].join(", ");
+        if changed.len() > shown {
+            text.push_str(&format!(" and {} more file(s)", changed.len() - shown));
+        }
+        reasons.push(text);
+    }
+    let prev_deps: BTreeSet<&str> = prev.deps.iter().map(String::as_str).collect();
+    let changed_deps: Vec<&str> = deps
+        .iter()
+        .filter(|(_, k)| !prev_deps.contains(k.as_str()))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if !changed_deps.is_empty() {
+        reasons.push(format!("{} changed", changed_deps.join(", ")));
+    }
+    if reasons.is_empty() {
+        "inputs changed".to_string()
+    } else {
+        reasons.join("; ")
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +608,35 @@ mod tests {
     }
 
     #[test]
+    fn plans_one_group_per_arch_and_names_them_apart() {
+        let mut config = sample();
+        let ci = config.groups.get_mut("ci").unwrap();
+        ci.arch = vec!["x86_64".into(), "aarch64".into()];
+        let groups = plan(&config, &[]).unwrap();
+        let names: Vec<_> = groups
+            .iter()
+            .map(|g| (g.name.as_str(), g.arch.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("ci@linux-x86_64", "x86_64"),
+                ("ci@linux-aarch64", "aarch64"),
+                ("ci@windows-x86_64", "x86_64"),
+                ("ci@windows-aarch64", "aarch64"),
+            ]
+        );
+        let ci = config.groups.get_mut("ci").unwrap();
+        ci.os = vec!["linux".into()];
+        ci.arch = vec!["aarch64".into()];
+        let groups = plan(&config, &[]).unwrap();
+        assert_eq!(
+            (groups[0].name.as_str(), groups[0].arch.as_str()),
+            ("ci", "aarch64")
+        );
+    }
+
+    #[test]
     fn selecting_a_task_pulls_in_its_deps_only() {
         let groups = plan(&sample(), &["lint".into()]).unwrap();
         let names: Vec<_> = groups[0].tasks.iter().map(|(n, _)| n.clone()).collect();
@@ -352,6 +653,163 @@ mod tests {
         assert_eq!(a.len(), 3, "install change affects lint and build: {a:?}");
         assert!(affected(&c, &["README.md".into()]).unwrap().is_empty());
         assert_eq!(affected(&c, &["pit.config.ts".into()]).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn explains_why_a_task_missed_the_cache() {
+        let t = task("build", &[], Some(&["src/**", "tsconfig.json"]));
+        let files = |v: &[(&str, &str)]| {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let before = key_inputs(
+            &t,
+            "linux",
+            &files(&[("src/a.ts", "1"), ("tsconfig.json", "1")]),
+            &[],
+        )
+        .unwrap();
+        let after = key_inputs(
+            &t,
+            "linux",
+            &files(&[("src/a.ts", "1"), ("tsconfig.json", "2"), ("src/b.ts", "1")]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            explain_miss(&before, &after, &[]),
+            "src/b.ts added, tsconfig.json changed"
+        );
+        let test = task("test", &["build"], Some(&["test/**"]));
+        let a = key_inputs(&test, "linux", &[], &[before.key()]).unwrap();
+        let b = key_inputs(&test, "linux", &[], &[after.key()]).unwrap();
+        assert_eq!(
+            explain_miss(&a, &b, &[("build".into(), after.key())]),
+            "build changed"
+        );
+        let edited = task("build --prod", &[], Some(&["src/**", "tsconfig.json"]));
+        let c = key_inputs(
+            &edited,
+            "linux",
+            &files(&[("src/a.ts", "1"), ("tsconfig.json", "1")]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            explain_miss(&before, &c, &[]),
+            "task definition or environment changed"
+        );
+        assert_eq!(
+            before.key(),
+            action_key(
+                &t,
+                "linux",
+                &files(&[("src/a.ts", "1"), ("tsconfig.json", "1")]),
+                &[]
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn sharded_tasks_split_into_groups_with_their_setup() {
+        let mut tasks = BTreeMap::new();
+        tasks.insert("install".into(), task("i", &[], None));
+        tasks.insert("lint".into(), task("l", &["install"], None));
+        let mut test = task("t", &["install"], None);
+        test.shards = Some(3);
+        tasks.insert("test".into(), test);
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "ci".into(),
+            GroupDef {
+                os: vec!["linux".into()],
+                tasks,
+                ..Default::default()
+            },
+        );
+        let config = PitConfig {
+            groups,
+            ..Default::default()
+        };
+        let planned = plan(&config, &[]).unwrap();
+        let names: Vec<_> = planned.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["ci#1", "ci#2", "ci#3"]);
+        let tasks_of = |i: usize| {
+            planned[i]
+                .tasks
+                .iter()
+                .map(|(n, t)| (n.as_str(), t.shard))
+                .collect::<Vec<_>>()
+        };
+        // Setup in every shard, lint once, each shard its own index.
+        assert_eq!(
+            tasks_of(0),
+            vec![("install", None), ("lint", None), ("test", Some(1))]
+        );
+        assert_eq!(tasks_of(2), vec![("install", None), ("test", Some(3))]);
+        // Shards never share a cache key.
+        let key =
+            |i: usize| action_key(&planned[i].tasks.last().unwrap().1, "linux", &[], &[]).unwrap();
+        assert_ne!(key(0), key(1));
+        // Nothing may depend on a sharded task.
+        let mut bad = config.clone();
+        bad.groups
+            .get_mut("ci")
+            .unwrap()
+            .tasks
+            .get_mut("lint")
+            .unwrap()
+            .deps
+            .push("test".into());
+        assert!(validate(&bad).unwrap_err().to_string().contains("sharded"));
+    }
+
+    #[test]
+    fn runtime_outputs_are_part_of_the_key() {
+        let mut t = task("build", &[], Some(&["src/**"]));
+        t.runtime = vec!["node --version".into()];
+        let rt = |v: &str| {
+            std::collections::HashMap::from([("node --version".to_string(), v.to_string())])
+        };
+        let a = key_inputs_with_runtime(&t, "linux", &[], &[], &rt("v22.11.0")).unwrap();
+        let b = key_inputs_with_runtime(&t, "linux", &[], &[], &rt("v24.3.0")).unwrap();
+        assert_ne!(a.key(), b.key());
+        assert_eq!(
+            explain_miss(&a, &b, &[]),
+            "`node --version` changed (v22.11.0 → v24.3.0)"
+        );
+        // Tasks without `runtime` keep their keys.
+        let plain = task("build", &[], Some(&["src/**"]));
+        assert_eq!(
+            key_inputs_with_runtime(&plain, "linux", &[], &[], &rt("x"))
+                .unwrap()
+                .key(),
+            action_key(&plain, "linux", &[], &[]).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_moved_image_tag_changes_the_key() {
+        let task = TaskDef {
+            run: "npm test".into(),
+            image: Some("node:22".into()),
+            ..Default::default()
+        };
+        let files = vec![("a.js".to_string(), "1".to_string())];
+        let measured = |id: &str| {
+            std::collections::HashMap::from([(format!("{IMAGE_INPUT}node:22"), id.to_string())])
+        };
+        let a =
+            key_inputs_with_runtime(&task, "linux", &files, &[], &measured("sha256:aaa")).unwrap();
+        let b =
+            key_inputs_with_runtime(&task, "linux", &files, &[], &measured("sha256:bbb")).unwrap();
+        assert_ne!(a.key(), b.key());
+        assert_eq!(
+            explain_miss(&a, &b, &[]),
+            "`docker image node:22` changed (sha256:aaa → sha256:bbb)"
+        );
     }
 
     #[test]

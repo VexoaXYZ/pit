@@ -15,6 +15,8 @@ pub struct Client {
     token: Option<String>,
     /// Sent as `x-pit-lease` on job updates (see `Job::lease`).
     lease: Option<String>,
+    /// Sent when claiming jobs (see `ServerOpts::worker_token`).
+    worker_token: Option<String>,
     http: reqwest::Client,
 }
 
@@ -42,9 +44,17 @@ pub fn seg(s: &str) -> Result<String> {
 }
 
 pub const LEASE_HEADER: &str = "x-pit-lease";
+pub const WORKER_TOKEN_HEADER: &str = "x-pit-worker-token";
 
 impl Client {
     /// A client whose requests prove they come from the current claim of a group.
+    pub fn with_worker_token(&self, token: Option<String>) -> Client {
+        Client {
+            worker_token: token,
+            ..self.clone()
+        }
+    }
+
     pub fn with_lease(&self, lease: &str) -> Client {
         Client {
             lease: Some(lease.to_string()),
@@ -57,6 +67,7 @@ impl Client {
             base: base.trim_end_matches('/').to_string(),
             token,
             lease: None,
+            worker_token: None,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .pool_idle_timeout(Duration::from_secs(90))
@@ -170,6 +181,10 @@ impl Client {
     pub async fn claim(&self, info: &WorkerInfo) -> Result<ClaimResponse> {
         let resp = self
             .req(reqwest::Method::POST, "/api/workers/claim")
+            .header(
+                WORKER_TOKEN_HEADER,
+                self.worker_token.as_deref().unwrap_or_default(),
+            )
             .timeout(Duration::from_secs(40))
             .json(info)
             .send()

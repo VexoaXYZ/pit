@@ -55,7 +55,8 @@ fn tools() -> Value {
                 "properties": {
                     "path": { "type": "string", "description": "Repository directory. Defaults to the server's working directory." },
                     "tasks": { "type": "array", "items": { "type": "string" }, "description": "Task names (`task` or `group.task`). Default: all tasks." },
-                    "noCache": { "type": "boolean", "description": "Ignore cached results." }
+                    "noCache": { "type": "boolean", "description": "Ignore cached results." },
+                    "debug": { "type": "boolean", "description": "If a task fails, keep its workspace and name a script in its result: `sh <script> '<command>'` runs a command where it failed, in its container with its variables." }
                 }
             }
         },
@@ -135,8 +136,19 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
                 })
                 .unwrap_or_default();
             let no_cache = args["noCache"].as_bool().unwrap_or(false);
+            let debug = args["debug"].as_bool().unwrap_or(false);
             let started = std::time::Instant::now();
-            let sub = crate::cli::submit(client, &path_arg(args), tasks, no_cache).await?;
+            let sub = crate::cli::submit(
+                client,
+                &path_arg(args),
+                tasks,
+                crate::cli::RunOpts {
+                    no_cache,
+                    fresh: false,
+                    debug,
+                },
+            )
+            .await?;
             let view = crate::cli::wait(client, &sub.run_id, |_| {}).await?;
             let text = summarize(
                 client,
@@ -191,6 +203,7 @@ async fn call(client: &Client, name: &str, args: &Value) -> Result<(String, bool
                         branch: Some(branch.into()),
                         pr: None,
                         target: args["target"].as_str().map(String::from),
+                        sha: None,
                     },
                 )
                 .await?;
@@ -256,12 +269,21 @@ async fn summarize(client: &Client, view: &RunView, elapsed_ms: u64, url: &str) 
     let mut failed = Vec::new();
     for g in &view.groups {
         s.push_str(&format!("{} ({}):\n", g.name, g.os));
+        if let Some(m) = &g.message {
+            s.push_str(&format!("  {m}\n"));
+        }
         for t in &g.tasks {
             let time = t
                 .duration_ms
                 .map(|d| format!(" {:.1}s", d as f64 / 1000.0))
                 .unwrap_or_default();
-            s.push_str(&format!("  {} {}{time}\n", t.status.as_str(), t.name));
+            let slow = t
+                .message
+                .as_deref()
+                .and_then(|m| m.split(" · ").find(|p| p.starts_with("slow:")))
+                .map(|p| format!(" ({p})"))
+                .unwrap_or_default();
+            s.push_str(&format!("  {} {}{time}{slow}\n", t.status.as_str(), t.name));
             if matches!(t.status, Status::Failed | Status::Error) {
                 failed.push((
                     format!("{}.{}", g.name, t.name),
@@ -277,9 +299,14 @@ async fn summarize(client: &Client, view: &RunView, elapsed_ms: u64, url: &str) 
             message.unwrap_or_default()
         ));
         if let Ok(log) = client.get_text(&format!("/api/tasks/{id}/log")).await {
-            let lines: Vec<&str> = log.lines().collect();
-            s.push_str(&lines[lines.len().saturating_sub(80)..].join("\n"));
-            s.push('\n');
+            // Error lines and the tail, not the whole log: agents pay for every
+            // token, and a tail alone misses errors printed early.
+            s.push_str(&crate::excerpt::excerpt(&log, 40));
+            s.push_str(&format!(
+                "\n(full log: {} lines; pit_logs with runId {} and task {name})\n",
+                log.lines().count(),
+                view.id
+            ));
         }
     }
     s

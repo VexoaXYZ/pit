@@ -20,7 +20,46 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     {
         bail!("refusing to write inside .git: {rel:?}");
     }
+    // The checkout is repository code: a committed symlink (`out -> /home`)
+    // must not turn `out/x` into a path outside the workspace. The last
+    // component may be one; callers replace or skip it rather than follow it.
+    let mut dir = root.to_path_buf();
+    let parts: Vec<_> = p.components().collect();
+    for c in &parts[..parts.len() - 1] {
+        dir.push(c);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => {
+                bail!(
+                    "refusing to follow the symlink {} in {rel:?}",
+                    dir.display()
+                )
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
     Ok(root.join(p))
+}
+
+/// A file a task wrote, read without following a symlink (a task can swap
+/// one in for `/dev/zero`), regular files only, at most `max` bytes.
+pub fn read_task_file(path: &Path, max: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = open.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(max).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 pub fn write_file(dest: &Path, bytes: &[u8], executable: bool) -> Result<()> {
@@ -145,6 +184,31 @@ mod tests {
         for bad in ["../x", "/etc/passwd", "a/../../x", ".git/config", ""] {
             assert!(safe_join(root, bad).is_err(), "{bad}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn never_follows_a_symlinked_directory_out_of_the_workspace() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), "precious").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("r")).unwrap();
+        assert!(safe_join(ws.path(), "r/keep").is_err());
+        // A fork's `reports: ["r/**"]` deletes nothing outside, and a cached
+        // output is not written through the link.
+        assert!(clear_outputs(ws.path(), &["r/**".into()]).is_ok());
+        std::fs::create_dir(outside.path().join("pit")).unwrap();
+        std::fs::write(outside.path().join("pit/db"), "precious").unwrap();
+        assert!(clear_outputs(ws.path(), &["r/pit/**".into()]).is_err());
+        assert!(outside.path().join("pit/db").exists());
+        assert!(collect_outputs(ws.path(), &["r/keep".into()]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("keep")).unwrap(),
+            "precious"
+        );
+        // The link itself, as the last component, is fine to replace.
+        assert!(safe_join(ws.path(), "r").is_ok());
+        assert!(safe_join(ws.path(), "new/dir/file").is_ok());
     }
 
     #[test]

@@ -87,9 +87,47 @@ pub fn remove(app: &App, key: &str, repo: Option<&str>, reason: &str) -> Result<
     Ok(n)
 }
 
-pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
+/// Refused: on a shared server a GitHub repo's queue is entered only through
+/// the `pit:merge` label.
+#[derive(Debug)]
+pub struct GithubOnlyLabel(pub String);
+
+impl std::fmt::Display for GithubOnlyLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is a GitHub repo: queue its pull requests with the `pit:merge` label",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for GithubOnlyLabel {}
+
+/// `from_api`: sent by an API caller, not by the GitHub webhook.
+pub async fn add(app: &Arc<App>, req: QueueAdd, from_api: bool) -> Result<QueueEntryView> {
     let repo = app.db.upsert_repo(&req.repo, req.url.as_deref(), None)?;
-    let mirror = app.fetch_mirror(&repo).await?;
+    // A queued change runs as trusted, config included, and the mirror has
+    // every pull request, forks' too. On a shared server, a GitHub repo's
+    // queue is entered only through the `pit:merge` label, which a
+    // maintainer applies after reading the change. Checked on the repo the
+    // request resolved to: a new name with that repo's URL resolves to it.
+    if from_api && app.token.is_some() && repo.github.is_some() {
+        return Err(GithubOnlyLabel(repo.name).into());
+    }
+    // If origin is down, queue from the last fetched state of the branch; the
+    // queue lands it once origin is back.
+    let mut offline: Option<String> = None;
+    let mirror = match app.fetch_mirror(&repo).await {
+        Ok(m) => m,
+        Err(e) if app.mirror_dir(&repo.id).join("HEAD").exists() => {
+            let why = origin_error(&e);
+            tracing::warn!("queueing from the last fetched state: {why}");
+            offline = Some(why);
+            app.mirror_dir(&repo.id)
+        }
+        Err(e) => bail!("cannot reach {}: {}", repo.url, origin_error(&e)),
+    };
     let source = match (&req.branch, req.pr) {
         (Some(b), None) => b.clone(),
         (None, Some(n)) => format!("pr/{n}"),
@@ -97,7 +135,30 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     };
     let head = git::rev_parse(&mirror, &source_ref(&source))
         .await?
-        .with_context(|| format!("{source} not found in {}", repo.url))?;
+        .with_context(|| match &offline {
+            Some(why) => format!(
+                "{source} is not known to Pit yet, and {} is unreachable ({why}); \
+                 Pit can only queue branches it fetched before the outage",
+                repo.url
+            ),
+            None => format!("{source} not found in {}", repo.url),
+        })?;
+    // A fork's pull request is queued at this commit only: a later push
+    // drops it rather than testing new code with the queue's trust. Unless
+    // a webhook said the pull request comes from the repo itself, it is
+    // treated as a fork: a missed webhook pins, it never trusts.
+    let same_repo = req.pr.is_some_and(|n| {
+        matches!(
+            app.db.kv_get("pr-origin", &format!("{}/{n}", repo.id)),
+            Ok(Some(o)) if o == "same"
+        )
+    });
+    let pinned = req.sha.is_some() || (req.pr.is_some() && !same_repo);
+    if let Some(approved) = &req.sha {
+        if *approved != head {
+            bail!("{source} moved to {head} after {approved} was approved; add the label again");
+        }
+    }
     let target = match req.target {
         Some(t) => t,
         None => default_branch(&mirror).await?,
@@ -115,7 +176,7 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     }
     let id = app
         .db
-        .queue_insert(&repo.id, &source, req.pr, &head, &target)?;
+        .queue_insert(&repo.id, &source, req.pr, &head, &target, pinned)?;
     app.emit(
         "queue.updated",
         None,
@@ -133,7 +194,7 @@ pub async fn add(app: &Arc<App>, req: QueueAdd) -> Result<QueueEntryView> {
     Ok(view(&row, repo.name))
 }
 
-async fn default_branch(mirror: &Path) -> Result<String> {
+pub(crate) async fn default_branch(mirror: &Path) -> Result<String> {
     for b in ["main", "master", "trunk"] {
         if git::rev_parse(mirror, &format!("refs/heads/{b}"))
             .await?
@@ -146,6 +207,18 @@ async fn default_branch(mirror: &Path) -> Result<String> {
 }
 
 /// Advances every queue: collects results, lands, and starts new candidates.
+/// The useful line of a failed fetch, without git's boilerplate.
+fn origin_error(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    for marker in ["fatal: ", "error: "] {
+        if let Some(i) = text.find(marker) {
+            let rest = &text[i + marker.len()..];
+            return rest.lines().next().unwrap_or(rest).trim().to_string();
+        }
+    }
+    text.lines().next().unwrap_or_default().trim().to_string()
+}
+
 pub async fn tick(app: &Arc<App>) -> Result<()> {
     let _guard = app.queue_lock.lock().await;
     let active = app.db.queue_active()?;
@@ -180,9 +253,31 @@ async fn tick_target(
     app: &Arc<App>,
     repo: &Repo,
     target: &str,
-    entries: Vec<QueueRow>,
+    mut entries: Vec<QueueRow>,
 ) -> Result<()> {
-    let mirror = app.fetch_mirror(repo).await?;
+    let mirror = match app.fetch_mirror(repo).await {
+        Ok(m) => m,
+        Err(e) => {
+            // Origin is down (a GitHub outage, a network blip). Nothing can be
+            // tested against the latest target or landed, so wait, and say why.
+            let reason = format!("waiting for origin to come back ({})", origin_error(&e));
+            for entry in entries
+                .iter_mut()
+                .filter(|e| e.reason.as_deref() != Some(reason.as_str()))
+            {
+                entry.reason = Some(reason.clone());
+                app.db.queue_update(entry)?;
+            }
+            app.emit(
+                "queue.updated",
+                None,
+                None,
+                None,
+                serde_json::json!({ "waiting": reason }),
+            );
+            return Ok(());
+        }
+    };
     if let Some(gh) = repo.github.as_deref().and(app.github.as_ref()) {
         let url = gh.push_url(repo.github.as_deref().unwrap()).await?;
         git::git(&mirror, &["config", "remote.origin.pushurl", &url]).await?;
@@ -307,6 +402,14 @@ impl Queue<'_> {
                 self.remove_entry(i, "branch deleted")?;
                 continue;
             };
+            if head != self.entries[i].head_sha && self.entries[i].pinned {
+                // Only the approved commit may run with the queue's trust.
+                self.remove_entry(
+                    i,
+                    "new commits were pushed after it was queued; add the merge label again",
+                )?;
+                continue;
+            }
             if head != self.entries[i].head_sha && self.entries[i].status != "landed" {
                 let (lane, pos) = (
                     self.entries[i].lane.clone(),
@@ -319,6 +422,28 @@ impl Queue<'_> {
                 }
             }
         }
+        // A lane's newest testing entry needs a run of its own. It can lack
+        // one when the change it was batched into left the lane (removed,
+        // updated, requeued); that run covers every batched entry before it.
+        let lanes: BTreeSet<String> = self.entries.iter().filter_map(|e| e.lane.clone()).collect();
+        for lane in lanes {
+            let newest = (0..self.entries.len())
+                .filter(|&j| {
+                    self.entries[j].lane.as_deref() == Some(lane.as_str())
+                        && self.entries[j].status == "testing"
+                })
+                .max_by_key(|&j| self.entries[j].position);
+            if let Some(j) = newest.filter(|&j| self.entries[j].run_id.is_none()) {
+                let o = self.entries[j].clone();
+                let run = self.queue_run(&o, self.lane_tasks(&o)).await?;
+                let o = &mut self.entries[j];
+                o.run_id = Some(run);
+                o.reason =
+                    Some("testing again: the change it was batched with left the queue".into());
+                let o = o.clone();
+                self.save(&o)?;
+            }
+        }
         let mut order: Vec<usize> = (0..self.entries.len()).collect();
         order.sort_by_key(|&i| (self.entries[i].lane.clone(), self.entries[i].position));
         for i in order {
@@ -328,7 +453,22 @@ impl Queue<'_> {
             let Some(run_id) = self.entries[i].run_id.clone() else {
                 continue;
             };
-            let run = self.app.db.run(&run_id)?;
+            let mut run = self.app.db.run(&run_id)?;
+            // A candidate is decided by its first real failure: nothing later
+            // in its run can make it pass, so the run stops there and the
+            // queue moves on, instead of holding the lane until its slowest
+            // task ends (GitHub's fail-fast, for the merge gate only; other
+            // runs report every failure).
+            if !run.status.is_done() {
+                if let Some(task) = self.app.db.run_failed_task(&run_id)? {
+                    let why = format!("stopped early: {task} failed");
+                    if self.app.db.cancel_run_because(&run_id, &why)? {
+                        self.app.db.fail_groups_with_failures(&run_id)?;
+                        self.cancelled.push(run_id.clone());
+                    }
+                    run = self.app.db.run(&run_id)?;
+                }
+            }
             if !run.status.is_done() {
                 continue;
             }
@@ -337,10 +477,64 @@ impl Queue<'_> {
                 self.entries[i].reason = None;
                 let e = self.entries[i].clone();
                 self.save(&e)?;
+                // This candidate contains every earlier change in its lane, so
+                // their own runs are no longer needed.
+                let (lane, pos) = (e.lane.clone(), e.position);
+                for j in 0..self.entries.len() {
+                    let o = &self.entries[j];
+                    if o.lane != lane || o.position >= pos || o.status != "testing" {
+                        continue;
+                    }
+                    // A change whose own run already failed is not rescued
+                    // by a later one: it fails, and the later ones are
+                    // retested without it.
+                    let own = match &o.run_id {
+                        Some(r) => Some((r.clone(), self.app.db.run(r)?.status)),
+                        None => None,
+                    };
+                    if own.as_ref().is_some_and(|(_, s)| s.is_done() && !s.is_ok()) {
+                        continue;
+                    }
+                    // Saved first: a crash before the skip must not leave a
+                    // skipped run on an entry that still counts it.
+                    let o = &mut self.entries[j];
+                    o.status = "passed".into();
+                    o.reason = Some(format!("passed together with later changes in {run_id}"));
+                    let o = o.clone();
+                    self.save(&o)?;
+                    if let Some((r, _)) = own {
+                        if self
+                            .app
+                            .db
+                            .skip_run_because(&r, &format!("covered by {run_id}"))?
+                        {
+                            self.app.run_finished(&r).await;
+                        }
+                    }
+                }
             } else {
                 // A candidate contains every earlier change in its lane. Until
                 // those have passed, the failure may not be this change's fault.
                 let (lane, pos) = (self.entries[i].lane.clone(), self.entries[i].position);
+                // Changes batched into this candidate get their own runs now,
+                // to find which one broke it.
+                for j in 0..self.entries.len() {
+                    let o = &self.entries[j];
+                    if o.lane == lane
+                        && o.position < pos
+                        && o.status == "testing"
+                        && o.run_id.is_none()
+                    {
+                        let o = o.clone();
+                        let run = self.queue_run(&o, self.lane_tasks(&o)).await?;
+                        let o = &mut self.entries[j];
+                        o.run_id = Some(run);
+                        o.reason =
+                            Some("testing on its own: a batch with later changes failed".into());
+                        let o = o.clone();
+                        self.save(&o)?;
+                    }
+                }
                 let earlier_untested = self
                     .entries
                     .iter()
@@ -367,25 +561,22 @@ impl Queue<'_> {
     async fn land(&mut self) -> Result<()> {
         let lanes: BTreeSet<String> = self.entries.iter().filter_map(|e| e.lane.clone()).collect();
         for lane in lanes {
-            loop {
-                // The first entry of the lane that has not landed yet.
-                let next = self
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| {
-                        e.lane.as_deref() == Some(lane.as_str())
-                            && matches!(e.status.as_str(), "testing" | "passed")
-                    })
-                    .min_by_key(|(_, e)| e.position)
-                    .map(|(i, _)| i);
-                let Some(i) = next else { break };
-                if self.entries[i].status != "passed" {
-                    break;
-                }
-                if !self.land_one(i, "tested").await? {
-                    break;
-                }
+            // The leading run of passed entries lands as one push of the
+            // newest, which contains the others: the target never sits on a
+            // commit that was not itself tested.
+            let mut pending: Vec<usize> = (0..self.entries.len())
+                .filter(|&i| {
+                    self.entries[i].lane.as_deref() == Some(lane.as_str())
+                        && matches!(self.entries[i].status.as_str(), "testing" | "passed")
+                })
+                .collect();
+            pending.sort_by_key(|&i| self.entries[i].position);
+            let batch: Vec<usize> = pending
+                .into_iter()
+                .take_while(|&i| self.entries[i].status == "passed")
+                .collect();
+            if !batch.is_empty() {
+                self.land_batch(&batch, "tested").await?;
             }
         }
         Ok(())
@@ -393,7 +584,17 @@ impl Queue<'_> {
 
     /// Pushes an entry to the target. Returns false if it could not land now.
     async fn land_one(&mut self, i: usize, how: &str) -> Result<bool> {
-        let e = self.entries[i].clone();
+        self.land_batch(&[i], how).await
+    }
+
+    /// Pushes consecutive passed entries of one lane as a single commit: the
+    /// newest one's candidate, which contains the others.
+    async fn land_batch(&mut self, batch: &[usize], how: &str) -> Result<bool> {
+        let (&first, &last) = (
+            batch.first().context("empty batch")?,
+            batch.last().context("empty batch")?,
+        );
+        let e = self.entries[last].clone();
         let candidate = e
             .candidate_sha
             .clone()
@@ -403,20 +604,28 @@ impl Queue<'_> {
         } else {
             // Another lane landed first. Its tasks are disjoint from this one,
             // so re-merging onto the new tip keeps this lane's result valid.
-            let msg = merge_message(&e);
-            match git::merge_commit(&self.mirror, &self.tip, &e.head_sha, &msg).await? {
-                Some(c) => c,
-                None => {
-                    let lane = e.lane.clone().unwrap_or_default();
-                    self.requeue(i, "conflicts with a change that landed first; retesting")?;
-                    self.requeue_after(
-                        &lane,
-                        e.position.unwrap_or(0),
-                        "an earlier change in this lane is being retested",
-                    )?;
-                    return Ok(false);
+            let mut c = self.tip.clone();
+            for &i in batch {
+                let o = &self.entries[i];
+                match git::merge_commit(&self.mirror, &c, &o.head_sha, &merge_message(o)).await? {
+                    Some(m) => c = m,
+                    None => {
+                        let lane = self.entries[first].lane.clone().unwrap_or_default();
+                        let pos = self.entries[first].position.unwrap_or(0);
+                        self.requeue(
+                            first,
+                            "conflicts with a change that landed first; retesting",
+                        )?;
+                        self.requeue_after(
+                            &lane,
+                            pos,
+                            "an earlier change in this lane is being retested",
+                        )?;
+                        return Ok(false);
+                    }
                 }
             }
+            c
         };
         if !git::push(
             &self.mirror,
@@ -429,19 +638,21 @@ impl Queue<'_> {
             return Ok(false);
         }
         self.tip = commit.clone();
-        let e = &mut self.entries[i];
-        e.status = "landed".into();
-        e.landed_sha = Some(commit.clone());
-        e.reason = Some(how.to_string());
-        let e = e.clone();
-        self.save(&e)?;
-        self.app.emit(
-            "queue.landed",
-            None,
-            None,
-            None,
-            serde_json::json!({ "id": e.id, "sha": commit }),
-        );
+        for &i in batch {
+            let e = &mut self.entries[i];
+            e.status = "landed".into();
+            e.landed_sha = Some(commit.clone());
+            e.reason = Some(how.to_string());
+            let e = e.clone();
+            self.save(&e)?;
+            self.app.emit(
+                "queue.landed",
+                None,
+                None,
+                None,
+                serde_json::json!({ "id": e.id, "sha": commit }),
+            );
+        }
         // Backstop: the landed commit gets a full run on the target branch.
         self.app
             .create_run(
@@ -454,6 +665,15 @@ impl Queue<'_> {
                     trigger: Some("post-merge".into()),
                     git_ref: Some(self.target.to_string()),
                     no_cache: false,
+                    fresh: false,
+                    debug: false,
+                    counts_as: None,
+                    no_secrets: false,
+                    trusted: super::trusted_branch(
+                        self.target,
+                        default_branch(&self.mirror).await.ok().as_deref(),
+                    ),
+                    draft: false,
                 },
                 None,
             )
@@ -483,7 +703,17 @@ impl Queue<'_> {
                 continue;
             };
             let changed = git::changed_files(&self.mirror, &self.tip, &merged).await?;
-            let config = match self.app.load_config(&self.mirror, &merged, None).await {
+            let config = match self
+                .app
+                .load_config(
+                    self.repo,
+                    &self.mirror,
+                    &merged,
+                    None,
+                    self.app.config_sandboxed(self.repo, true),
+                )
+                .await
+            {
                 Ok(c) => c,
                 Err(err) => {
                     let e = &mut self.entries[i];
@@ -573,22 +803,42 @@ impl Queue<'_> {
                 );
             }
             tasks.retain(|t| !t.is_empty());
-            let run_id = self
-                .app
-                .create_run(
-                    CreateRun {
-                        repo: self.repo.name.clone(),
-                        url: None,
-                        sha: candidate.clone(),
-                        overlay: None,
-                        tasks: tasks.into_iter().collect(),
-                        trigger: Some("queue".into()),
-                        git_ref: Some(format!("queue/{}", e.source)),
-                        no_cache: false,
-                    },
-                    e.pr,
-                )
-                .await?;
+            let mut probe = e.clone();
+            probe.candidate_sha = Some(candidate.clone());
+            let run_id = self.queue_run(&probe, tasks).await?;
+            // Batching: the change before this one in the lane, if no worker
+            // has started on it, is tested by this candidate (which contains
+            // it) instead of on its own. If this candidate fails, it gets its
+            // own run again (see `collect_results`).
+            if position > 0 {
+                let prev = self.entries.iter().position(|o| {
+                    o.lane.as_deref() == Some(lane.as_str())
+                        && o.position == Some(position - 1)
+                        && o.status == "testing"
+                });
+                if let Some(p) = prev {
+                    if let Some(r) = self.entries[p].run_id.clone() {
+                        if self.app.db.run_untouched(&r)? {
+                            // Saved first: a crash before the skip must not
+                            // leave a skipped run on an entry that counts it.
+                            let o = &mut self.entries[p];
+                            o.run_id = None;
+                            o.reason = Some(format!(
+                                "batched: tested together with later changes in {run_id}"
+                            ));
+                            let o = o.clone();
+                            self.save(&o)?;
+                            if self
+                                .app
+                                .db
+                                .skip_run_because(&r, &format!("batched into {run_id}"))?
+                            {
+                                self.app.run_finished(&r).await;
+                            }
+                        }
+                    }
+                }
+            }
             let entry = &mut self.entries[i];
             entry.status = "testing".into();
             entry.lane = Some(lane);
@@ -601,6 +851,50 @@ impl Queue<'_> {
             self.save(&entry)?;
         }
         Ok(())
+    }
+}
+
+impl Queue<'_> {
+    /// Starts a merge queue run of an entry's candidate.
+    async fn queue_run(&self, e: &QueueRow, tasks: BTreeSet<String>) -> Result<String> {
+        self.app
+            .create_run(
+                CreateRun {
+                    repo: self.repo.name.clone(),
+                    url: None,
+                    sha: e
+                        .candidate_sha
+                        .clone()
+                        .context("entry without a candidate")?,
+                    overlay: None,
+                    tasks: tasks.into_iter().collect(),
+                    trigger: Some("queue".into()),
+                    git_ref: Some(format!("queue/{}", e.source)),
+                    no_cache: false,
+                    fresh: false,
+                    debug: false,
+                    counts_as: None,
+                    no_secrets: false,
+                    // Queueing is the decision to land it on the target.
+                    trusted: super::trusted_branch(
+                        self.target,
+                        default_branch(&self.mirror).await.ok().as_deref(),
+                    ),
+                    draft: false,
+                },
+                e.pr,
+            )
+            .await
+    }
+
+    /// The tasks a lane has affected up to and including this entry.
+    fn lane_tasks(&self, e: &QueueRow) -> BTreeSet<String> {
+        self.entries
+            .iter()
+            .filter(|o| o.lane == e.lane && o.position <= e.position)
+            .flat_map(|o| o.affected.iter().cloned())
+            .filter(|t| !t.is_empty())
+            .collect()
     }
 }
 

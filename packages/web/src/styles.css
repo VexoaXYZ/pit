@@ -903,6 +903,30 @@ h1 {
   font-style: italic;
 }
 
+/* Virtualized long logs: fixed-height lines, no wrapping. */
+.log-virtual {
+  white-space: pre;
+  word-break: normal;
+  line-height: 18px;
+  position: relative;
+}
+
+.log-virtual pre {
+  font: inherit;
+  line-height: inherit;
+  white-space: pre;
+}
+
+.log-count {
+  position: sticky;
+  bottom: 0;
+  float: right;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--bg-inset);
+  padding: 0 4px;
+}
+
 /* --- queue --------------------------------------------------------------- */
 
 .lanes {
