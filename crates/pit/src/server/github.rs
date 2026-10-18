@@ -480,7 +480,7 @@ fn summarize(g: &GroupView, run_id: &str, untrusted: bool) -> String {
             .unwrap_or_default();
         s.push_str(&format!(
             "| {} | {} | {} | {} |\n",
-            t.name,
+            heading_name(&t.name).trim_matches('`').replace('|', "\\|"),
             t.status.as_str(),
             time,
             note(t)
@@ -493,6 +493,7 @@ fn summarize(g: &GroupView, run_id: &str, untrusted: bool) -> String {
         let Some(md) = t.summary.as_deref().filter(|m| !m.trim().is_empty()) else {
             continue;
         };
+        let name = heading_name(&t.name);
         let body = if untrusted {
             format!(
                 "~~~~~~~~text\n{}\n~~~~~~~~",
@@ -501,17 +502,37 @@ fn summarize(g: &GroupView, run_id: &str, untrusted: bool) -> String {
         } else {
             md.trim_end().to_string()
         };
-        let block = format!("\n### {}\n\n{body}\n", t.name);
-        if block.len() <= CHECK_SUMMARY_ROOM.saturating_sub(s.len()) {
+        let block = format!("\n### {name}\n\n{body}\n");
+        let note = format!(
+            "\n### {name}\n\n_(summary too long for the check: `GET /api/runs/{run_id}` on the Pit server has it)_\n"
+        );
+        let room = CHECK_SUMMARY_ROOM.saturating_sub(s.len());
+        if block.len() <= room {
             s.push_str(&block);
-        } else {
-            s.push_str(&format!(
-                "\n### {}\n\n_(summary too long for the check: `GET /api/runs/{run_id}` on the Pit server has it)_\n",
-                t.name
-            ));
+        } else if note.len() <= room {
+            s.push_str(&note);
         }
     }
+    // GitHub rejects an update whose summary is over 65535 characters.
+    if s.len() > CHECK_SUMMARY_ROOM + 4_000 {
+        let mut cut = CHECK_SUMMARY_ROOM + 4_000;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
     s
+}
+
+/// A task name on one line, as plain text: names are config keys, and a
+/// fork's could otherwise break out of the table or the summary fence.
+fn heading_name(name: &str) -> String {
+    let flat: String = name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(100)
+        .collect();
+    format!("`{}`", flat.replace('`', "'"))
 }
 
 /// Room for task summaries in a check's summary (GitHub's limit is 65535).
@@ -926,16 +947,16 @@ mod tests {
         g.tasks[0].summary = Some("## Coverage\n91%".into());
         g.tasks[1].summary = Some("x".repeat(70_000));
         let text = summarize(&g, "run_1", false);
-        assert!(text.contains("### lint\n\n## Coverage\n91%"), "{text}");
+        assert!(text.contains("### `lint`\n\n## Coverage\n91%"), "{text}");
         assert!(
-            text.contains("### test\n\n_(summary too long for the check: `GET /api/runs/run_1`"),
+            text.contains("### `test`\n\n_(summary too long for the check: `GET /api/runs/run_1`"),
             "{}",
             &text[..200]
         );
         // A fork's markdown is fenced.
         let fork = summarize(&g, "run_1", true);
         assert!(
-            fork.contains("### lint\n\n~~~~~~~~text\n## Coverage\n91%\n~~~~~~~~"),
+            fork.contains("### `lint`\n\n~~~~~~~~text\n## Coverage\n91%\n~~~~~~~~"),
             "{fork}"
         );
         assert!(text.len() < 65_535);

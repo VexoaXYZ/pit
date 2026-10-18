@@ -3549,8 +3549,21 @@ and an independent review found:
 - the "see the run" note pointed at a page that doesn't show it.
 
 All are fixed as described above. e2e `summaries_live_outside_the_workspace` checks the path is
-outside the workspace and `git status` stays clean. A unit test checks the fork fence. JUnit
-reports are again skipped unless valid UTF-8.
+outside the workspace and `git status` stays clean, and, with Docker, that a `node:22-alpine` task
+writes through the `/pit-summary` mount. A unit test checks the fork fence. JUnit reports are again
+skipped unless valid UTF-8.
+
+A second review round fixed:
+- notes for oversized summaries could push the check past GitHub's limit, so the summary is now
+  hard-capped;
+- a fork task name with newlines escaped the fence, so names are now flattened and quoted in
+  headings and the table;
+- `pit run --debug` lost `$PIT_SUMMARY`, so the directory now lives as long as the debug hold;
+- crash leftovers are removed at worker start;
+- a requeued group's tasks start with no summary.
+
+Not done: the summary file is recreated with a plain write, which a parallel sibling container
+could in theory race. Fork tasks run one at a time, so it isn't a trust boundary.
 
 **Verdict: SOLVED.** Limits:
 - One summary per task, not per step.
@@ -3598,6 +3611,18 @@ new e2e `every_deploy_runs_in_order_under_a_lock` makes four quick pushes to a d
 **Measured.** The e2e passed 5 of 5 after the fix (1 of 3 before), with `start/end` lines strictly
 in push order and no run cancelled. The old supersede rule fails the same test (checked by putting
 it back). The P29 lock tests and the rest of the suite pass, twice.
+
+**Review fixes.** An independent review of this found no deadlock, but four real gaps, all fixed:
+1. **The "still planning" rule ended as soon as an older run inserted its first group**, so its
+   later locked group could still be overtaken. Runs now record `planned_at` once all their groups
+   exist, and the e2e config has two groups planned before the deploy.
+2. **An older locked group no online worker could run blocked everyone behind it.** It's now
+   skipped.
+3. **Priority inversion: a merge-queue or trusted group waited behind older PR runs on a shared
+   lock.** Only older runs of the same or a higher claim priority count.
+4. **The new subqueries scanned a repo's whole run history on every claim.** Indexes added.
+
+Ties within a millisecond are broken by row order.
 
 **Verdict: SOLVED.** Pit had "no limit, no cancellations" but not ordering, and default branches
 not named main were superseded. Both are fixed. Limit: while a locked group waits behind an older

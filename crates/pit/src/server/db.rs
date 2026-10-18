@@ -328,6 +328,17 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has_base {
         conn.execute_batch("ALTER TABLE runs ADD COLUMN base_sha TEXT")?;
     }
+    // For the lock rules in claims; after the columns they cover exist.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS groups_lock ON groups_(lock_name, status);
+         CREATE INDEX IF NOT EXISTS runs_repo_status ON runs(repo_id, status, created_at);",
+    )?;
+    let has_planned: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'planned_at'")?
+        .exists([])?;
+    if !has_planned {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN planned_at INTEGER")?;
+    }
     let has_summary: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'summary'")?
         .exists([])?;
@@ -884,16 +895,24 @@ impl Db {
                    -- A lock is taken in the order runs were created (a deploy of
                    -- every commit, in push order): not before an older run's
                    -- group waiting for it, nor while an older run of the repo is
-                   -- still being planned (for a minute at most).
+                   -- still being planned (for a minute at most). Only older runs
+                   -- of the same or a higher claim priority count, and not a
+                   -- group no online worker can run.
                    AND NOT EXISTS (
                      SELECT 1 FROM groups_ earlier JOIN runs er ON er.id = earlier.run_id
                      WHERE earlier.lock_name = groups_.lock_name AND earlier.status = 'queued'
-                       AND er.status IN ('queued', 'running') AND er.created_at < runs.created_at)
+                       AND er.status IN ('queued', 'running')
+                       AND (er.created_at, er.rowid) < (runs.created_at, runs.rowid)
+                       AND COALESCE(earlier.message, '') NOT LIKE 'waiting: no online worker%'
+                       AND (CASE WHEN er.trigger = 'queue' THEN 0 WHEN er.trusted = 1 THEN 1 ELSE 2 END)
+                         <= (CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END))
                    AND NOT EXISTS (
                      SELECT 1 FROM runs planning WHERE planning.repo_id = runs.repo_id
-                       AND planning.status = 'queued' AND planning.created_at < runs.created_at
+                       AND planning.status = 'queued' AND planning.planned_at IS NULL
+                       AND (planning.created_at, planning.rowid) < (runs.created_at, runs.rowid)
                        AND planning.created_at > ?2 - 60000
-                       AND NOT EXISTS (SELECT 1 FROM groups_ pg WHERE pg.run_id = planning.id))))
+                       AND (CASE WHEN planning.trigger = 'queue' THEN 0 WHEN planning.trusted = 1 THEN 1 ELSE 2 END)
+                         <= (CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END))))
                  ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
                    groups_.created_at",
             )?;
@@ -936,6 +955,11 @@ impl Db {
                message = CASE WHEN message LIKE 'waiting:%' THEN NULL ELSE message END
              WHERE id = ?3",
             params![worker.name, now, gid, lease],
+        )?;
+        // A new attempt of these tasks: an earlier one's summary is not its.
+        tx.execute(
+            "UPDATE tasks SET summary = NULL WHERE group_id = ?1",
+            params![gid],
         )?;
         let (run, repo_name, url, group_name): (RunRow, String, String, String) = tx.query_row(
             "SELECT runs.*, repos.name AS repo_name, repos.url AS repo_url, groups_.name AS group_name
@@ -1516,6 +1540,15 @@ impl Db {
         self.conn
             .lock()
             .execute("UPDATE runs SET no_secrets = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Marks a run's groups as all inserted (see the lock rule in claims).
+    pub fn set_run_planned(&self, id: &str) -> Result<()> {
+        self.conn.lock().execute(
+            "UPDATE runs SET planned_at = ?2 WHERE id = ?1",
+            params![id, now_ms()],
+        )?;
         Ok(())
     }
 
@@ -2338,6 +2371,7 @@ mod tests {
             let g = db
                 .insert_locked_group(&run, "it", "linux", &[], &task, Some("r:staging-db"))
                 .unwrap();
+            db.set_run_planned(&run).unwrap();
             ids.push(g);
         }
         let worker = WorkerInfo {

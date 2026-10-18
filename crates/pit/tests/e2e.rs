@@ -2829,7 +2829,7 @@ async fn failed_tests_are_annotated_on_the_check() {
     assert!(
         summaries
             .iter()
-            .any(|s| s.contains("### test\n\n**60 failed**, see annotations")),
+            .any(|s| s.contains("### `test`\n\n**60 failed**, see annotations")),
         "{summaries:?}"
     );
     let first = all.iter().find(|a| a["title"] == "cart.case 1").unwrap();
@@ -3923,10 +3923,16 @@ async fn every_deploy_runs_in_order_under_a_lock() {
     std::fs::create_dir_all(&work).unwrap();
     sh(tmp.path(), "git init -q --bare -b develop origin.git");
     let log = tmp.path().join("deploys.log");
-    let config = serde_json::json!({ "groups": { "deploy": { "lock": "prod", "tasks": { "ship": {
-        "run": format!("echo start $PIT_SHA >> {l}; sleep 1; echo end $PIT_SHA >> {l}", l = log.display()),
-        "cache": false,
-    } } } } });
+    // Groups planned before the deploy (names sort first), so an older run
+    // is half planned while a newer one could take the lock.
+    let config = serde_json::json!({ "groups": {
+        "a-build": { "tasks": { "b": { "run": "true", "cache": false } } },
+        "b-test": { "tasks": { "t": { "run": "true", "cache": false } } },
+        "deploy": { "lock": "prod", "tasks": { "ship": {
+            "run": format!("echo start $PIT_SHA >> {l}; sleep 1; echo end $PIT_SHA >> {l}", l = log.display()),
+            "cache": false,
+        } } },
+    } });
     write(&work, "pit.config.json", &config.to_string());
     sh(&work, "git init -q -b develop && git add -A && git commit -qm c0 && git remote add origin ../origin.git && git push -q origin develop");
     let url = tmp.path().join("origin.git").to_string_lossy().to_string();
@@ -4005,4 +4011,22 @@ async fn summaries_live_outside_the_workspace() {
     let view = run(&pit, dir).await;
     assert_eq!(view.status, Status::Passed, "{view:?}");
     assert_eq!(view.groups[0].tasks[0].summary.as_deref(), Some("## hi\n"));
+    // In a container, through the mounted directory.
+    if cfg!(target_os = "linux")
+        && pit::worker::exec::detect_backends()
+            .await
+            .contains(&Backend::Docker)
+    {
+        let config = serde_json::json!({ "tasks": { "t": {
+            "image": "node:22-alpine",
+            "run": "cd /tmp && echo \"node $(node --version)\" >> $PIT_SUMMARY",
+            "cache": false,
+        } } });
+        write(dir, "pit.config.json", &config.to_string());
+        sh(dir, "git commit -qam docker");
+        let view = run_with_timeout(&pit, dir, Duration::from_secs(240)).await;
+        assert_eq!(view.status, Status::Passed, "{view:?}");
+        let md = view.groups[0].tasks[0].summary.clone().unwrap_or_default();
+        assert!(md.starts_with("node v22"), "{md:?}");
+    }
 }

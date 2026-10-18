@@ -534,6 +534,7 @@ impl App {
                 lock.as_deref(),
             )?;
         }
+        self.db.set_run_planned(run_id)?;
         tracing::debug!(
             "planned {run_id} in {:?} (commit {:?}, config {:?}, rest {:?})",
             t0.elapsed(),
@@ -688,9 +689,9 @@ pub fn trusted_branch(branch: &str, default_branch: Option<&str>) -> bool {
 }
 
 /// Whether a new run with this trigger and ref replaces older ones.
-/// Whether a newer run of this ref cancels the older ones. Never for
-/// trusted runs (default-branch pushes, whatever the branch is called: a
-/// deploy of every commit must run, one after another under a `lock`).
+/// Whether a newer run of this ref cancels the older ones. Never for a
+/// trusted run (a default-branch push, whatever the branch is called): a
+/// deploy of every commit must run, one after another under a `lock`.
 fn supersedes(trigger: &str, git_ref: &str, trusted: bool) -> bool {
     match trigger {
         "pr" | "local" => true,

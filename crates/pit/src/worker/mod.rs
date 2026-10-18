@@ -122,6 +122,7 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
     // Debug scripts from an earlier process point at workspaces it no longer
     // holds; the next job may check out over them.
     let _ = std::fs::remove_dir_all(opts.data_dir.join("debug"));
+    let _ = std::fs::remove_dir_all(opts.data_dir.join("summaries"));
     let mut worker = Worker::new(
         opts.server.as_str(),
         opts.token.clone(),
@@ -600,7 +601,7 @@ impl Worker {
             .lock()
             .remove(&job.lease)
             .and_then(|slot| slot.get().and_then(|r| r.as_ref().ok().cloned()));
-        let _ = std::fs::remove_dir_all(self.data_dir.join("summaries").join(&job.lease));
+        let summaries = self.data_dir.join("summaries").join(&job.lease);
         hb.abort();
         let debug_dir = debug::dir(&self.data_dir, &job.group_id);
         if job.debug && debug::has_scripts(&debug_dir) {
@@ -611,6 +612,8 @@ impl Worker {
             let (w, ws) = (self.clone(), ws.clone());
             tokio::spawn(async move {
                 debug::hold(&debug_dir, debug::HOLD).await;
+                // The debug shell writes `$PIT_SUMMARY` there too.
+                let _ = std::fs::remove_dir_all(&summaries);
                 // The debug shell can still reach the services until then.
                 if let Some(s) = services {
                     s.stop().await;
@@ -622,6 +625,7 @@ impl Worker {
                 }
             });
         } else {
+            let _ = std::fs::remove_dir_all(&summaries);
             if let Some(s) = services {
                 s.stop().await;
             }
