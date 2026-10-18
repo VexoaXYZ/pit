@@ -5203,6 +5203,34 @@ async fn trusted_secrets_reach_only_trusted_runs() {
                 "a branch's git hook ran on the worker's host"
             );
             sh(&work, "git checkout -q -- pit.config.json");
+            // And each throwaway workspace is deleted once its run is done.
+            let fresh_left = || {
+                let root = data.path().join("worker/workspaces");
+                std::fs::read_dir(&root)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .flat_map(|repo| {
+                        std::fs::read_dir(repo.path())
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                    })
+                    .filter(|g| g.file_name().to_string_lossy().ends_with("~fresh"))
+                    .flat_map(|g| std::fs::read_dir(g.path()).into_iter().flatten().flatten())
+                    .count()
+            };
+            for _ in 0..50 {
+                if fresh_left() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_eq!(
+                fresh_left(),
+                0,
+                "a confined run's workspace was left on disk"
+            );
         }
 
         let main = log(scheduled().await).await;

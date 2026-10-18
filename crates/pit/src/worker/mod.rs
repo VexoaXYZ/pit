@@ -718,8 +718,11 @@ impl Worker {
             if let Some(s) = services {
                 s.stop().await;
             }
+            // Whatever made it fresh (`--fresh`, or a confined job), it is
+            // never reused, so it goes.
+            let fresh = lease.fresh;
             drop(lease);
-            if job.fresh {
+            if fresh {
                 let ws = ws.clone();
                 disk::remove_meta(&ws);
                 tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws));
@@ -2004,7 +2007,9 @@ impl Worker {
     /// branch can leave a poisoned tool cache for main. A fork's run, or a
     /// `--fresh` one, gets none.
     fn docker_home(&self, job: &Job) -> Result<Option<PathBuf>> {
-        if job.no_secrets || job.fresh {
+        // A confined job (see `confined`) gets none either: a home its
+        // container wrote must never reach a job that holds deploy keys.
+        if self.confined(job) || job.fresh {
             return Ok(None);
         }
         // Per repo (a hash keeps names that `safe_name` folds together
