@@ -516,6 +516,25 @@ impl GitHub {
             };
             let summary = format!("{passed} of {} shards passed", shards.len());
             let key = format!("shards\0{run_id}\0{base}");
+            // As for a group's own check: a left-out copy (another run of the
+            // commit, `on`) posted after the real one must not win. The real
+            // run reposts when one appears (`copies`), and in App mode posts
+            // a new check run when the copy is newer than its own.
+            // (`#` names no group, so this cannot collide with one.)
+            let copies_key = format!("{}\0{}\0#{}", run.repo_id, run.sha, base);
+            let copies = self
+                .left_out_posts
+                .lock()
+                .get(&copies_key)
+                .copied()
+                .unwrap_or(0);
+            let newest_copy = if all_left_out {
+                None
+            } else {
+                app.db
+                    .kv_get("shard-check", &copies_key)?
+                    .and_then(|v| v.parse::<u64>().ok())
+            };
             let said = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -525,7 +544,7 @@ impl GitHub {
                 } else {
                     summary.as_str()
                 };
-                (status.as_str(), shown).hash(&mut h);
+                (status.as_str(), shown, copies, newest_copy).hash(&mut h);
                 h.finish()
             };
             if self.reported.lock().get(&key) == Some(&said) {
@@ -542,9 +561,29 @@ impl GitHub {
                 all_left_out,
                 &summary,
                 &details,
+                &copies_key,
+                newest_copy,
             )
             .await?;
             self.reported.lock().insert(key, said);
+            if all_left_out {
+                *self.left_out_posts.lock().entry(copies_key).or_default() += 1;
+                // A run that really runs the group may have appeared while
+                // this copy was being posted: report it again, so its check
+                // is the newest.
+                for other in app
+                    .db
+                    .real_group_runs(&run.repo_id, &run.sha, &shards[0].name)?
+                {
+                    match Box::pin(self.try_report_run(app, &other)).await {
+                        Ok(()) => {}
+                        Err(e) => match e.downcast_ref::<RateLimited>() {
+                            Some(RateLimited(wait)) => self.schedule_retry(app, &other, *wait),
+                            None => return Err(e),
+                        },
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -566,6 +605,8 @@ impl GitHub {
         left_out: bool,
         summary: &str,
         details: &str,
+        copies_key: &str,
+        newest_copy: Option<u64>,
     ) -> Result<()> {
         let check_name = format!("pit / {base}");
         match &self.auth {
@@ -607,10 +648,12 @@ impl GitHub {
                     }
                 }
                 let key = format!("{run_id}\0{base}");
+                // A newer left-out copy: a new check run, to be the newest.
                 let existing = app
                     .db
                     .kv_get("shard-check", &key)?
-                    .and_then(|v| v.parse::<u64>().ok());
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|own| newest_copy.is_none_or(|copy| copy < *own));
                 match existing {
                     Some(id) => {
                         self.call(
@@ -632,6 +675,10 @@ impl GitHub {
                             .await?;
                         if let Some(id) = created["id"].as_u64() {
                             app.db.kv_put("shard-check", &key, &id.to_string())?;
+                            // The newest left-out copy, for real runs to beat.
+                            if left_out {
+                                app.db.kv_put("shard-check", copies_key, &id.to_string())?;
+                            }
                         }
                     }
                 }

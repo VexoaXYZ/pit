@@ -12,7 +12,8 @@ use crate::model::*;
 /// `kv` namespaces that are Pit's own records, not cache entries: never
 /// evicted or counted as artifacts. `last` (a task's last result),
 /// `pr-origin` (whether a pull request comes from a fork), `annotated`
-/// (checks whose annotations were sent).
+/// (checks whose annotations were sent), `shard-check` (a sharded group's
+/// combined check run, and the newest left-out copy of one).
 macro_rules! internal_kv {
     () => {
         "('last', 'pr-origin', 'annotated', 'shard-check')"

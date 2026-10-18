@@ -241,7 +241,8 @@ pub fn translate(stem: &str, src: &str) -> Result<Vec<TsGroup>> {
             continue;
         }
         let group = if jobs.len() == 1 && slug(id) == "build" {
-            stem.to_string()
+            // `#` names shards, so a group can't have it.
+            stem.replace('#', "-")
         } else {
             id.to_string()
         };
