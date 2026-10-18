@@ -229,6 +229,7 @@ pub struct WaitingGroup {
     pub name: String,
     pub os: String,
     pub arch: String,
+    pub min_cpus: u32,
     pub needs: Vec<Backend>,
     pub message: Option<String>,
     pub lock: Option<String>,
@@ -303,6 +304,12 @@ fn migrate(conn: &Connection) -> Result<()> {
         .exists([])?;
     if !has_arch {
         conn.execute_batch("ALTER TABLE groups_ ADD COLUMN arch TEXT NOT NULL DEFAULT 'any'")?;
+    }
+    let has_min_cpus: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'min_cpus'")?
+        .exists([])?;
+    if !has_min_cpus {
+        conn.execute_batch("ALTER TABLE groups_ ADD COLUMN min_cpus INTEGER NOT NULL DEFAULT 0")?;
     }
     let has_lock_until: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('groups_') WHERE name = 'lock_until'")?
@@ -906,12 +913,13 @@ impl Db {
         backends: &[Backend],
         tasks: &[(String, TaskDef)],
     ) -> Result<String> {
-        self.insert_locked_group(run_id, name, os, "any", backends, tasks, None)
+        self.insert_locked_group(run_id, name, os, "any", 0, backends, tasks, None)
     }
 
-    /// `insert_group` with a lock (see `GroupDef::lock`) and a CPU
-    /// architecture (`any`, or what a worker must have), set in the same
-    /// statement so the group is never claimable without them.
+    /// `insert_group` with a lock (see `GroupDef::lock`), a CPU architecture
+    /// (`any`, or what a worker must have) and the fewest CPUs a worker must
+    /// have, set in the same statement so the group is never claimable
+    /// without them.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_locked_group(
         &self,
@@ -919,6 +927,7 @@ impl Db {
         name: &str,
         os: &str,
         arch: &str,
+        min_cpus: u32,
         backends: &[Backend],
         tasks: &[(String, TaskDef)],
         lock: Option<&str>,
@@ -928,8 +937,8 @@ impl Db {
         let gid = new_id("grp");
         let now = now_ms();
         tx.execute(
-            "INSERT INTO groups_ (id, run_id, name, os, backends, status, created_at, lock_name, arch) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8)",
-            params![gid, run_id, name, os, serde_json::to_string(backends)?, now, lock, arch],
+            "INSERT INTO groups_ (id, run_id, name, os, backends, status, created_at, lock_name, arch, min_cpus) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
+            params![gid, run_id, name, os, serde_json::to_string(backends)?, now, lock, arch, min_cpus],
         )?;
         for (pos, (tname, def)) in tasks.iter().enumerate() {
             tx.execute(
@@ -1054,6 +1063,7 @@ impl Db {
                  WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                    AND (groups_.os = 'any' OR groups_.os = ?1)
                    AND (groups_.arch = 'any' OR groups_.arch = ?3)
+                   AND groups_.min_cpus <= ?4
                    AND (groups_.lock_name IS NULL OR (NOT EXISTS (
                      SELECT 1 FROM groups_ held WHERE held.lock_name = groups_.lock_name
                        AND (held.status = 'running' OR held.lock_until > ?2))
@@ -1084,7 +1094,8 @@ impl Db {
                    groups_.created_at, groups_.rowid",
             )?;
             let arch = crate::model::canonical_arch(&worker.arch);
-            let mut rows = st.query_map(params![worker.os, now, arch], |r| {
+            let cpus = worker.cpus as i64;
+            let mut rows = st.query_map(params![worker.os, now, arch, cpus], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -2311,7 +2322,7 @@ impl Db {
                groups_.lock_name,
                (SELECT held.run_id FROM groups_ held WHERE held.lock_name = groups_.lock_name
                   AND (held.status = 'running' OR held.lock_until > ?2) LIMIT 1),
-               groups_.arch
+               groups_.arch, groups_.min_cpus
              FROM groups_ JOIN runs ON runs.id = groups_.run_id
              WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                AND groups_.created_at < ?1",
@@ -2329,6 +2340,7 @@ impl Db {
                     lock: r.get(6)?,
                     lock_holder: r.get(7)?,
                     arch: r.get(8)?,
+                    min_cpus: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2846,6 +2858,41 @@ mod tests {
     }
 
     #[test]
+    fn a_group_that_needs_more_cpus_goes_only_to_a_big_enough_worker() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let run = db
+            .insert_run(&repo.id, "sha", None, None, 0, "test", false, None, false)
+            .unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let heavy = db
+            .insert_locked_group(&run, "verify", "linux", "any", 6, &[], &task, None)
+            .unwrap();
+        let worker = |cpus: usize| WorkerInfo {
+            name: format!("w{cpus}"),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cpus,
+            backends: vec![Backend::Host],
+            kvm: false,
+            protocol: crate::model::PROTOCOL,
+        };
+        assert!(db.claim_group(&worker(3)).unwrap().0.is_none());
+        let job = db
+            .claim_group(&worker(6))
+            .unwrap()
+            .0
+            .expect("6 cpus is enough");
+        assert_eq!(job.group_id, heavy);
+    }
+
+    #[test]
     fn a_group_pinned_to_an_arch_goes_only_to_a_worker_with_it() {
         let db = Db::memory().unwrap();
         let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
@@ -2860,7 +2907,7 @@ mod tests {
             },
         )];
         let arm = db
-            .insert_locked_group(&run, "b@aarch64", "linux", "aarch64", &[], &task, None)
+            .insert_locked_group(&run, "b@aarch64", "linux", "aarch64", 0, &[], &task, None)
             .unwrap();
         let worker = |arch: &str| WorkerInfo {
             name: arch.into(),
@@ -2952,7 +2999,16 @@ mod tests {
                 .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
                 .unwrap();
             let g = db
-                .insert_locked_group(&run, "it", "linux", "any", &[], &task, Some("r:staging-db"))
+                .insert_locked_group(
+                    &run,
+                    "it",
+                    "linux",
+                    "any",
+                    0,
+                    &[],
+                    &task,
+                    Some("r:staging-db"),
+                )
                 .unwrap();
             db.set_run_planned(&run).unwrap();
             ids.push(g);
@@ -2989,7 +3045,16 @@ mod tests {
             .insert_run(&repo.id, "sha", None, None, 0, "local", false, None, false)
             .unwrap();
         let third = db
-            .insert_locked_group(&run, "it", "linux", "any", &[], &task, Some("r:staging-db"))
+            .insert_locked_group(
+                &run,
+                "it",
+                "linux",
+                "any",
+                0,
+                &[],
+                &task,
+                Some("r:staging-db"),
+            )
             .unwrap();
         assert!(db.cancel_run_because(&second.run_id, "cancelled").unwrap());
         assert!(db.claim_group(&worker).unwrap().0.is_none(), "still held");
@@ -3102,7 +3167,7 @@ mod tests {
             },
         )];
         let g = db
-            .insert_locked_group(&run, "g", "any", "any", &[], &task, None)
+            .insert_locked_group(&run, "g", "any", "any", 0, &[], &task, None)
             .unwrap();
         let files = vec![Artifact {
             path: "report/a.png".into(),

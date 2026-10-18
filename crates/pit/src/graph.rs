@@ -95,6 +95,8 @@ pub struct PlannedGroup {
     pub os: String,
     /// `any`, or the CPU architecture a worker must have.
     pub arch: String,
+    /// The fewest CPUs a worker must have (`GroupDef::cpus`); 0 for any.
+    pub min_cpus: u32,
     /// Task name and definition, in dependency order.
     pub tasks: Vec<(String, TaskDef)>,
     /// See `GroupDef::lock`.
@@ -179,6 +181,7 @@ pub fn plan_for(
                         .into_iter()
                         .map(|g| PlannedGroup {
                             arch: arch.clone(),
+                            min_cpus: group.cpus.unwrap_or(0),
                             lock: group.lock.clone(),
                             not_in: not_in.clone(),
                             ..g
@@ -208,6 +211,7 @@ fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<Planne
             name: name.to_string(),
             os: os.to_string(),
             arch: "any".into(),
+            min_cpus: 0,
             tasks: tasks.to_vec(),
             lock: None,
             not_in: None,
@@ -251,6 +255,7 @@ fn shard_groups(name: &str, os: &str, tasks: &[(String, TaskDef)]) -> Vec<Planne
                 name: format!("{name}#{k}"),
                 os: os.to_string(),
                 arch: "any".into(),
+                min_cpus: 0,
                 tasks,
                 lock: None,
                 not_in: None,
@@ -634,6 +639,21 @@ mod tests {
             (groups[0].name.as_str(), groups[0].arch.as_str()),
             ("ci", "aarch64")
         );
+    }
+
+    #[test]
+    fn a_groups_cpus_reach_every_instance_and_shard() {
+        let mut config = sample();
+        let ci = config.groups.get_mut("ci").unwrap();
+        ci.cpus = Some(6);
+        ci.tasks.get_mut("lint").unwrap().shards = Some(2);
+        let groups = plan(&config, &[]).unwrap();
+        assert!(
+            groups.len() > 2,
+            "{:?}",
+            groups.iter().map(|g| &g.name).collect::<Vec<_>>()
+        );
+        assert!(groups.iter().all(|g| g.min_cpus == 6));
     }
 
     #[test]

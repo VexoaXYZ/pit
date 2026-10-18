@@ -617,6 +617,7 @@ impl App {
                 &g.name,
                 &g.os,
                 &g.arch,
+                g.min_cpus,
                 &backends,
                 &g.tasks,
                 lock.as_deref(),
@@ -840,12 +841,14 @@ pub fn run_kinds(trigger: &str, trusted: bool, git_ref: Option<&str>) -> Vec<&'s
 pub fn waiting_reason(
     os: &str,
     arch: &str,
+    min_cpus: u32,
     needs: &[Backend],
     online: &[WorkerInfo],
 ) -> Option<String> {
     let fits = |w: &WorkerInfo| {
         (os == "any" || w.os == os)
             && (arch == "any" || crate::model::canonical_arch(&w.arch) == arch)
+            && w.cpus >= min_cpus as usize
             && needs.iter().all(|b| w.backends.contains(b))
     };
     if online.iter().any(fits) {
@@ -854,6 +857,9 @@ pub fn waiting_reason(
     let mut need = vec![format!("os {os}")];
     if arch != "any" {
         need.push(format!("arch {arch}"));
+    }
+    if min_cpus > 0 {
+        need.push(format!("{min_cpus}+ cpus"));
     }
     need.extend(
         needs
@@ -868,7 +874,14 @@ pub fn waiting_reason(
             .iter()
             .map(|w| {
                 let b: Vec<&str> = w.backends.iter().map(|b| b.as_str()).collect();
-                format!("{} ({} {}; {})", w.name, w.os, w.arch, b.join(", "))
+                format!(
+                    "{} ({} {}, {} cpus; {})",
+                    w.name,
+                    w.os,
+                    w.arch,
+                    w.cpus,
+                    b.join(", ")
+                )
             })
             .collect();
         format!("online: {}", list.join(", "))
@@ -892,11 +905,12 @@ impl App {
             .map(|(w, _, _)| w)
             .collect();
         for g in self.db.waiting_groups(now - 3_000)? {
-            let reason = waiting_reason(&g.os, &g.arch, &g.needs, &online).or_else(|| {
-                let (lock, holder) = (g.lock.as_ref()?, g.lock_holder.as_ref()?);
-                let lock = lock.split_once(':').map_or(lock.as_str(), |(_, l)| l);
-                Some(format!("waiting: lock `{lock}` is held by {holder}"))
-            });
+            let reason =
+                waiting_reason(&g.os, &g.arch, g.min_cpus, &g.needs, &online).or_else(|| {
+                    let (lock, holder) = (g.lock.as_ref()?, g.lock_holder.as_ref()?);
+                    let lock = lock.split_once(':').map_or(lock.as_str(), |(_, l)| l);
+                    Some(format!("waiting: lock `{lock}` is held by {holder}"))
+                });
             let ours = g
                 .message
                 .as_deref()
@@ -1146,31 +1160,40 @@ mod waiting_tests {
             waiting_reason(
                 "linux",
                 "any",
+                0,
                 &[Backend::Host],
                 std::slice::from_ref(&linux)
             ),
             None
         );
         assert_eq!(
-            waiting_reason("any", "any", &[], std::slice::from_ref(&linux)),
+            waiting_reason("any", "any", 0, &[], std::slice::from_ref(&linux)),
             None
         );
         let mac = waiting_reason(
             "macos",
             "any",
+            0,
             &[Backend::Host],
             std::slice::from_ref(&linux),
         )
         .unwrap();
         assert!(
-            mac.contains("needs os macos") && mac.contains("local (linux x86_64; host, sandbox)"),
+            mac.contains("needs os macos")
+                && mac.contains("local (linux x86_64, 8 cpus; host, sandbox)"),
             "{mac}"
         );
-        let arm = waiting_reason("linux", "aarch64", &[], std::slice::from_ref(&linux)).unwrap();
+        let arm = waiting_reason("linux", "aarch64", 0, &[], std::slice::from_ref(&linux)).unwrap();
         assert!(arm.contains("needs os linux, arch aarch64"), "{arm}");
-        let docker = waiting_reason("linux", "any", &[Backend::Docker], &[linux]).unwrap();
+        let big = waiting_reason("linux", "any", 16, &[], std::slice::from_ref(&linux)).unwrap();
+        assert!(big.contains("needs os linux, 16+ cpus"), "{big}");
+        assert_eq!(
+            waiting_reason("linux", "any", 8, &[], std::slice::from_ref(&linux)),
+            None
+        );
+        let docker = waiting_reason("linux", "any", 0, &[Backend::Docker], &[linux]).unwrap();
         assert!(docker.contains("backend docker"), "{docker}");
-        assert!(waiting_reason("linux", "any", &[], &[])
+        assert!(waiting_reason("linux", "any", 0, &[], &[])
             .unwrap()
             .contains("no workers are online"));
     }

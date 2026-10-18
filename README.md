@@ -82,6 +82,7 @@ The fields you'll use most:
 | `image` | Run the task in a container. |
 | `shards` | Split a slow task across workers. |
 | `os`, `arch` (group) | Run a copy of the group per OS or CPU architecture. |
+| `cpus` (group) | Only run it on a worker with at least this many CPUs. |
 
 Groups also take `on` (which kinds of run they're in), `lock` (one at a time across runs),
 `services` (a database for the tests) and `schedules`. All of it is in
