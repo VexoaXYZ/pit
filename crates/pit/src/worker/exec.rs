@@ -332,6 +332,12 @@ pub async fn run(
             Ok(())
         });
     }
+    // Every process the task starts inherits this, a daemon that leaves its
+    // session included (`setsid`, `--daemonize`): after the task, whatever
+    // still carries it is stopped, as GitHub's runner does with
+    // `RUNNER_TRACKING_ID`.
+    let tracking = crate::model::new_id("track");
+    cmd.env(TRACKING_ENV, &tracking);
     let oom_before = super::memory::oom_kills();
     let mut child = cmd.spawn().context("spawning task")?;
     let pid = child.id();
@@ -461,7 +467,13 @@ pub async fn run(
         }
     }
     kill_tree(pid);
+    let leftovers = kill_tracked(&tracking);
     let mut log = collector.await.unwrap_or_default();
+    if leftovers > 0 {
+        log.push_str(&format!(
+            "\n[pit: stopped {leftovers} process(es) the task left running]\n"
+        ));
+    }
     if went_idle {
         let secs = limits.idle.map(|d| d.as_secs()).unwrap_or_default();
         log.push_str(&format!(
@@ -515,6 +527,47 @@ async fn pump(stream: impl AsyncRead + Unpin, tx: mpsc::UnboundedSender<String>)
                 }
             }
         }
+    }
+}
+
+/// See `run`: the variable whose value marks a task's processes.
+pub const TRACKING_ENV: &str = "PIT_TRACKING_ID";
+
+/// Stops every process whose environment carries this task's tracking id
+/// (Linux, where `/proc` shows it; only processes of this user are
+/// readable). Returns how many.
+fn kill_tracked(tracking: &str) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let needle = format!("{TRACKING_ENV}={tracking}");
+        let me = std::process::id();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return 0;
+        };
+        let mut n = 0;
+        for e in entries.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid == me {
+                continue;
+            }
+            let Ok(environ) = std::fs::read(e.path().join("environ")) else {
+                continue;
+            };
+            if environ.split(|b| *b == 0).any(|v| v == needle.as_bytes()) {
+                // SAFETY: plain syscall on a pid that carries this task's id.
+                if unsafe { libc_kill(pid as i32, 9) } == 0 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = tracking;
+        0
     }
 }
 
@@ -686,6 +739,42 @@ mod tests {
         .unwrap();
         assert_eq!(out.exit_code, Some(0), "{}", out.log);
         assert!(out.log.contains("own-session"), "{}", out.log);
+    }
+
+    /// A daemon a task starts in a session of its own (out of reach of the
+    /// process-group kill) is stopped when the task ends.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_daemon_a_task_leaves_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        // A sleep length no other test uses, to find it afterwards.
+        let task = TaskDef {
+            run: "setsid -f sleep 7781; echo started".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let out = run(
+            command(&task, Backend::Host, dir.path(), &[]),
+            Limits::default(),
+            tx,
+            never(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{}", out.log);
+        assert!(
+            out.log
+                .contains("stopped 1 process(es) the task left running"),
+            "{}",
+            out.log
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let alive = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+            .any(|c| c == b"sleep\x007781\x00");
+        assert!(!alive, "the daemon outlived its task");
     }
 
     #[cfg(unix)]
