@@ -6026,3 +6026,64 @@ async fn a_workers_git_config_does_not_change_its_checkout() {
     let v = run(&pit, &dir).await;
     assert_eq!(v.status, Status::Passed, "{v:?}");
 }
+
+/// Each host task gets a temp dir of its own, removed with its job: tasks
+/// running at once don't collide on a fixed name in `/tmp`, and nothing
+/// they leave there reaches a later run (another repo's included).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tasks_get_their_own_temp_dir_removed_with_the_job() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let seen = tempfile::tempdir().unwrap();
+    let task = |me: &str| {
+        serde_json::json!({ "tasks": { "t": {
+            "run": format!(
+                "echo {me} > \"$TMPDIR/owner\" && sleep 1 && test \"$(cat \"$TMPDIR/owner\")\" = {me} \
+                 && test \"$TMP\" = \"$TMPDIR\" && echo \"$TMPDIR\" > {}/{me}",
+                seen.path().display()
+            ),
+            "cache": false,
+        } } })
+    };
+    let mut config = serde_json::json!({ "groups": {} });
+    config["groups"]["one"] = task("one");
+    config["groups"]["two"] = task("two");
+    // A retry starts with an empty temp dir.
+    config["groups"]["retry"] = serde_json::json!({ "tasks": { "t": {
+        "run": format!(
+            "test ! -e \"$TMPDIR/mark\" && touch \"$TMPDIR/mark\" && {{ test -e {0}/tried || {{ touch {0}/tried; exit 1; }}; }}",
+            seen.path().display()
+        ),
+        "retries": 1,
+        "cache": false,
+    } } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let v = run(&pit, dir).await;
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    let temp = |me: &str| {
+        std::path::PathBuf::from(
+            std::fs::read_to_string(seen.path().join(me))
+                .unwrap()
+                .trim(),
+        )
+    };
+    let (one, two) = (temp("one"), temp("two"));
+    assert_ne!(one, two);
+    // Short, so sockets made in it fit: `tmp/<8>/<8>`.
+    let rel = one
+        .strip_prefix(pit._data.path().join("worker").join("tmp"))
+        .unwrap();
+    assert_eq!(rel.as_os_str().len(), 17, "{one:?}");
+    for _ in 0..100 {
+        if !one.exists() && !two.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!one.exists() && !two.exists(), "temp dirs outlived the job");
+}

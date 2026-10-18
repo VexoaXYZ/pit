@@ -128,6 +128,7 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
     // holds; the next job may check out over them.
     let _ = std::fs::remove_dir_all(opts.data_dir.join("debug"));
     let _ = std::fs::remove_dir_all(opts.data_dir.join("summaries"));
+    let _ = disk::remove_tree(&opts.data_dir.join("tmp"));
     let mut worker = Worker::new(
         opts.server.as_str(),
         opts.token.clone(),
@@ -696,6 +697,7 @@ impl Worker {
             .remove(&job.lease)
             .and_then(|slot| slot.get().and_then(|r| r.as_ref().ok().cloned()));
         let summaries = self.data_dir.join("summaries").join(&job.lease);
+        let temp = self.job_temp(&job.lease);
         hb.abort();
         let debug_dir = debug::dir(&self.data_dir, &job.group_id);
         if job.debug && debug::has_scripts(&debug_dir) {
@@ -706,8 +708,10 @@ impl Worker {
             let (w, ws) = (self.clone(), ws.clone());
             tokio::spawn(async move {
                 debug::hold(&debug_dir, debug::HOLD).await;
-                // The debug shell writes `$PIT_SUMMARY` there too.
+                // The debug shell writes `$PIT_SUMMARY` there too, and uses
+                // the task's `$TMPDIR`.
                 let _ = std::fs::remove_dir_all(&summaries);
+                remove_temp(temp);
                 // The debug shell can still reach the services until then.
                 if let Some(s) = services {
                     s.stop().await;
@@ -720,6 +724,7 @@ impl Worker {
             });
         } else {
             let _ = std::fs::remove_dir_all(&summaries);
+            remove_temp(temp);
             if let Some(s) = services {
                 s.stop().await;
             }
@@ -1410,6 +1415,19 @@ impl Worker {
         for k in ["PIT_SUMMARY", "GITHUB_STEP_SUMMARY"] {
             env.push((k.into(), summary_env.clone()));
         }
+        // A temp dir of its own, emptied with the job (as `RUNNER_TEMP` is):
+        // the worker's `/tmp` is shared by every task it runs, at once and
+        // over time, from any repo or branch (a fixed name such as Jest's
+        // cache dir collides or carries state across). A container has its
+        // own `/tmp` already. Made, empty, by each attempt.
+        let temp = (backend != Backend::Docker)
+            .then(|| self.job_temp(&job.lease).join(short_id(&task.id)));
+        if let Some(temp) = &temp {
+            let temp = temp.to_string_lossy().into_owned();
+            for k in ["TMPDIR", "TMP", "TEMP"] {
+                env.push((k.into(), temp.clone()));
+            }
+        }
         // One file per line, so names with spaces survive `xargs -d '\n'`.
         // The whole list is always in a file too: a big suite's list can be
         // more than the OS lets a process environment hold.
@@ -1545,6 +1563,10 @@ impl Worker {
         let outcome = loop {
             attempt += 1;
             files::clear_outputs(ws, &def.reports)?;
+            if let Some(temp) = &temp {
+                let _ = disk::remove_tree(temp);
+                std::fs::create_dir_all(temp)?;
+            }
             // Each attempt starts a summary of its own.
             files::write_file(&summary_path, b"", false)?;
             let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -2089,6 +2111,14 @@ impl Worker {
         Ok(())
     }
 
+    /// The parent of a job's task temp dirs (see `run_task`). Short: a Unix
+    /// socket made in one must fit in 104 bytes (macOS), and tests add their
+    /// own dirs under it. With the default data dir it is about as long as
+    /// macOS's own `$TMPDIR`.
+    fn job_temp(&self, lease: &str) -> PathBuf {
+        self.data_dir.join("tmp").join(short_id(lease))
+    }
+
     /// The `$HOME` a job's `docker` tasks keep between runs: one per repo and
     /// trust pool, like warm workspaces (P20), so neither another repo nor a
     /// branch can leave a poisoned tool cache for main. A fork's run, or a
@@ -2376,6 +2406,26 @@ async fn image_id(image: &str) -> String {
         .output()
         .await;
     inspect().await.unwrap_or_else(|| "unavailable".into())
+}
+
+/// The first 8 characters of an id's random part (`lease_1a2b3c4d5e6f`).
+fn short_id(id: &str) -> &str {
+    let tail = id.rsplit_once('_').map_or(id, |(_, t)| t);
+    &tail[..tail.len().min(8)]
+}
+
+/// Removes a job's temp dirs in the background: the job's result is not held
+/// up by a big tree.
+fn remove_temp(temp: PathBuf) {
+    tokio::task::spawn_blocking(move || {
+        // None was made when no task ran on the host (containers, cache hits).
+        match disk::remove_tree(&temp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("removing {}: {e}", temp.display());
+            }
+            _ => {}
+        }
+    });
 }
 
 /// Deletes the index of every git directory under `dir` (the submodules',

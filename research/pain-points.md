@@ -5511,3 +5511,79 @@ interrupted-pass cases rest on the e2e test, which fails on that version.
   checkout (a `filter` driver, `core.symlinks=false`).
 - **Windows workers** now check out LF unless `.gitattributes` says otherwise, unlike GitHub's
   Windows runners. That is deliberate: the bytes are the commit's, as on every other worker.
+
+## P87. Jobs on one machine share `/tmp`: they collide, and leave things for the next one
+
+**The pain.** Several runners or jobs on one host share its disk, temp dirs included. In
+[czepter/kaletacms#73](https://github.com/czepter/kaletacms/issues/73) (October 2026), runners
+sharing a host saw "a half-written shared binary" and "failures that pass on re-run", and quote
+setup-php's docs: "Do not set up multiple self-hosted runners on a single server instance as
+parallel workflows will conflict with each other." GitHub's own answer for temp files is a
+directory per runner, `RUNNER_TEMP`, which "is emptied at the beginning and end of each job"
+([GitHub docs](https://docs.github.com/en/actions/reference/workflows-and-actions/variables));
+`/tmp` itself is not.
+
+Pit runs several groups at once on one worker (`--slots`), and its host and sandbox tasks used
+the worker's own `TMPDIR`. Tools put fixed names there: Jest keeps its transform cache in
+`os.tmpdir()` + `jest_<uid>`
+([getCacheDirectory.ts](https://github.com/jestjs/jest/blob/main/packages/jest-config/src/getCacheDirectory.ts)),
+one directory for every job the worker runs.
+Containers get a `/tmp` of their own already.
+
+**Reproduction** (`/tmp/painhunt/p87`, a scratch server on port 7981, one worker with 2
+slots). Two groups each write their name to `$TMPDIR/p87-cache/owner`, wait 2 s and check it:
+```
+✗ one.t: exited with 1
+  │ /tmp/p87-cache/owner was overwritten by two-2530681
+```
+Then a task in another repo looked for that file, and found it:
+```
+✗ default.check: exited with 1
+  │ found another repo's file: /tmp/p87-cache/owner
+```
+Nothing removes it, so state crosses from run to run, from any repo or branch to any other on
+that worker, which is what P66 closed for workspaces.
+
+**Fix.**
+- **A dir per task.** Each host or sandbox task gets `TMPDIR`, `TMP` and `TEMP` set to a
+  directory of its own, `<worker data>/tmp/<job>/<task>`, using 8 characters of each id.
+- **Short.** A Unix socket's path must fit in 104 bytes on macOS and 108 on Linux, and tests add
+  their own dirs below. With the default data dir it is about as long as macOS's own `$TMPDIR`.
+- **Empty for every attempt.** A retry doesn't see what the failed attempt left.
+- **Removed with the job,** in the background, where the job's summaries are. When `--debug`
+  keeps a failed workspace, that happens once the debug shell is done, since the shell uses the
+  same `TMPDIR`. A worker clears its whole `tmp` directory when it starts.
+
+**After** (rebuilt server and worker, same repos):
+```
+one on box ✓ t 2.0s    two on box ✓ t 2.0s    passed
+b: ✓ check   passed     (the old run's /tmp/p87-cache is still in /tmp; the task no longer looks there)
+   clean; TMPDIR=/tmp/painhunt/p87-data/w/worker/tmp/07ef3c4e/91dd6d64 (53 chars, a deep scratch --data)
+<worker data>/tmp after the runs: empty
+```
+The e2e test `tasks_get_their_own_temp_dir_removed_with_the_job` runs two groups at once on the
+same name under `$TMPDIR`, checks that their dirs differ and sit under the worker's `tmp`, and
+that both are gone after the job. Without the fix the run fails on the collision. A third group,
+with `retries: 1`, fails if its second attempt finds the first one's file; without the
+per-attempt reset it does.
+
+**Review.** Three independent rounds.
+- **Round 1: changes.**
+  - **Path length.** The first paths (`<data>/tmp/lease_<12>/task_<12>`) were long enough
+    to break Unix sockets a test makes inside them. Fixed: the paths were shortened.
+  - **Nits, all fixed.** Removal held up the job's finish; retries shared the dir; removal
+    errors were dropped.
+  - **Kept in the worker's data dir,** not the shared `/tmp`. A startup sweep of `/tmp/pit-*`
+    would delete another worker's dirs on the same host.
+- **Round 2: changes.** The new warning also fired for jobs that never made a dir (containers
+  only); fixed, and checked live with a container-only job (no warning). A doc comment split
+  another's; fixed.
+- **Round 3: APPROVE.**
+
+**Verdict: SOLVED** for tools that use `TMPDIR` (`mktemp`, `os.tmpdir()`, Python's
+`tempfile`, Go's `os.TempDir`). Limits:
+- **Hardcoded paths.** A tool that writes to `/tmp` by name still shares it; only a mount
+  namespace would stop that, and host tasks don't get one.
+- **Steps share it.** Tasks of one job don't share a temp dir, unlike steps sharing
+  `RUNNER_TEMP`. Pass files between tasks through the workspace.
+- **`$HOME` is still shared** by host tasks on one worker; containers have their own (P59).
