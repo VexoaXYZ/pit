@@ -334,7 +334,8 @@ pub struct WorkerInfo {
     pub protocol: u32,
 }
 
-/// A group handed to a worker.
+/// A group handed to a worker. A field an older worker would ignore to a
+/// job's harm (secrets, confinement, cache scope) raises `PROTOCOL`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {

@@ -5300,3 +5300,63 @@ have no automated test.
   `tasks`) plans a plain `ci` group, whose check shares the combined check's name.
 - **Leftover rows.** The stored check-run ids outlive pruned runs, like the existing `annotated`
   key.
+
+## P84. An outdated runner keeps taking jobs it no longer understands
+
+**The pain.** Self-hosted fleets drift: a server is upgraded and some runners aren't. CI systems
+handle this with explicit version gates:
+- GitHub refuses jobs to self-hosted runners older than a minimum version, and runners
+  auto-update.
+- Jenkins agents need a compatible remoting version.
+
+Pit had none. P70 recorded the consequence as a limit: "an older worker skips the `[trusted]`
+header and hands those secrets to every task that asks".
+
+**Reproduction** (`/tmp/painhunt/p84`). A worker built from before P70 (`edb84b1`, in a temporary
+worktree), with a secrets file holding a `[trusted]` deploy key, ran against the current server
+(port 7878). A task on a `feature` branch asked for the key:
+```
+leak │ deploy key: 27 chars
+passed in 577ms
+```
+The server couldn't tell: `version` is the crate version (`0.1.0` in every build), and workers
+didn't send it anyway. Any job field an older worker doesn't know is silently ignored: secrets
+gating, confinement (P70), the cache token (P67), the zone defaults (P76).
+
+**Fix.**
+- **A protocol version.** `model::PROTOCOL` (1) is the job format a worker understands, sent in
+  every claim (`WorkerInfo.protocol`, absent and so 0 from older workers).
+- **A gate.** After the worker-token check, so an unauthenticated caller learns nothing, the
+  server refuses a claim below it with `426 Upgrade Required: this worker is older than the
+  server (protocol 0 < 1): upgrade pit on <name>`, and warns at most once a minute per worker.
+  A refused worker never gets a lease or a job, and isn't counted as online.
+- **When to raise it.** `PROTOCOL` goes up whenever a job field an older worker would ignore to
+  a job's harm is added; that rule is written on `Job` and on `PROTOCOL`.
+- **The other way round.** A new worker against an old server is harmless: the old server never
+  sets `trusted_secrets`, so `[trusted]` secrets stay withheld.
+
+**After** (same old worker, the server rebuilt):
+```
+old worker: WARN claim failed: 426 Upgrade Required: this worker is older than the server (protocol 0 < 1): upgrade pit on old-worker
+server:     WARN worker old-worker is older than this server (protocol 0 < 1); it gets no jobs until it is upgraded
+pit run:    no worker took the job
+```
+The e2e test `outdated_workers_get_no_jobs` checks that a claim without `protocol` gets a 426
+naming the worker, and that a current worker isn't refused. An existing test caught my first
+version checking the protocol before the worker token; the order is now right.
+
+**Review.** One independent round: APPROVE.
+- **The gate is complete.** Every other worker route needs a lease, and only a claim creates one.
+- **Fails closed.** A new worker against an old server withholds `[trusted]` secrets.
+- **The right scope.** Gating all jobs, not just ones with secrets, is right: the server can't
+  know a worker's secrets, and old workers lack several fields.
+- **Nits.** One is fixed: the rule is now on `Job`. Two are declined: an old worker still running
+  a job claimed before the upgrade counts as online until that job ends, and its waiting groups'
+  hint doesn't mention the version.
+
+**Verdict: SOLVED.** Limits:
+- **Order.** Upgrading means the server first, then the workers. Until a worker is upgraded, its
+  jobs wait, and the run says "no online worker" rather than naming the version; the server's
+  warning does.
+- **In-flight jobs.** A job an old worker claimed before the server was upgraded runs to its end.
+- **Raising it.** `PROTOCOL` must be raised by hand when such a field is added.
