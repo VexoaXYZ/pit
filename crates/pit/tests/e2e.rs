@@ -4083,6 +4083,19 @@ async fn container_homes_persist_per_trust_pool() {
         first_log(&pit, &main).await.contains("cold"),
         "trusted runs shared the untrusted home"
     );
+    // Another repo on the worker has its own home too.
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    write(&other, "pit.config.json", &config.to_string());
+    sh(
+        &other,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let other_run = run(&pit, &other).await;
+    assert!(
+        first_log(&pit, &other_run).await.contains("cold"),
+        "repos shared a home"
+    );
 }
 
 /// The log of a run's first task.
