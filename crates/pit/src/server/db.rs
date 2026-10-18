@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS groups_ (
 );
 CREATE INDEX IF NOT EXISTS groups_status ON groups_(status, created_at);
 CREATE INDEX IF NOT EXISTS groups_run ON groups_(run_id);
+CREATE INDEX IF NOT EXISTS groups_run_status ON groups_(run_id, status);
 
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
@@ -962,7 +963,8 @@ impl Db {
         Ok(gid)
     }
 
-    /// Claims the oldest queued group this worker can run. Returns the job,
+    /// Claims the next queued group this worker can run (priority class, then
+    /// fewest groups running in its run, then oldest). Returns the job,
     /// and whether some group was held back for another worker (see below),
     /// so the caller knows to look again shortly.
     ///
@@ -985,6 +987,8 @@ impl Db {
         // then the oldest group: a run that fans out into many groups shares
         // the workers with the runs queued after it rather than holding all
         // of them until it is done (one agent's run stalling everyone else's).
+        // Not merge queue runs: a lane's candidates (tip+A, tip+A+B, …) land
+        // in order, so the oldest should finish, and fail, first.
         let pick = {
             let mut st = tx.prepare(
                 "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends, groups_.created_at,
@@ -1026,8 +1030,8 @@ impl Db {
                        AND (CASE WHEN planning.trigger = 'queue' THEN 0 WHEN planning.trusted = 1 THEN 1 ELSE 2 END)
                          <= (CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END))))
                  ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
-                   (SELECT COUNT(*) FROM groups_ busy
-                     WHERE busy.run_id = groups_.run_id AND busy.status = 'running'),
+                   CASE WHEN runs.trigger = 'queue' THEN 0 ELSE (SELECT COUNT(*) FROM groups_ busy
+                     WHERE busy.run_id = groups_.run_id AND busy.status = 'running') END,
                    groups_.created_at",
             )?;
             let mut rows = st.query_map(params![worker.os, now], |r| {
@@ -2652,6 +2656,15 @@ mod tests {
         let queue = run("queue");
         let queue_group = db.insert_group(&queue, "q", "linux", &[], &task).unwrap();
         assert_eq!(claim(), queue_group);
+        // Merge queue runs stay oldest first: a lane's next candidate waits
+        // for the earlier one's groups, even with one of them running.
+        let queue_2 = db.insert_group(&queue, "q2", "linux", &[], &task).unwrap();
+        let later_queue = run("queue");
+        let later_queue_group = db
+            .insert_group(&later_queue, "q", "linux", &[], &task)
+            .unwrap();
+        assert_eq!(claim(), queue_2);
+        assert_eq!(claim(), later_queue_group);
         assert_eq!(claim(), small_group);
         // Then the big run's groups, oldest first.
         assert_eq!(claim(), big_groups[1]);
