@@ -4996,3 +4996,67 @@ On the old code it fails with "No names found".
   push to. The merge queue pushes explicit refs, never tags. The new host-side `git fetch` runs in
   `prepare`, before any of the job's containers start, as `checkout` already does; confined jobs
   get fresh workspaces (P70).
+
+## P79. `[skip ci]`: the release bot's commit runs everything, and skipping must not mean passing
+
+**The pain.** Release tools commit version bumps and changelogs back to the default branch and mark
+them `[skip ci]` so CI doesn't run, or loop, again. GitHub honours `[skip ci]`, `[ci skip]`,
+`[no ci]`, `[skip actions]` and `[actions skip]` in a pushed commit or a PR's head commit
+([GitHub: Skipping workflow runs](https://docs.github.com/actions/managing-workflow-runs/skipping-workflow-runs)).
+The catch is required checks: "checks associated with that workflow will remain in a 'Pending'
+state. A pull request that requires those checks to be successful will be blocked from merging"
+([same page](https://docs.github.com/actions/managing-workflow-runs/skipping-workflow-runs),
+[Troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)).
+Users then look for workarounds
+([community #142210](https://github.com/orgs/community/discussions/142210),
+[#26698](https://github.com/orgs/community/discussions/26698),
+[ittrip.xyz](https://en.ittrip.xyz/windows/troubleshooting/skip-ci-pending-checks)).
+That pending state is deliberate: if a skip reported success, anyone could get a change past CI by
+writing three words in a commit message.
+
+**Reproduction** (a scratch `pit up` in GitHub token mode on port 7575; a signed `push` webhook
+for a release bot's commit `chore(release): 1.0.1 [skip ci]`):
+```
+{"run":"run_37d4f68d99d8"}
+run_37d4f68d99d8   passed   push   main   acme/rel@19cbf0aa 1 tasks   ← the full suite ran
+```
+Checking what Pit would post for a skipped run turned up a second bug. A run that ends Skipped with
+no groups posted a `pit / plan` status with state **failure** in token mode. P72's skipped drafts
+had been doing that since P72: a red X on every draft push.
+
+**Fix.**
+- **The markers.** A `push` or `pr` run whose head commit message contains GitHub's markers, or
+  `[skip pit]` (case-insensitive, read from the server's mirror), ends Skipped with "[skip ci] in
+  the commit message".
+- **What never skips.** The merge queue, post-merge backstop, schedules, reruns, `/retest` and
+  `pit run` always run, so `/retest` runs a skipped PR commit.
+- **Nothing posted.** A run skipped on purpose (a skip marker, a draft, a batched queue candidate)
+  posts no status or check, as GitHub posts nothing for a skipped workflow. Required group checks
+  stay pending: no red X, and no green that could satisfy a required check.
+- **Only active runs are marked.** The skip (and P72's draft skip) only applies to a run still
+  active, so a run superseded while its commit was fetched keeps "superseded by …".
+
+**After:**
+```
+{"run":"run_61ffe72b7c3b"}
+run_61ffe72b7c3b skipped 0 groups, [skip ci] in the commit message
+```
+Tests:
+- the unit test `skip_markers_are_found_anywhere_any_case`;
+- the e2e test `skip_ci_skips_pushes_but_not_pit_run`: a push-triggered run of a `[skip ci]` commit
+  is skipped with no groups, and `pit run` of the same commit passes;
+- the draft e2e test now records statuses from a fake GitHub API and asserts a skipped draft posts
+  none. It fails on the old code.
+
+**Review.** One independent round: APPROVE.
+- **No bypass.** A PR author can reach only the `push` and `pr` triggers. Reruns, retests and the
+  queue keep their own, and queue admission never reads the PR run's result.
+- **Nothing on main breaks.** Notify ignores skipped runs, and `green_commits` takes only passed
+  runs, so "affected" falls back to an older base.
+- **Nits.** Its two nits are fixed: the skip overwrote a superseded run, and `/retest` for a
+  skipped PR commit wasn't documented.
+
+**Verdict: SOLVED.** Limits:
+- A maintainer's `pit:run` label on a fork commit that says `[skip ci]` also skips; `/retest` runs
+  it, keeping the fork's restrictions.
+- In GitHub App mode a skipped commit has no check, so no Re-run button either.

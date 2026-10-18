@@ -453,12 +453,13 @@ impl App {
                 .await
                 .unwrap_or_default();
             if let Some(marker) = skip_marker(&message) {
-                self.db.set_run_status(
-                    run_id,
-                    Status::Skipped,
-                    Some(&format!("{marker} in the commit message")),
-                )?;
-                self.run_finished(run_id).await;
+                // Only if still active: it may have been superseded meanwhile.
+                if self
+                    .db
+                    .skip_run_because(run_id, &format!("{marker} in the commit message"))?
+                {
+                    self.run_finished(run_id).await;
+                }
                 return Ok(());
             }
         }
@@ -481,14 +482,12 @@ impl App {
             .await?;
         let t_config = t0.elapsed();
         if req.draft && config.drafts == Some(false) {
-            self.db.set_run_status(
+            if self.db.skip_run_because(
                 run_id,
-                Status::Skipped,
-                Some(
-                    "draft pull request: runs when it is marked ready for review (`drafts: false`)",
-                ),
-            )?;
-            self.run_finished(run_id).await;
+                "draft pull request: runs when it is marked ready for review (`drafts: false`)",
+            )? {
+                self.run_finished(run_id).await;
+            }
             return Ok(());
         }
         // `on`: which groups this kind of run includes. Tasks named on the

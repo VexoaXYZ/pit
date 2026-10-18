@@ -349,7 +349,8 @@ with a plain token too, where checks have no Re-run button.
 `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]` or `[skip pit]` gets no run, as on
 GitHub: a release bot's version bump doesn't run CI again. As on GitHub, nothing is reported for
 it, so a required check waits rather than passes; three words in a commit message don't get a
-change past CI. The merge queue, schedules, reruns and `pit run` always run.
+change past CI. The merge queue, schedules, reruns and `pit run` always run, so a `/retest`
+comment runs a skipped pull request commit.
 
 **Drafts.** Draft pull requests run like any other by default. With `drafts: false` in the
 config, a draft's pushes get no run and post no checks. GitHub can't merge a draft, so required
