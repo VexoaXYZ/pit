@@ -344,6 +344,13 @@ member or collaborator reruns the commit Pit last ran for it, with the same rest
 stays a fork's). Passed tasks come back from the cache, so only what failed runs again. It works
 with a plain token too, where checks have no Re-run button.
 
+**Drafts.** Draft pull requests run like any other by default. With `drafts: false` in the
+config, a draft's pushes get no run and post no checks. GitHub can't merge a draft, so required
+checks just wait. Marking it ready for review (`ready_for_review`, which needs the
+`pull_request` event, already subscribed) runs its head commit. This replaces the usual
+`if: draft == false` job condition, whose skipped check counts as passed and isn't rerun when the
+draft becomes ready.
+
 **Forks.** A pull request from a fork never runs on its own: its code, `pit.config.ts`
 included, is someone else's. A maintainer who has read it adds the `pit:run` label, which
 runs that one commit. A later push needs the label again, so nobody can swap code in after a

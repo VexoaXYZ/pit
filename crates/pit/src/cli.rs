@@ -132,6 +132,7 @@ pub async fn submit(
                 counts_as: None,
                 no_secrets: false,
                 trusted: false,
+                draft: false,
             },
         )
         .await?;

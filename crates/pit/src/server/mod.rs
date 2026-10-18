@@ -461,6 +461,17 @@ impl App {
             )
             .await?;
         let t_config = t0.elapsed();
+        if req.draft && config.drafts == Some(false) {
+            self.db.set_run_status(
+                run_id,
+                Status::Skipped,
+                Some(
+                    "draft pull request: runs when it is marked ready for review (`drafts: false`)",
+                ),
+            )?;
+            self.run_finished(run_id).await;
+            return Ok(());
+        }
         // `on`: which groups this kind of run includes. Tasks named on the
         // command line or in a schedule always run; a merge queue lane names
         // its tasks too, and still follows `on`.

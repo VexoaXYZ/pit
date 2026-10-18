@@ -21,6 +21,11 @@ pub struct PitConfig {
     /// that branch.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub schedules: BTreeMap<String, Schedule>,
+    /// `false`: pull requests marked draft get no run until they are marked
+    /// ready for review (GitHub cannot merge a draft, so nothing waits on
+    /// it). Default true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drafts: Option<bool>,
 }
 
 /// A scheduled run, e.g. a nightly `pit verify`.
@@ -303,6 +308,10 @@ pub struct CreateRun {
     /// `server::trusted_branch`.
     #[serde(skip)]
     pub trusted: bool,
+    /// A draft pull request's run: skipped when the config says
+    /// `drafts: false`. Only the server sets it.
+    #[serde(skip)]
+    pub draft: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

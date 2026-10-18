@@ -169,6 +169,12 @@ export interface PitConfig {
    * `{ cron: "17 3 * * *", fresh: true, noCache: true }`.
    */
   schedules?: Record<string, Schedule>;
+  /**
+   * `false`: a pull request marked draft gets no run until it is marked ready
+   * for review (GitHub can't merge a draft, so nothing waits on it). Default
+   * true.
+   */
+  drafts?: boolean;
 }
 
 export interface Schedule {

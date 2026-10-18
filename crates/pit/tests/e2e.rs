@@ -2783,6 +2783,7 @@ async fn failed_tests_are_annotated_on_the_check() {
                 counts_as: None,
                 no_secrets: false,
                 trusted: false,
+                draft: false,
             },
             None,
         )
@@ -3068,6 +3069,7 @@ async fn run_ref(pit: &Pit, url: &str, sha: String, git_ref: &str, trusted: bool
                 counts_as: None,
                 no_secrets: false,
                 trusted,
+                draft: false,
             },
             None,
         )
@@ -3517,6 +3519,7 @@ async fn groups_run_only_on_the_kinds_of_run_they_name() {
                 counts_as: None,
                 no_secrets: false,
                 trusted: true,
+                draft: false,
             },
             None,
         )
@@ -3635,6 +3638,7 @@ async fn groups_left_out_by_on_still_report_their_check() {
                 counts_as: None,
                 no_secrets: false,
                 trusted: false,
+                draft: false,
             },
             Some(1),
         )
@@ -3688,6 +3692,7 @@ async fn groups_left_out_by_on_still_report_their_check() {
                 counts_as: None,
                 no_secrets: false,
                 trusted: false,
+                draft: false,
             },
             None,
         )
@@ -3858,6 +3863,7 @@ async fn a_real_check_is_reposted_over_a_newer_left_out_one() {
                         counts_as: None,
                         no_secrets: false,
                         trusted: false,
+                        draft: false,
                     },
                     pr,
                 )
@@ -3963,6 +3969,7 @@ async fn every_deploy_runs_in_order_under_a_lock() {
                     counts_as: None,
                     no_secrets: false,
                     trusted: true,
+                    draft: false,
                 },
                 None,
             )
@@ -4205,6 +4212,7 @@ async fn github_reporting_posts_each_change_once() {
                 counts_as: None,
                 no_secrets: false,
                 trusted: false,
+                draft: false,
             },
             Some(1),
         )
@@ -4318,6 +4326,7 @@ async fn rate_limited_reports_are_retried() {
                 counts_as: None,
                 no_secrets: false,
                 trusted: false,
+                draft: false,
             },
             Some(1),
         )
@@ -5274,4 +5283,92 @@ async fn read_only_leftovers_do_not_break_the_next_run() {
         let v = run(&pit, dir).await;
         assert_eq!(v.status, Status::Passed, "run {i}: {v:?}");
     }
+}
+
+/// `drafts: false`: a draft pull request gets no run (it reports nothing,
+/// so required checks wait); marking it ready for review runs it. Without
+/// the setting, drafts run as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn draft_pull_requests_run_when_marked_ready() {
+    use hmac::Mac;
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    // No GitHub API to report to: posting statuses fails, quietly.
+    let github =
+        pit::server::github::GitHub::with_token("http://127.0.0.1:9", "t", Some("s3cret".into()))
+            .unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("w".into()),
+        data_dir: data.path().join("worker"),
+        slots: 2,
+        parallelism: 2,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let client = Client::new(&base, None).unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    sh(dir, "git init -q -b main");
+    let http = reqwest::Client::new();
+    let event = |action: &str, draft: bool, sha: &str| {
+        let body = serde_json::json!({ "action": action, "number": 7,
+            "repository": { "full_name": "acme/web", "clone_url": dir.to_string_lossy(), "default_branch": "main" },
+            "pull_request": { "number": 7, "draft": draft,
+                "head": { "sha": sha, "ref": "feature", "repo": { "full_name": "acme/web" } },
+                "base": { "ref": "main", "repo": { "full_name": "acme/web" } } } })
+        .to_string();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+        mac.update(body.as_bytes());
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let req = http
+            .post(format!("{base}/webhooks/github"))
+            .header("x-github-event", "pull_request")
+            .header("x-hub-signature-256", sig)
+            .body(body);
+        async move {
+            let v: serde_json::Value = req.send().await.unwrap().json().await.unwrap();
+            v["run"].as_str().map(String::from)
+        }
+    };
+    let commit = |config: &str, n: u32| {
+        write(dir, "pit.config.json", config);
+        write(dir, "n.txt", &n.to_string());
+        sh(dir, &format!("git add -A && git commit -qm n{n}"));
+        sh(dir, "git rev-parse HEAD").trim().to_string()
+    };
+
+    // Skipped while a draft.
+    let skip = r#"{"drafts":false,"tasks":{"test":{"run":"echo testing","cache":false}}}"#;
+    let sha = commit(skip, 1);
+    let id = event("opened", true, &sha).await.expect("a run");
+    let v = pit::cli::wait(&client, &id, |_| {}).await.unwrap();
+    assert_eq!(v.status, Status::Skipped, "{v:?}");
+    assert!(v.groups.is_empty(), "{v:?}");
+    assert!(v.message.unwrap_or_default().contains("ready for review"));
+    // Marked ready: it runs.
+    let id = event("ready_for_review", false, &sha).await.expect("a run");
+    let v = pit::cli::wait(&client, &id, |_| {}).await.unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    assert_eq!(v.groups.len(), 1);
+
+    // Without the setting, a draft runs as before.
+    let sha = commit(
+        r#"{"tasks":{"test":{"run":"echo testing","cache":false}}}"#,
+        2,
+    );
+    let id = event("synchronize", true, &sha).await.expect("a run");
+    let v = pit::cli::wait(&client, &id, |_| {}).await.unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
 }

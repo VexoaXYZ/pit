@@ -673,6 +673,7 @@ impl Queue<'_> {
                         self.target,
                         default_branch(&self.mirror).await.ok().as_deref(),
                     ),
+                    draft: false,
                 },
                 None,
             )
@@ -878,6 +879,7 @@ impl Queue<'_> {
                         self.target,
                         default_branch(&self.mirror).await.ok().as_deref(),
                     ),
+                    draft: false,
                 },
                 e.pr,
             )

@@ -291,6 +291,7 @@ async fn start(
                 counts_as: None,
                 no_secrets: false,
                 trusted: true,
+                draft: false,
             },
             None,
         )

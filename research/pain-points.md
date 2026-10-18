@@ -4590,3 +4590,56 @@ a file the worker already owns.
   can't be removed; Pit doesn't run containers as root.
 - An ignored read-only tree (a Go module cache listed in `.gitignore`) stays warm on purpose.
   Only `git clean`'s untracked files are removed.
+
+## P72. Draft pull requests burn CI, and the usual fix skips the run you need
+
+**The pain.** GitHub runs `pull_request` workflows on drafts too, so every push to a
+work-in-progress PR runs the full pipeline. The standard workaround is a job-level
+`if: github.event.pull_request.draft == false`, plus `ready_for_review` in the trigger types so CI
+runs when the draft is marked ready
+([gist](https://gist.github.com/harrybiddle/92dd83ecd35ed3402ffdccafd964fc78),
+[community #25722](https://github.com/orgs/community/discussions/25722),
+[#120231](https://github.com/orgs/community/discussions/120231),
+[reviewdog/action-eslint#29](https://github.com/reviewdog/action-eslint/issues/29),
+[pr-gate#30](https://github.com/Nitjsefnie-Actions/pr-gate/pull/30),
+[OneUptime](https://oneuptime.com/blog/post/2025-12-20-github-actions-pull-request-triggers/view)).
+#25722 names its trap: "The check is reported as successful even though it didn't actually run",
+and without the extra trigger, "when the PR is switched from 'draft' to 'ready' the CI does not
+run again".
+
+**Reproduction** (a scratch `pit up` in GitHub token mode on port 7474, signed `pull_request`
+webhooks for a draft PR #7):
+```
+opened draft=true            -> {"run":"run_1112b13dd33c"}
+synchronize draft=true       -> {"run":"run_873ef3ef3848"}      (passed, 1 task)
+ready_for_review draft=false -> {"ignored":"ready_for_review"}
+```
+Pit ran every draft push and had no way to turn that off. `ready_for_review` was ignored, so even
+a team that skipped drafts some other way would get no run when the PR became ready.
+
+**Fix.**
+- **A setting.** `drafts: false` in the config: a draft's run ends as `skipped`, with "draft pull
+  request: runs when it is marked ready for review", and no groups. So it posts no checks, and
+  required checks wait instead of passing. GitHub can't merge a draft anyway.
+- **Read per commit.** The setting comes from the commit's own config, like everything else.
+- **`ready_for_review` starts a run.** It runs the head commit, the same as a push to the PR.
+- **Default unchanged.** Without the setting, drafts run as before.
+
+**After** (same scratch server, `drafts: false`):
+```
+opened draft=true            -> run_83f1633a40c5   skipped  draft pull request: runs when it is marked ready for review
+synchronize draft=true       -> run_48afb4bbac5f   skipped  (same)
+ready_for_review draft=false -> run_c42dcc9bd92c   passed   1 task
+```
+The e2e test `draft_pull_requests_run_when_marked_ready` sends signed webhooks:
+- with `drafts: false`, a draft is skipped with no groups, and `ready_for_review` runs and
+  passes;
+- without the setting, a draft push runs.
+
+On the old code the draft would have run and `ready_for_review` returned no run.
+
+**Verdict: SOLVED.** Limits:
+- Converting a PR back to draft doesn't cancel a run already in progress; the next push is
+  skipped.
+- No independent review: the draft flag comes from a signed webhook, and skipping only means not
+  running.
