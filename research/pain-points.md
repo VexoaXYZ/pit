@@ -4705,3 +4705,60 @@ Unit tests:
   secret.
 - **No independent review this round.** The parser only reads the operator's own file, and masking
   more is the safe direction.
+
+## P74. A runaway task's output: gigabytes in the server's database, and one endless line in memory
+
+**The pain.** A test stuck in a loop, or a tool in debug mode, can print far more than anyone
+will read, and CI systems have to bound it:
+- GitLab's runner has an `output_limit` (4 MB by default) and truncates past it
+  ([GitLab forum](https://forum.gitlab.com/t/the-output-is-too-lengthy-causing-the-gitlab-runner-to-mark-the-pipeline-as-failed/115851),
+  [datawookie](https://datawookie.dev/blog/2021-07-24-fixing-truncated-logs-on-gitlab-ci-cd/)).
+- GitHub truncates live logs at about 4 MB
+  ([community #127903](https://github.com/orgs/community/discussions/127903)).
+- Rundeck users asked for exactly this
+  ([rundeck#1452](https://github.com/rundeck/rundeck/issues/1452): "abort/fail or truncate logging
+  if too much output occurs").
+- Very long lines with no newline are their own problem: "once a log message gets up to about 6k
+  characters the runner starts to take a few seconds to process… at 100k characters this can be
+  10 minutes or so" ([actions/runner#1031](https://github.com/actions/runner/issues/1031)).
+
+**Before.** Pit capped the *stored* log at 8 MiB, but not the rest:
+1. **The live stream had no cap.** Every line still streamed to the server, which appended it
+   to the running task's live log in SQLite, and every view of that log concatenated all of it.
+   A task printing 300 MB (`head -c 300000000 /dev/zero | tr '\0' x | fold -w 100`):
+   ```
+   live log size while running: 277555676 bytes
+   db: 10 MB before → 286 MB while running → 299 MB after (SQLite keeps the space)
+   server+worker RSS: 537 MB
+   ```
+2. **One endless line was held whole.** Output was read up to each newline with no limit, so 800
+   MB with no newline was buffered whole before any cap applied:
+   ```
+   peak server+worker RSS: 1421 MB
+   ```
+
+**Fix.**
+- **Only what is kept is streamed.** Past the 8 MiB cap, one note is streamed ("log over 8 MiB;
+  the rest is not streamed or kept") and nothing more. The idle limit still sees every byte.
+- **Bounded reads.** Output is read at most 64 KiB at a time, so an endless line arrives in
+  bounded pieces that the cap counts.
+
+**After:**
+```
+300 MB in lines:  largest live log while running 8388611 bytes, note streamed; db level; peak RSS 132 MB
+800 MB, one line: peak RSS 42 MB; stored log ends "[pit: 791611398 bytes of log output truncated]"
+```
+The unit test `a_flood_of_output_is_neither_streamed_nor_kept_past_the_cap` covers 12 MB of
+lines and 12 MB on one line:
+- streamed and kept output stay under the cap, with the note;
+- no piece is over 64 KiB.
+
+It fails if everything is streamed.
+
+**Verdict: SOLVED.** Limits:
+- The task keeps running; it isn't failed or stopped for printing too much. The time and idle
+  limits are what stop a stuck one.
+- A secret that straddles a 64 KiB piece boundary of one huge line could escape the live log's
+  masking if the pieces are flushed in different 50 ms batches. The stored log is masked whole.
+- The earlier run's 290 MB stays in the database file until a `VACUUM`. Pit doesn't vacuum.
+- No independent review: this only drops output past an existing cap.

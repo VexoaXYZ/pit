@@ -345,12 +345,20 @@ pub async fn run(
                 started.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            // Only what is kept is streamed: a task printing gigabytes
+            // would otherwise fill the server's database while it runs.
             if log.len() + line.len() <= MAX_LOG {
                 log.push_str(&line);
+                let _ = live.send(line);
             } else {
+                if dropped == 0 {
+                    let _ = live.send(format!(
+                        "\n[pit: log over {} MiB; the rest is not streamed or kept]\n",
+                        MAX_LOG >> 20
+                    ));
+                }
                 dropped += line.len();
             }
-            let _ = live.send(line);
         }
         if dropped > 0 {
             log.push_str(&format!(
@@ -472,12 +480,21 @@ pub async fn run(
     })
 }
 
+/// The longest piece of output read as one "line": a task printing one
+/// endless line with no newline would otherwise be held whole in memory.
+const MAX_LINE: u64 = 64 * 1024;
+
 async fn pump(stream: impl AsyncRead + Unpin, tx: mpsc::UnboundedSender<String>) {
+    use tokio::io::AsyncReadExt;
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
+        match (&mut reader)
+            .take(MAX_LINE)
+            .read_until(b'\n', &mut buf)
+            .await
+        {
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 if tx.send(String::from_utf8_lossy(&buf).into_owned()).is_err() {
@@ -576,6 +593,61 @@ mod tests {
         // Positional parameters and `$@` are the script's, not the wrapper's.
         let (_, log) = exit("echo \"[$#][$@]\"").await;
         assert!(log.contains("[0][]"), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_flood_of_output_is_neither_streamed_nor_kept_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskDef {
+            run: "head -c 12000000 /dev/zero | tr '\\0' x | fold -w 100".into(),
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = run(
+            command(&task, Backend::Host, dir.path(), &[]),
+            Limits::default(),
+            tx,
+            never(),
+        )
+        .await
+        .unwrap();
+        let mut streamed = String::new();
+        while let Ok(line) = rx.try_recv() {
+            streamed.push_str(&line);
+        }
+        assert!(
+            streamed.len() <= MAX_LOG + 200,
+            "streamed {}",
+            streamed.len()
+        );
+        assert!(streamed.contains("not streamed or kept"));
+        assert!(out.log.len() <= MAX_LOG + 200);
+        assert!(out.log.contains("bytes of log output truncated"));
+
+        // One endless line with no newline is cut into bounded pieces.
+        let task = TaskDef {
+            run: "head -c 12000000 /dev/zero | tr '\\0' x".into(),
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = run(
+            command(&task, Backend::Host, dir.path(), &[]),
+            Limits::default(),
+            tx,
+            never(),
+        )
+        .await
+        .unwrap();
+        let mut longest = 0;
+        while let Ok(piece) = rx.try_recv() {
+            longest = longest.max(piece.len());
+        }
+        assert!(
+            longest as u64 <= MAX_LINE.max(200),
+            "a piece of {longest} bytes"
+        );
+        assert!(out.log.len() <= MAX_LOG + 200);
     }
 
     #[cfg(unix)]
