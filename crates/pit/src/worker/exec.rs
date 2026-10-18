@@ -467,12 +467,20 @@ pub async fn run(
         }
     }
     kill_tree(pid);
-    let leftovers = kill_tracked(&tracking);
+    // Off the async threads, and bounded: reading another process's
+    // environment can block (a process stuck on a hung mount).
+    let scan = {
+        let tracking = tracking.clone();
+        tokio::task::spawn_blocking(move || kill_tracked(&tracking, pid))
+    };
+    let leftovers = tokio::time::timeout(Duration::from_secs(5), scan).await;
     let mut log = collector.await.unwrap_or_default();
-    if leftovers > 0 {
-        log.push_str(&format!(
-            "\n[pit: stopped {leftovers} process(es) the task left running]\n"
-        ));
+    match leftovers {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => log.push_str(&format!(
+            "\n[pit: stopped {n} process(es) the task left running]\n"
+        )),
+        _ => log.push_str("\n[pit: looking for processes the task left running took too long]\n"),
     }
     if went_idle {
         let secs = limits.idle.map(|d| d.as_secs()).unwrap_or_default();
@@ -535,38 +543,58 @@ pub const TRACKING_ENV: &str = "PIT_TRACKING_ID";
 
 /// Stops every process whose environment carries this task's tracking id
 /// (Linux, where `/proc` shows it; only processes of this user are
-/// readable). Returns how many.
-fn kill_tracked(tracking: &str) -> usize {
+/// readable), other than the task's own process group, which `kill_tree`
+/// handles. A few passes, for a process forked while one ran. Returns how
+/// many it stopped.
+fn kill_tracked(tracking: &str, group: Option<u32>) -> usize {
     #[cfg(target_os = "linux")]
     {
         let needle = format!("{TRACKING_ENV}={tracking}");
         let me = std::process::id();
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return 0;
-        };
-        let mut n = 0;
-        for e in entries.flatten() {
-            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
-                continue;
+        let mut total = 0;
+        for _ in 0..3 {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                break;
             };
-            if pid == me {
-                continue;
-            }
-            let Ok(environ) = std::fs::read(e.path().join("environ")) else {
-                continue;
-            };
-            if environ.split(|b| *b == 0).any(|v| v == needle.as_bytes()) {
-                // SAFETY: plain syscall on a pid that carries this task's id.
-                if unsafe { libc_kill(pid as i32, 9) } == 0 {
-                    n += 1;
+            let mut n = 0;
+            for e in entries.flatten() {
+                let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                if pid == me {
+                    continue;
+                }
+                // The process group: the fourth field after the command name,
+                // which may itself hold spaces and parentheses.
+                let pgid = std::fs::read_to_string(e.path().join("stat"))
+                    .ok()
+                    .and_then(|s| {
+                        let rest = s.rsplit_once(')')?.1.to_string();
+                        rest.split_whitespace().nth(2)?.parse::<u32>().ok()
+                    });
+                if pgid.is_some() && pgid == group {
+                    continue;
+                }
+                let Ok(environ) = std::fs::read(e.path().join("environ")) else {
+                    continue;
+                };
+                if environ.split(|b| *b == 0).any(|v| v == needle.as_bytes()) {
+                    // SAFETY: plain syscall on a pid that carries this task's id.
+                    if unsafe { libc_kill(pid as i32, 9) } == 0 {
+                        n += 1;
+                    }
                 }
             }
+            total += n;
+            if n == 0 {
+                break;
+            }
         }
-        n
+        total
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = tracking;
+        let _ = (tracking, group);
         0
     }
 }
@@ -749,7 +777,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A sleep length no other test uses, to find it afterwards.
         let task = TaskDef {
-            run: "setsid -f sleep 7781; echo started".into(),
+            // A daemon, a plain background job (the group kill's), and a
+            // daemon kept on purpose.
+            run: "setsid -f sleep 7781; sleep 7782 & PIT_TRACKING_ID= setsid -f sleep 7783; echo started"
+                .into(),
             ..Default::default()
         };
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -769,12 +800,20 @@ mod tests {
             out.log
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let alive = std::fs::read_dir("/proc")
-            .unwrap()
-            .flatten()
-            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
-            .any(|c| c == b"sleep\x007781\x00");
-        assert!(!alive, "the daemon outlived its task");
+        let alive = |arg: &str| {
+            std::fs::read_dir("/proc")
+                .unwrap()
+                .flatten()
+                .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+                .any(|c| c == format!("sleep\0{arg}\0").as_bytes())
+        };
+        assert!(!alive("7781"), "the daemon outlived its task");
+        assert!(!alive("7782"), "the background job outlived its task");
+        let kept = alive("7783");
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", "-f", "sleep 7783"])
+            .status();
+        assert!(kept, "a daemon started with PIT_TRACKING_ID= was stopped");
     }
 
     #[cfg(unix)]
