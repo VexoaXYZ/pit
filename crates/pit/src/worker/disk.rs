@@ -203,7 +203,7 @@ mod tests {
         assert!(found[0].bytes >= 8192);
         // Over budget and idle: chosen; used recently (busy): kept.
         let now = SystemTime::now() + STALE_AFTER;
-        assert_eq!(plan(&found, |_| false, 1, now), [home.clone()]);
+        assert_eq!(plan(&found, |_| false, 1, now), std::slice::from_ref(&home));
         assert!(plan(&found, |_| true, 1, now).is_empty());
     }
 
