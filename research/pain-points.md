@@ -4772,9 +4772,10 @@ considerably" ([server docs](https://woodpecker-ci.org/docs/administration/confi
 Users ask for logs to move out of the database so they can have "pretty simple retention
 policies", because "pipeline logs are flooding the DB and it's pretty hard to clean them up on DB
 level" ([discussion #2278](https://github.com/woodpecker-ci/woodpecker/discussions/2278)).
-SQLite adds one more catch: deleting rows doesn't shrink the file
-([frappe#42814](https://github.com/frappe/frappe/issues/42814): a log cleanup that "silently
-deletes nothing on SQLite").
+SQLite adds one more catch: deleting rows doesn't shrink the file. "Unless SQLite is running in
+'auto_vacuum=FULL' mode, when a large amount of data is deleted from the database file it leaves
+behind empty space, or 'free' database pages"
+([SQLite: VACUUM](https://www.sqlite.org/lang_vacuum.html)).
 
 **Before.** Pit deleted no run, ever (no `DELETE FROM runs` anywhere), and never vacuumed. Logs
 live in the CAS and are collected after 14 days, but every run's rows stay. Space freed inside
