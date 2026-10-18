@@ -317,8 +317,21 @@ pub async fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // A session of its own, which also makes it a process group (`kill_tree`):
+    // without a controlling terminal, a tool that prompts on `/dev/tty`
+    // (git asking for a password, ssh for a host key) fails at once instead
+    // of waiting on the terminal `pit up` runs in until the idle limit.
     #[cfg(unix)]
-    cmd.process_group(0);
+    // SAFETY: `setsid` is async-signal-safe, the only kind of call allowed
+    // between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let oom_before = super::memory::oom_kills();
     let mut child = cmd.spawn().context("spawning task")?;
     let pid = child.id();
@@ -648,6 +661,31 @@ mod tests {
             "a piece of {longest} bytes"
         );
         assert!(out.log.len() <= MAX_LOG + 200);
+    }
+
+    /// A task leads its own session, so it has no controlling terminal: a
+    /// prompt on `/dev/tty` fails at once instead of waiting on the terminal
+    /// the worker runs in.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_runs_in_its_own_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = TaskDef {
+            // Field 6 of /proc/<pid>/stat is the session id.
+            run: "test \"$(cut -d' ' -f6 /proc/$$/stat)\" = \"$$\" && echo own-session".into(),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let out = run(
+            command(&task, Backend::Host, dir.path(), &[]),
+            Limits::default(),
+            tx,
+            never(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{}", out.log);
+        assert!(out.log.contains("own-session"), "{}", out.log);
     }
 
     #[cfg(unix)]

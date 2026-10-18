@@ -5126,3 +5126,50 @@ with a fake GitHub API and a real server and repo:
 - **API cost.** Three API calls per repo every ten minutes.
 - **Short history (declined).** Below `PIT_HISTORY_DAYS=3`, a PR touched since its head run was
   pruned can get one repeated untrusted run.
+
+## P81. A job hangs on an invisible password prompt
+
+**The pain.** Tools that need a credential prompt on the terminal, not on stdin: git asks
+"Username for 'https://github.com':", ssh asks to confirm a host key, sudo asks for a password.
+In CI there's nobody to answer, so if the job has a terminal it waits until the step times out.
+- A Buildkite job hung for over 40 minutes at git's `Username for` prompt because `docker run -it`
+  gave it a TTY; the fix was `GIT_TERMINAL_PROMPT=0`, "so a missing credential is an immediate
+  exit 128 instead of a hung agent" ([MinaProtocol/mina#19514](https://github.com/MinaProtocol/mina/issues/19514)).
+- GitLab's background workers hit the same problem: "if auth fails, git will prompt for a password
+  locking the worker completely" ([gitlab-foss#24187](https://gitlab.com/gitlab-org/gitlab-foss/-/issues/24187)).
+- A "hang" can be an invisible prompt: "it is actually asking the user for their credentials …
+  but the prompt is invisible" ([git-lfs#3585](https://github.com/git-lfs/git-lfs/issues/3585)).
+
+**Reproduction** (`/tmp/painhunt/p81`). Pit's tasks already get `/dev/null` as stdin, but prompts
+open `/dev/tty` directly. Tasks got their own process group in the *server's* session, so when
+`pit up` runs in a developer's terminal, every host task has that terminal. Run under `script`
+(a real pseudo-terminal), a task that reads `/dev/tty`, standing in for git, ssh and sudo:
+```
+prompt │ asking
+failed in 21.1s      "no output for 20s; stopped (set idleTimeout …)"
+```
+It waited on the operator's terminal until the idle limit; with the defaults that's 15 minutes.
+
+**Fix.** Each task starts in a session of its own (`setsid` before exec, instead of only a new
+process group). It still leads its own process group, so stopping a task still kills everything
+it started, and it has no controlling terminal, so a prompt fails at once.
+
+**After** (same pseudo-terminal setup):
+```
+prompt │ asking
+prompt │ no terminal: failed fast
+prompt │ bash: line 1: /dev/tty: No such device or address
+failed in 382ms
+```
+- **Unit test.** `a_task_runs_in_its_own_session` (Linux) checks the task's session id in
+  `/proc/$$/stat` is its own pid. It fails with the old `process_group(0)`.
+- **Existing test.** `cancellation_stops_the_task_and_its_children` still passes.
+- **A real git prompt wasn't demonstrated.** Asked for a missing private repo, GitHub answered
+  "Repository not found" without a credential challenge, so the `/dev/tty` reproduction is the
+  evidence.
+
+**Verdict: SOLVED** for host and sandbox tasks under a terminal (`docker` tasks never got a TTY).
+Limits:
+- **Windows** is unchanged.
+- **No independent review.** It changes only how the task process is started, and the
+  process-group kill and cancel tests still pass.
