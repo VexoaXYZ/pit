@@ -797,6 +797,37 @@ async fn claim(
             ));
         }
     }
+    // Checked after the worker token, so nobody unauthenticated learns this.
+    // A worker older than the jobs it would get ignores what it doesn't know
+    // (an old one hands `[trusted]` secrets to any task): no work for it.
+    if info.protocol < crate::model::PROTOCOL {
+        static WARNED: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, i64>>> =
+            std::sync::OnceLock::new();
+        let now = crate::model::now_ms();
+        let mut warned = WARNED.get_or_init(Default::default).lock();
+        if warned.len() > 1000 {
+            warned.clear();
+        }
+        let last = warned.entry(info.name.clone()).or_insert(0);
+        if now - *last > 60_000 {
+            *last = now;
+            tracing::warn!(
+                "worker {} is older than this server (protocol {} < {}); it gets no jobs until it is upgraded",
+                info.name,
+                info.protocol,
+                crate::model::PROTOCOL
+            );
+        }
+        return Err(ApiError(
+            StatusCode::UPGRADE_REQUIRED,
+            anyhow::anyhow!(
+                "this worker is older than the server (protocol {} < {}): upgrade pit on {}",
+                info.protocol,
+                crate::model::PROTOCOL,
+                info.name
+            ),
+        ));
+    }
     app.db.touch_worker(&info)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {

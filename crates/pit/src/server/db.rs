@@ -2738,6 +2738,7 @@ mod tests {
             cpus: 1,
             backends: vec![Backend::Host],
             kvm: false,
+            protocol: crate::model::PROTOCOL,
         };
         let job = db
             .claim_group(&worker)
@@ -2778,6 +2779,7 @@ mod tests {
             cpus: 1,
             backends: vec![Backend::Host],
             kvm: false,
+            protocol: crate::model::PROTOCOL,
         };
         let claim = || db.claim_group(&worker).unwrap().0.unwrap().group_id;
         assert_eq!(claim(), big_groups[0]);
@@ -2832,6 +2834,7 @@ mod tests {
             cpus: 1,
             backends: vec![Backend::Host],
             kvm: false,
+            protocol: crate::model::PROTOCOL,
         };
         let first = db.claim_group(&worker).unwrap().0.unwrap();
         assert_eq!(first.group_id, ids[0]);
@@ -3048,6 +3051,7 @@ mod tests {
             cpus: 1,
             backends: vec![Backend::Host],
             kvm: false,
+            protocol: crate::model::PROTOCOL,
         };
         let job = db.claim_group(&worker).unwrap().0.unwrap();
         assert!(!db.requeue_group(&g, "not-the-lease").unwrap());
@@ -3089,6 +3093,7 @@ mod tests {
             cpus: 1,
             backends: vec![Backend::Host],
             kvm: false,
+            protocol: crate::model::PROTOCOL,
         };
         let order: Vec<String> = (0..4)
             .map(|_| db.claim_group(&worker).unwrap().0.unwrap().group_id)
@@ -3150,6 +3155,7 @@ mod affinity_tests {
             cpus: 1,
             backends: vec![Backend::Host],
             kvm: false,
+            protocol: crate::model::PROTOCOL,
         }
     }
 

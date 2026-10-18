@@ -746,6 +746,7 @@ async fn stale_claims_cannot_report() {
         cpus: 1,
         backends: vec![Backend::Host],
         kvm: false,
+        protocol: pit::model::PROTOCOL,
     };
     let job = loop {
         if let ClaimResponse::Job(job) = client.claim(&info).await.unwrap() {
@@ -5911,4 +5912,35 @@ async fn sharded_groups_get_one_check_with_a_stable_name() {
         "{:?}",
         posted.lock().unwrap()
     );
+}
+
+/// A worker older than the server (no `protocol` in its claim, as before
+/// it existed) gets no jobs: it would ignore what it doesn't understand,
+/// such as which secrets a job may have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outdated_workers_get_no_jobs() {
+    let pit = start().await;
+    let old = serde_json::json!({ "name": "old", "os": "linux", "arch": "x86_64",
+        "cpus": 1, "backends": ["host"], "kvm": false });
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/workers/claim", pit.base))
+        .json(&old)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 426);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("upgrade pit on old"), "{body}");
+    // The same claim from a current worker is not refused for its version.
+    let mut current = old.clone();
+    current["protocol"] = pit::model::PROTOCOL.into();
+    current["name"] = "current".into();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/workers/claim", pit.base))
+        .json(&current)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), 426);
 }

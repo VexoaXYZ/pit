@@ -314,6 +314,12 @@ pub struct CreateRun {
     pub draft: bool,
 }
 
+/// What a worker understands of a `Job`. Raised when a job gains a field an
+/// older worker would ignore to the job's harm (`trusted_secrets`: an older
+/// worker hands `[trusted]` secrets to any task). The server hands work only
+/// to workers at least this new.
+pub const PROTOCOL: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerInfo {
@@ -323,6 +329,9 @@ pub struct WorkerInfo {
     pub cpus: usize,
     pub backends: Vec<Backend>,
     pub kvm: bool,
+    /// See `PROTOCOL`. Absent (0) from workers older than it.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 /// A group handed to a worker.

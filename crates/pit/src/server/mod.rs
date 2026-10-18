@@ -1103,6 +1103,7 @@ mod waiting_tests {
             cpus: 8,
             backends: vec![Backend::Host, Backend::Sandbox],
             kvm: false,
+            protocol: crate::model::PROTOCOL,
         };
         assert_eq!(
             waiting_reason("linux", &[Backend::Host], std::slice::from_ref(&linux)),

@@ -326,6 +326,7 @@ impl Worker {
             cpus: num_cpus::get(),
             backends: exec::detect_backends().await,
             kvm: exec::kvm_available(),
+            protocol: crate::model::PROTOCOL,
         };
         Ok(Worker {
             client: Client::new(server, token)?,

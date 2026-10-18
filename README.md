@@ -431,6 +431,12 @@ the worker's environment, which every task inherits.
 Upgrade workers before adding a `[trusted]` section: an older worker skips the header and hands
 those secrets to every task that asks. A server older than this version never allows them.
 
+**Worker versions.** Workers tell the server which version of the job format they understand.
+A worker older than the server gets no jobs (`426 Upgrade Required: … upgrade pit on <name>` in
+its log, and a warning in the server's) rather than running jobs whose fields it would ignore,
+such as which secrets a job may have. Upgrade the server first, then the workers; until a worker
+is upgraded, its jobs wait for one that is.
+
 ## Cloud credentials (OIDC)
 
 `pit server --oidc` makes the server an OIDC issuer, so a task with
