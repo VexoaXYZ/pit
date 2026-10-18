@@ -216,8 +216,10 @@ The server reads `schedules` from the config on each repo's default branch and s
 run of the branch tip when a cron (five fields, UTC unless `timezone` names an IANA zone)
 matches. A zoned schedule follows daylight saving the way GitHub's does: a time the clocks skip
 fires at the next valid minute, and a time they repeat fires once. It checks twice a minute and
-records each slot, so a slot fires once. A slot missed while the server was down is skipped, not
-replayed. A bad cron is a config error.
+records each slot, so a slot fires once. A slot missed while the server was down (a restart or
+an upgrade at 03:00) fires once when it is back, if it fell in the last day, like a systemd timer
+with `Persistent=true`. After a longer outage each schedule fires once, never a backlog. A bad
+cron is a config error.
 
 ### Tool caches
 

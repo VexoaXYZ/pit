@@ -2478,6 +2478,29 @@ impl Db {
         Ok(())
     }
 
+    /// The last minute the scheduler evaluated, kept across restarts under a
+    /// key no schedule can have (theirs are `<repo id>:<name>`).
+    pub fn schedule_tick(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT last_minute FROM schedules WHERE key = ':tick'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_schedule_tick(&self, minute: i64) -> Result<()> {
+        self.conn.lock().execute(
+            "INSERT INTO schedules (key, last_minute) VALUES (':tick', ?1)
+             ON CONFLICT(key) DO UPDATE SET last_minute = MAX(last_minute, ?1)",
+            params![minute],
+        )?;
+        Ok(())
+    }
+
     /// Claims a schedule slot. False if this minute already fired.
     pub fn claim_schedule_slot(&self, key: &str, minute: i64) -> Result<bool> {
         let n = self.conn.lock().execute(

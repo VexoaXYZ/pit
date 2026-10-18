@@ -4387,3 +4387,56 @@ It fails without the fairness term, and its queue assertion fails without the qu
 - Fairness is per run. Five runs from one agent count as five, so per-agent or per-repo shares
   are not modelled.
 - A run's long macOS group counts against its Linux groups.
+
+## P69. The nightly that never ran: slots missed while the server was down (P26's open gap)
+
+**The pain.** Scheduled CI quietly skips runs. GitHub's scheduled workflows can be delayed or
+dropped under load (P26's sources). A self-hosted scheduler has its own version: if the server
+is being restarted, upgraded or rebooted when the cron minute passes, that night's run simply
+doesn't happen, and nothing says so. Cron has the same problem on machines that aren't always
+on, which is why anacron exists and why systemd timers offer `Persistent=true`: "the time when
+the service unit was last triggered is stored on disk… [it] is triggered immediately if it would
+have been triggered at least once during the time when the timer was inactive"
+([systemd.timer(5)](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html),
+[anacron(8)](https://manpages.debian.org/bookworm/anacron/anacron.8.en.html)). P26 recorded it as
+a limit: "Missed slots are not replayed."
+
+**Reproduction** (`/tmp/painhunt/p69`): a daily schedule two minutes ahead (`01 07 * * *` UTC).
+The server is stopped at 07:00:09 and started again at 07:02:35.
+```
+p69 nightly · 01 07 * * * UTC · on main
+  next  2026-10-19 07:01 UTC (in 23h 57m)
+  last  never ran
+```
+That day's run is gone, and nothing in the log says so.
+
+**Fix.**
+- **The scheduler's position is kept on disk.** The last minute the scheduler evaluated is stored
+  under a reserved key in the slot table.
+- **The first tick after a start catches up.** It covers every minute since then, up to a day
+  back. Ticks after that cover the last ten minutes, as before.
+- **No backlog.** Each schedule fires at most once per tick, for its latest matching minute. A
+  two-day outage gives one run, not two.
+- **No double runs.** Slots are still claimed in the same table, so a slot never fires twice. The
+  position is written after the slots are claimed, so a crash in between only redoes the window.
+- **Logged.** A catch-up after more than ten minutes is logged.
+
+**After** (same repro, slot `17 07`, server down 07:16:03 → 07:19:10):
+```
+07:19:18 INFO schedule nightly on p69: started run_e6a84dee9873
+p69 nightly · 17 07 * * * UTC · on main
+  last  run_e6a84dee9873 passed 2026-10-18 09:19 CEST (now)
+```
+The e2e test `schedules_catch_up_on_slots_missed_while_down` restarts by opening a fresh App on
+the same data:
+- down 03:10–05:00: the 03:17 slot fires once, and not again on the next tick;
+- down for two days: exactly one run.
+
+It fails at "the missed slot" without the catch-up.
+
+**Verdict: SOLVED.** Limits:
+- Slots more than a day old are skipped. Each schedule fires once per outage, not once per
+  missed slot, as with systemd.
+- A schedule committed while the server was down can fire at start-up for a slot that fell after
+  the commit.
+- No independent review this round: the slot claim that prevents double runs is unchanged.

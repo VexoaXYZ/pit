@@ -4,7 +4,9 @@
 //! periods of high loads", some are dropped, and in public repos they are
 //! disabled after 60 days without activity. These run on the server's own
 //! clock: each slot fires once, on the branch tip at that moment, as a trusted
-//! run. A slot missed while the server was down is skipped, not replayed.
+//! run. A slot missed while the server was down (a restart or an upgrade at
+//! 03:00) fires once when it is back, if it was in the last day, the way a
+//! systemd timer with `Persistent=true` does; older ones are skipped.
 //! `pit schedules` lists them with their next and last runs, and
 //! `pit schedules run` starts one now, to try it without waiting.
 
@@ -26,25 +28,40 @@ fn read_cache() -> &'static ReadCache {
     CACHE.get_or_init(Default::default)
 }
 
-/// Starts the runs whose cron matched any minute since the last tick (at most
-/// the last ten, so a long outage does not replay a backlog), up to the minute
-/// containing `now_ms`.
+/// How far back the first tick after a start looks for missed slots.
+const CATCH_UP_MINUTES: i64 = 24 * 60;
+
+/// Starts the runs whose cron matched any minute since the last tick, up to
+/// the minute containing `now_ms`. Each schedule fires at most once per tick,
+/// for its latest matching minute, so an outage never replays a backlog. The
+/// first tick after a start goes back to the last minute the server
+/// evaluated before it stopped (at most a day); later ticks, ten minutes.
 pub async fn tick(app: &Arc<App>, now_ms: i64) -> Result<()> {
     let now = now_ms.div_euclid(60_000);
-    let first = {
-        let mut last = app.schedule_minute.lock();
-        let first = match *last {
-            Some(l) if l < now => (l + 1).max(now - 9),
+    let in_process = *app.schedule_minute.lock();
+    let first = match in_process {
+        Some(l) if l < now => (l + 1).max(now - 9),
+        Some(_) => now,
+        None => match app.db.schedule_tick()? {
+            Some(l) if l < now => (l + 1).max(now - CATCH_UP_MINUTES),
             _ => now,
-        };
-        *last = Some(now);
-        first
+        },
     };
+    *app.schedule_minute.lock() = Some(now);
+    if first < now - 9 {
+        tracing::info!(
+            "schedules: catching up on {} minute(s) missed while the server was down",
+            now - first
+        );
+    }
     for repo in app.db.repos()? {
         if let Err(e) = repo_tick(app, &repo, first, now).await {
             tracing::warn!("schedules of {}: {e:#}", repo.name);
         }
     }
+    // After the slots are claimed: a crash before this point redoes the
+    // window, and claimed slots do not fire twice.
+    app.db.set_schedule_tick(now)?;
     Ok(())
 }
 

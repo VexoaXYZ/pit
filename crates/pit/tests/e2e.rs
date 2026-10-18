@@ -5014,3 +5014,62 @@ async fn turbo_cache_from_tasks_is_split_by_trust() {
         assert_eq!(put.status(), 401, "{t}");
     }
 }
+
+/// A slot that falls while the server is down (a restart or upgrade at
+/// 03:00) fires once when it is back, if it was in the last day; a longer
+/// outage fires each schedule once, never a backlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schedules_catch_up_on_slots_missed_while_down() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    write(
+        &work,
+        "pit.config.json",
+        &serde_json::json!({
+            "tasks": { "check": { "run": "true", "cache": false } },
+            "schedules": { "nightly": { "cron": "17 3 * * *" } },
+        })
+        .to_string(),
+    );
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    assert_eq!(run(&pit, &work).await.status, Status::Passed);
+
+    // Days after today, so the server's own real-time ticker is behind.
+    let today = pit::model::now_ms().div_euclid(86_400_000);
+    let at = |day: i64, h: i64, m: i64| ((today + day) * 1440 + h * 60 + m) * 60_000;
+    // A "restart": a fresh App on the same data, with nothing in memory.
+    let restart = || {
+        pit::server::App::with_github(
+            &pit._data.path().join("server"),
+            None,
+            "http://x".into(),
+            None,
+        )
+        .unwrap()
+    };
+
+    pit::server::schedule::tick(&pit.app, at(2, 3, 10))
+        .await
+        .unwrap();
+    assert_eq!(count_trigger(&pit, "nightly").await, 0);
+    // Down from 03:10 to 05:00: 03:17 fires once on the way back up.
+    let back = restart();
+    pit::server::schedule::tick(&back, at(2, 5, 0))
+        .await
+        .unwrap();
+    assert_eq!(count_trigger(&pit, "nightly").await, 1, "the missed slot");
+    pit::server::schedule::tick(&back, at(2, 5, 1))
+        .await
+        .unwrap();
+    assert_eq!(count_trigger(&pit, "nightly").await, 1, "and only once");
+    // Down for two days: one run, for the latest slot in the last day.
+    let again = restart();
+    pit::server::schedule::tick(&again, at(4, 5, 0))
+        .await
+        .unwrap();
+    assert_eq!(count_trigger(&pit, "nightly").await, 2, "no backlog");
+}
