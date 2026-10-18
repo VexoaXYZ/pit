@@ -54,10 +54,10 @@ pub fn scan_homes(root: &Path) -> Vec<Workspace> {
     let Ok(repos) = std::fs::read_dir(root) else {
         return found;
     };
-    for repo in repos
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-    {
+    // `.trash` holds homes being removed.
+    for repo in repos.flatten().filter(|e| {
+        e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.')
+    }) {
         let Ok(pools) = std::fs::read_dir(repo.path()) else {
             continue;
         };
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn container_homes_are_found_and_aged() {
         let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("acme_web").join("untrusted");
+        let home = root.path().join("acme_web-1234").join("untrusted-default");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::write(home.join("big"), vec![0u8; 8192]).unwrap();
         touch_used(&home);

@@ -65,6 +65,9 @@ pub struct Worker {
     /// Groups running now, by id: their lease, to hand back on a hard stop,
     /// and the switch that stops their tasks.
     running: Mutex<HashMap<String, Running>>,
+    /// Held while a container home is created or touched, and while the GC
+    /// removes one, so it never removes a home a job just started on.
+    homes_lock: Mutex<()>,
     /// Service containers of the groups running now, by lease: started by
     /// the first task that runs (not a cache hit), shared by the rest.
     services: Mutex<HashMap<String, ServiceSlot>>,
@@ -309,6 +312,7 @@ impl Worker {
             draining: Default::default(),
             running: Default::default(),
             services: Default::default(),
+            homes_lock: Default::default(),
             instance: instance_id(data_dir),
             runtime_memo: Default::default(),
         })
@@ -491,13 +495,14 @@ impl Worker {
                 .saturating_sub(total - freed)
                 .max(1)
         };
+        let recent_enough = |used: std::time::SystemTime, now: std::time::SystemTime| {
+            now.duration_since(used)
+                .map_or(true, |age| age < Duration::from_secs(86_400))
+        };
         let recent = |p: &Path| {
-            homes.iter().any(|h| {
-                h.path == p
-                    && now
-                        .duration_since(h.last_used)
-                        .is_ok_and(|age| age < Duration::from_secs(86_400))
-            })
+            homes
+                .iter()
+                .any(|h| h.path == p && recent_enough(h.last_used, now))
         };
         for path in disk::plan(&homes, recent, left, now) {
             let bytes = homes
@@ -505,13 +510,31 @@ impl Worker {
                 .find(|h| h.path == path)
                 .map(|h| h.bytes)
                 .unwrap_or_default();
+            // Checked again under the lock `docker_home` takes: the scan
+            // above can be old, and a job may have just started using it.
+            {
+                let _guard = self.homes_lock.lock();
+                let fresh = disk::scan_homes(&self.data_dir.join("homes"));
+                if fresh
+                    .iter()
+                    .any(|h| h.path == path && recent_enough(h.last_used, now))
+                {
+                    continue;
+                }
+                let trash = self.data_dir.join("homes").join(".trash");
+                let _ = std::fs::create_dir_all(&trash);
+                let dest = trash.join(uuid::Uuid::new_v4().simple().to_string());
+                if std::fs::rename(&path, &dest).is_err() {
+                    continue;
+                }
+                disk::remove_meta(&path);
+                let _ = std::fs::remove_dir_all(&dest);
+            }
             tracing::info!(
                 "removed container home {} ({:.1} GB)",
                 path.display(),
                 bytes as f64 / 1e9
             );
-            let _ = std::fs::remove_dir_all(&path);
-            disk::remove_meta(&path);
         }
         Ok(())
     }
@@ -1351,7 +1374,11 @@ impl Worker {
             minimal: job.no_secrets,
             docker_network: services.as_ref().map(|s| s.network.clone()),
             summary_dir: Some(summary_dir.clone()),
-            docker_home: self.docker_home(job)?,
+            docker_home: if backend == Backend::Docker {
+                self.docker_home(job)?
+            } else {
+                None
+            },
         };
         // Secrets never reach the server's logs, live or stored.
         let masker = Arc::new(mask::Masker::new(secret_values));
@@ -1787,12 +1814,22 @@ impl Worker {
         if job.no_secrets || job.fresh {
             return Ok(None);
         }
+        // Per repo (a hash keeps names that `safe_name` folds together
+        // apart), trust pool and group, like workspaces: a credential one
+        // group's tool writes to `$HOME` (`~/.npmrc`, `docker login`) is not
+        // read by another group's tasks.
         let pool = if job.trusted { "trusted" } else { "untrusted" };
+        let repo = format!(
+            "{}-{}",
+            safe_name(&job.repo),
+            &crate::cas::digest(job.repo.as_bytes())[..8]
+        );
         let dir = self
             .data_dir
             .join("homes")
-            .join(safe_name(&job.repo))
-            .join(pool);
+            .join(repo)
+            .join(format!("{pool}-{}", safe_name(&job.group)));
+        let _guard = self.homes_lock.lock();
         std::fs::create_dir_all(&dir)?;
         disk::touch_used(&dir);
         Ok(Some(dir))

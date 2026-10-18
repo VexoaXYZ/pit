@@ -36,6 +36,23 @@ enum Auth {
     Token(String),
 }
 
+/// A response, or `RateLimited` if GitHub asked to wait (403/429 with
+/// Retry-After), or the HTTP error.
+fn limited_or_ok(resp: reqwest::Response) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if matches!(status.as_u16(), 403 | 429) {
+        if let Some(wait) = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            return Err(RateLimited(wait).into());
+        }
+    }
+    Ok(resp.error_for_status()?)
+}
+
 /// GitHub asked to wait this many seconds (a secondary rate limit).
 #[derive(Debug)]
 struct RateLimited(u64);
@@ -177,8 +194,8 @@ impl GitHub {
                     .bearer_auth(&jwt)
                     .header("accept", "application/vnd.github+json")
                     .send()
-                    .await?
-                    .error_for_status()?
+                    .await
+                    .map(limited_or_ok)??
                     .json()
                     .await?;
                 let id = inst["id"].as_u64().context("installation id")?;
@@ -188,8 +205,8 @@ impl GitHub {
                     .bearer_auth(&jwt)
                     .header("accept", "application/vnd.github+json")
                     .send()
-                    .await?
-                    .error_for_status()?
+                    .await
+                    .map(limited_or_ok)??
                     .json()
                     .await?;
                 let token = tok["token"]
@@ -263,27 +280,33 @@ impl GitHub {
     /// Mirrors a run's groups to GitHub. Errors are logged, never fatal.
     pub async fn report_run(&self, app: &Arc<App>, run_id: &str) {
         if let Some(wait) = self.report_once(app, run_id).await {
-            // Rate limited: report again later (the latest state, whatever it
-            // is by then), once per run, without holding up the caller.
-            if !self.retrying.lock().insert(run_id.to_string()) {
-                return;
-            }
-            let (app, run_id) = (app.clone(), run_id.to_string());
-            tokio::spawn(async move {
-                let mut wait = wait;
-                loop {
-                    tokio::time::sleep(Duration::from_secs(wait.clamp(1, 300))).await;
-                    let Some(gh) = &app.github else { return };
-                    match gh.report_once(&app, &run_id).await {
-                        Some(again) => wait = again,
-                        None => {
-                            gh.retrying.lock().remove(&run_id);
-                            return;
-                        }
+            self.schedule_retry(app, run_id, wait);
+        }
+    }
+
+    /// Rate limited: report the run again later (the latest state, whatever
+    /// it is by then), once per run, without holding up the caller. Jittered,
+    /// so runs limited together do not all come back at once.
+    fn schedule_retry(&self, app: &Arc<App>, run_id: &str, wait: u64) {
+        if !self.retrying.lock().insert(run_id.to_string()) {
+            return;
+        }
+        let (app, run_id) = (app.clone(), run_id.to_string());
+        tokio::spawn(async move {
+            let mut wait = wait;
+            loop {
+                let jitter = (uuid::Uuid::new_v4().as_u128() as u64) % (wait / 4 + 2);
+                tokio::time::sleep(Duration::from_secs(wait.clamp(1, 300) + jitter)).await;
+                let Some(gh) = &app.github else { return };
+                match gh.report_once(&app, &run_id).await {
+                    Some(again) => wait = again,
+                    None => {
+                        gh.retrying.lock().remove(&run_id);
+                        return;
                     }
                 }
-            });
-        }
+            }
+        });
     }
 
     /// One report of the run; `Some(seconds)` if GitHub asked to wait.
@@ -413,6 +436,8 @@ impl GitHub {
                 let mut reported = self.reported.lock();
                 if reported.len() > 50_000 {
                     reported.clear();
+                    // Losing this is like a restart: reposts happen anyway.
+                    self.left_out_posts.lock().clear();
                 }
                 reported.insert(g.id.clone(), said);
             }
@@ -424,7 +449,16 @@ impl GitHub {
             // is the newest (it posts a new check run over this one).
             if left_out && real_elsewhere(app)? {
                 for other in app.db.real_group_runs(&run.repo_id, &run.sha, &g.name)? {
-                    Box::pin(self.try_report_run(app, &other)).await?;
+                    // Not under `other`'s run lock: it may be reporting
+                    // this run the same way, and would wait for ours. If the
+                    // repost is rate limited, `other` is retried, not us.
+                    match Box::pin(self.try_report_run(app, &other)).await {
+                        Ok(()) => {}
+                        Err(e) => match e.downcast_ref::<RateLimited>() {
+                            Some(RateLimited(wait)) => self.schedule_retry(app, &other, *wait),
+                            None => return Err(e),
+                        },
+                    }
                 }
             }
         }
@@ -567,15 +601,24 @@ impl GitHub {
                 }
                 if let (true, Some(id)) = (annotate, id) {
                     for chunk in chunks {
-                        self.call(
-                            full,
-                            reqwest::Method::PATCH,
-                            &format!("/repos/{full}/check-runs/{id}"),
-                            serde_json::json!({ "output": {
-                                "title": body["output"]["title"], "summary": summary, "annotations": chunk,
-                            } }),
-                        )
-                        .await?;
+                        let sent = self
+                            .call(
+                                full,
+                                reqwest::Method::PATCH,
+                                &format!("/repos/{full}/check-runs/{id}"),
+                                serde_json::json!({ "output": {
+                                    "title": body["output"]["title"], "summary": summary, "annotations": chunk,
+                                } }),
+                            )
+                            .await;
+                        // Not all were sent: let the next report send them
+                        // (repeating some is better than losing the rest).
+                        if let Err(e) = sent {
+                            if let Some(g) = group_id {
+                                app.db.kv_delete("annotated", g)?;
+                            }
+                            return Err(e);
+                        }
                     }
                 }
             }

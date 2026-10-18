@@ -4096,6 +4096,16 @@ async fn container_homes_persist_per_trust_pool() {
         first_log(&pit, &other_run).await.contains("cold"),
         "repos shared a home"
     );
+    // So does another group of the same repo (a credential one group's tool
+    // writes to `$HOME` is not another's to read).
+    let regrouped = serde_json::json!({ "groups": { "another": { "tasks": { "t": config["tasks"]["t"].clone() } } } });
+    write(&work, "pit.config.json", &regrouped.to_string());
+    sh(&work, "git commit -qam regroup");
+    let another = run(&pit, &work).await;
+    assert!(
+        first_log(&pit, &another).await.contains("cold"),
+        "groups shared a home"
+    );
 }
 
 /// The log of a run's first task.

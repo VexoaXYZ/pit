@@ -3657,10 +3657,11 @@ containers got `HOME=/tmp` in a container removed after the task:
 
 **Fix.**
 - A container's `$HOME` is now `/pit-home`, bind-mounted from a worker directory
-  (`homes/<repo>/trusted`, `homes/<repo>/untrusted`), so tool caches persist.
-- It's split by repo and trust pool like warm workspaces (P20), so neither another repo nor a
-  branch can leave a poisoned npm cache for main. (The first commit shared it across repos; fixed
-  right after.)
+  (`homes/<repo>-<hash>/<pool>-<group>`), so tool caches persist.
+- It's split by repo, trust pool and group, like warm workspaces (P20), so neither another repo
+  nor a branch can leave a poisoned npm cache for main, and a credential one group's tool writes
+  to `$HOME` (`~/.npmrc`, `docker login`) isn't readable from another group. (The first commit
+  shared homes across repos, and a review found them shared across groups; both fixed.)
 - Fork runs and `--fresh` (and `pit verify`) get the old empty `/tmp`.
 
 The rest of the time is npm resolving metadata over the network; `--prefer-offline` would cut more.
@@ -3679,6 +3680,11 @@ The rest of the time is npm resolving metadata over the network; `--prefer-offli
 - each home is touched when a job uses it.
 
 A unit test checks that homes are found, sized, aged, and kept while recent.
+
+The review also made removal safe against a job starting on a home: the GC re-checks the home's
+last use under a lock that job setup also takes, then moves it to trash. Homes are mounted with
+`--mount`, which fails rather than letting Docker create a root-owned directory. Only Docker tasks
+create homes.
 
 **Verdict: PARTIAL.** Container tool caches now persist per worker, repo and trust pool, and are
 cleaned up. Limits:
@@ -3733,8 +3739,17 @@ tried again: a final "passed" could be lost and the check left "pending".
   `failure`). With the retry disabled, all three final statuses were lost.
 - The P56 race tests still pass.
 
+**Review fixes.**
+- A rate-limited repost of *another* run (P56's race path) is now retried for that run, not the
+  reporting one. Previously the repost was simply lost.
+- Retries are jittered.
+- Installation-token requests that are rate limited count as rate limits too.
+- A failed annotation chunk releases the claim, so the rest are sent later.
+- The left-out counter map is bounded.
+
 **Verdict: SOLVED** for Pit's own reporting. Limits:
 - The memory of what was posted is in-process: after a server restart, the first report of a run
-  posts every group once more.
+  posts every group once more. A retry pending at the restart is lost; the run's next event
+  reports again, but a run that has already finished gets none.
 - There's no global request budget across runs, so many large runs at once can still meet the
   limit. They then wait and retry rather than lose checks.

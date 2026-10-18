@@ -230,8 +230,10 @@ pub fn command_with(
                 // That user has no home in the image; tools need a writable one.
                 match &policy.docker_home {
                     Some(home) => a.extend([
-                        "-v".into(),
-                        format!("{}:{HOME_MOUNT}", home.display()),
+                        // `--mount` fails on a missing source, where `-v` would
+                        // create it owned by root, unwritable from here on.
+                        "--mount".into(),
+                        format!("type=bind,source={},target={HOME_MOUNT}", home.display()),
                         "-e".into(),
                         format!("HOME={HOME_MOUNT}"),
                     ]),
