@@ -60,6 +60,8 @@ pub struct Worker {
     workspace_max_bytes: u64,
     /// See `WorkerOpts::secrets_file`.
     secrets: HashMap<String, String>,
+    /// Its `[trusted]` section: only for jobs with `trusted_secrets`.
+    trusted_secrets: HashMap<String, String>,
     /// Set by SIGTERM or Ctrl-C: claim nothing new, finish what is running.
     draining: std::sync::atomic::AtomicBool,
     /// Groups running now, by id: their lease, to hand back on a hard stop,
@@ -138,8 +140,13 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
     if let Some(path) = &opts.secrets_file {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading secrets file {}", path.display()))?;
-        worker.secrets = parse_secrets(&text);
-        tracing::info!("{} secret(s) from {}", worker.secrets.len(), path.display());
+        (worker.secrets, worker.trusted_secrets) = parse_secrets(&text);
+        tracing::info!(
+            "{} secret(s), {} for trusted runs only, from {}",
+            worker.secrets.len() + worker.trusted_secrets.len(),
+            worker.trusted_secrets.len(),
+            path.display()
+        );
     }
     worker.client = worker.client.with_worker_token(opts.worker_token.clone());
     if worker.info.backends.contains(&Backend::Docker) {
@@ -329,6 +336,7 @@ impl Worker {
             workspaces: Default::default(),
             workspace_max_bytes: 0,
             secrets: Default::default(),
+            trusted_secrets: Default::default(),
             draining: Default::default(),
             running: Default::default(),
             services: Default::default(),
@@ -1346,12 +1354,21 @@ impl Worker {
             .iter()
             .map(|k| (k, false))
             .chain(def.secrets.iter().map(|k| (k, true)));
-        // A fork's config could ask for anything: it gets nothing.
+        // A fork's config could ask for anything: it gets nothing. Any
+        // branch's config can ask for a `[trusted]` secret too, so those go
+        // only where the server says (`Job::trusted_secrets`).
+        let mut withheld = Vec::new();
         for (k, secret) in wanted.filter(|_| !job.no_secrets) {
             if k.to_ascii_uppercase().starts_with("PIT_") {
                 continue;
             }
-            let value = if secret {
+            let value = if let Some(v) = self.trusted_secrets.get(k).filter(|_| secret) {
+                if !job.trusted_secrets {
+                    withheld.push(k.as_str());
+                    continue;
+                }
+                Some(v.clone())
+            } else if secret {
                 self.secrets
                     .get(k)
                     .cloned()
@@ -1366,13 +1383,25 @@ impl Worker {
                 env.push((k.clone(), v));
             }
         }
+        // Notes on what was withheld: streamed now, and kept at the top of
+        // the stored log.
+        let mut preamble = String::new();
+        if !withheld.is_empty() {
+            preamble.push_str(&format!(
+                "[pit: {} is for trusted runs only (the default branch, the merge queue, schedules); withheld]\n",
+                withheld.join(", ")
+            ));
+        }
         if job.no_secrets && !(def.env.is_empty() && def.secrets.is_empty()) {
+            preamble
+                .push_str("[pit: pull request from a fork; `env` and `secrets` are withheld]\n");
+        }
+        if !preamble.is_empty() {
             let _ = client
                 .post_empty(
                     &format!("/api/tasks/{}/log", task.id),
                     &LogChunk {
-                        text: "[pit: pull request from a fork; `env` and `secrets` are withheld]\n"
-                            .into(),
+                        text: preamble.clone(),
                     },
                 )
                 .await;
@@ -1412,7 +1441,7 @@ impl Worker {
         let masker = Arc::new(mask::Masker::new(secret_values));
         // The task's own retries, plus the job's automatic ones (merge queue).
         let attempts = 1 + def.retries.unwrap_or(0) + job.flake_retries;
-        let mut log = String::new();
+        let mut log = preamble;
         let mut failures: Vec<String> = Vec::new();
         let mut duration_ms = 0u64;
         let mut attempt = 0;
@@ -2230,20 +2259,34 @@ async fn image_id(image: &str) -> String {
 
 /// `KEY=VALUE` lines; blank lines and `#` comments are skipped, and a value
 /// may be wrapped in matching quotes.
-fn parse_secrets(text: &str) -> HashMap<String, String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| {
-            let v = v.trim();
-            let unquoted = ['"', '\'']
-                .iter()
-                .find_map(|q| v.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
-                .unwrap_or(v);
-            (k.trim().to_string(), unquoted.to_string())
-        })
-        .collect()
+/// `KEY=VALUE` lines; those after a `[trusted]` line are the second map.
+type Secrets = HashMap<String, String>;
+
+fn parse_secrets(text: &str) -> (Secrets, Secrets) {
+    let (mut all, mut trusted) = (Secrets::new(), Secrets::new());
+    let mut in_trusted = false;
+    for l in text.lines().map(str::trim) {
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        if l.starts_with('[') && l.ends_with(']') {
+            in_trusted = l == "[trusted]";
+            continue;
+        }
+        let Some((k, v)) = l.split_once('=') else {
+            continue;
+        };
+        let v = v.trim();
+        let unquoted = ['"', '\'']
+            .iter()
+            .find_map(|q| v.strip_prefix(*q).and_then(|v| v.strip_suffix(*q)))
+            .unwrap_or(v);
+        let map = if in_trusted { &mut trusted } else { &mut all };
+        map.insert(k.trim().to_string(), unquoted.to_string());
+    }
+    // A name in both is trusted-only.
+    all.retain(|k, _| !trusted.contains_key(k));
+    (all, trusted)
 }
 
 /// A task's time limits: its own settings, or an hour in total and fifteen
@@ -2308,12 +2351,27 @@ mod secrets_file_tests {
 
     #[test]
     fn parses_dotenv_style_lines() {
-        let s = parse_secrets(
+        let (s, trusted) = parse_secrets(
             "# deploy\nDEPLOY_TOKEN=abc=123\n\n NPM_TOKEN = \"q v\" \nBAD LINE\nX='y'\n",
         );
         assert_eq!(s["DEPLOY_TOKEN"], "abc=123");
         assert_eq!(s["NPM_TOKEN"], "q v");
         assert_eq!(s["X"], "y");
         assert_eq!(s.len(), 3);
+        assert!(trusted.is_empty());
+    }
+
+    #[test]
+    fn trusted_section_is_kept_apart() {
+        let (s, trusted) = parse_secrets(
+            "NPM_TOKEN=a\nPROD_KEY=early\n[trusted]\nPROD_KEY=p\nAWS=k\n[other]\nX=y\n",
+        );
+        assert_eq!(trusted["PROD_KEY"], "p");
+        assert_eq!(trusted["AWS"], "k");
+        assert_eq!(trusted.len(), 2);
+        // A name in both is trusted-only; a later section ends `[trusted]`.
+        assert!(!s.contains_key("PROD_KEY"));
+        assert_eq!(s["NPM_TOKEN"], "a");
+        assert_eq!(s["X"], "y");
     }
 }

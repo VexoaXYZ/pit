@@ -804,7 +804,12 @@ async fn claim(
         tokio::pin!(notified);
         notified.as_mut().enable();
         let (job, held) = app.db.claim_group(&info)?;
-        if let Some(job) = job {
+        if let Some(mut job) = job {
+            // One user, who runs the server: any trusted run will do. On a
+            // shared server only GitHub repos' (see `App::config_sandboxed`).
+            if app.token.is_none() {
+                job.trusted_secrets = job.trusted;
+            }
             app.db.set_run_status(&job.run_id, Status::Running, None)?;
             app.emit(
                 "group.started",

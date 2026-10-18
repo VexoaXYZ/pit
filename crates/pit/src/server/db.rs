@@ -1082,12 +1082,13 @@ impl Db {
             "UPDATE tasks SET summary = NULL, artifacts = NULL WHERE group_id = ?1",
             params![gid],
         )?;
-        let (run, repo_name, url, group_name): (RunRow, String, String, String) = tx.query_row(
-            "SELECT runs.*, repos.name AS repo_name, repos.url AS repo_url, groups_.name AS group_name
+        let (run, repo_name, url, group_name, github): (RunRow, String, String, String, bool) = tx.query_row(
+            "SELECT runs.*, repos.name AS repo_name, repos.url AS repo_url, groups_.name AS group_name,
+               repos.github IS NOT NULL AS repo_github
              FROM groups_ JOIN runs ON runs.id = groups_.run_id JOIN repos ON repos.id = runs.repo_id
              WHERE groups_.id = ?1",
             params![gid],
-            |r| Ok((run_row(r)?, r.get("repo_name")?, r.get("repo_url")?, r.get("group_name")?)),
+            |r| Ok((run_row(r)?, r.get("repo_name")?, r.get("repo_url")?, r.get("group_name")?, r.get("repo_github")?)),
         )?;
         let tasks = {
             let mut st = tx
@@ -1123,6 +1124,9 @@ impl Db {
             debug: run.debug,
             base_sha: run.base_sha,
             cache_token: Some(cache_token),
+            // A server without an API token clears the GitHub condition
+            // (see `api::claim`).
+            trusted_secrets: run.trusted && github,
             tasks,
         };
         Ok((Some(job), held))

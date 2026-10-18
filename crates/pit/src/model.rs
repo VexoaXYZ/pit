@@ -360,6 +360,12 @@ pub struct Job {
     /// results.
     #[serde(default)]
     pub cache_token: Option<String>,
+    /// May get the worker's `[trusted]` secrets (deploy keys): a trusted run
+    /// (default branch, merge queue, schedule), and on a server with an API
+    /// token, of a repo the GitHub webhook registered. Decided by the server,
+    /// never by the branch's config; an older server never sets it.
+    #[serde(default)]
+    pub trusted_secrets: bool,
     pub tasks: Vec<JobTask>,
 }
 

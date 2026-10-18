@@ -88,7 +88,7 @@ export default {
 | `reports` | JUnit XML reports the task writes (`reports/*.xml`). A failure names the failed tests and where they failed: "2 of 42 tests failed: cart.applies coupons (90 == 80) at src/cart.test.ts:42; …", from the test case's `file`/`line` or the first `path:line` in its failure text that is a file in the repo. With a GitHub App, every such failure is an annotation on the check, so it shows on the pull request's diff (sent 50 per request, past the 10-per-step cap Actions annotations have). Old reports are deleted before each attempt. |
 | `env` | Variables passed through and hashed into the cache key. |
 | `runtime` | Commands whose output is part of the cache key (`["node --version"]`), so a toolchain upgrade never reuses old results. |
-| `secrets` | Secrets the task needs, by name: from the worker's `--secrets-file` (or its environment), masked in logs (plain, base64, double base64), not in the cache key. Never given to fork pull requests. |
+| `secrets` | Secrets the task needs, by name: from the worker's `--secrets-file` (or its environment), masked in logs (plain, base64, double base64), not in the cache key. Never given to fork pull requests; those under `[trusted]` only to trusted runs (see "Secrets on workers"). |
 | `cache` | `"remote"` (default, shared by all workers), `"workspace"` (per warm workspace, for installs), or `false`. |
 | `backend` | `"host"` (default), `"sandbox"` (Linux PID, IPC, UTS and optional network namespaces), `"docker"`. |
 | `image` | Container image; implies `backend: "docker"`. The container's `$HOME` is `/pit-home`, a directory the worker keeps between runs (per repo: one for trusted runs, one for the rest), so `~/.npm`, `~/.cache/pip`, `~/.cargo` and Go's module cache stay warm. Fork and `--fresh` runs get an empty `/tmp` instead. Homes unused for two weeks are removed, and they count toward `--workspace-max-gb`. |
@@ -379,6 +379,22 @@ token exported there can be read by any task, declared or not. Put secrets in
 `pit worker --secrets-file FILE` (`KEY=VALUE` lines, `PIT_SECRETS_FILE`) instead: those values
 reach only tasks that list them in `secrets`. On the `host` backend a task still runs as the
 worker's user and could read the file itself, so run untrusted code in `docker`.
+
+Any branch's config can list any secret, so secrets a branch must never see (deploy keys,
+production tokens) go under a `[trusted]` line in that file:
+
+```
+NPM_TOKEN=…
+[trusted]
+PROD_DEPLOY_KEY=…
+```
+
+These reach only trusted runs: the default branch, the merge queue and schedules. On a server
+with an API token, only those of repos the GitHub webhook registered. The server decides, not
+the config. Anything else that asks gets a note in its log instead, and a branch's run can't
+get them. Don't also export them in the worker's environment, which every task inherits. A
+worker older than this version ignores the section header, and a server older than this
+version never allows these secrets.
 
 ## Cloud credentials (OIDC)
 

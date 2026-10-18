@@ -5073,3 +5073,107 @@ async fn schedules_catch_up_on_slots_missed_while_down() {
         .unwrap();
     assert_eq!(count_trigger(&pit, "nightly").await, 2, "no backlog");
 }
+
+/// Secrets in the worker's `[trusted]` section (deploy keys) reach only
+/// trusted runs, whatever a branch's config asks for; on a server with an
+/// API token, only those of repos the GitHub webhook registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusted_secrets_reach_only_trusted_runs() {
+    for token in [None, Some("tok")] {
+        let data = tempfile::tempdir().unwrap();
+        let secrets = data.path().join("secrets.env");
+        std::fs::write(&secrets, "NPM_TOKEN=n\n[trusted]\nPROD_KEY=s3cr3t-value\n").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = pit::server::App::with_github(
+            &data.path().join("server"),
+            token.map(String::from),
+            base.clone(),
+            None,
+        )
+        .unwrap();
+        tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+        tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+            server: base.clone(),
+            token: token.map(String::from),
+            name: Some("w".into()),
+            data_dir: data.path().join("worker"),
+            slots: 2,
+            parallelism: 2,
+            workspace_max_bytes: 0,
+            worker_token: None,
+            secrets_file: Some(secrets),
+        }));
+        let client = Client::new(&base, token.map(String::from)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let root = data.path().canonicalize().unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        sh(&root, "git init -q --bare -b main origin.git");
+        write(
+            &work,
+            "pit.config.json",
+            &serde_json::json!({
+                "tasks": { "show": {
+                    "run": "echo \"prod=${#PROD_KEY} npm=${#NPM_TOKEN}\"",
+                    "secrets": ["PROD_KEY", "NPM_TOKEN"],
+                    "cache": false,
+                } },
+                "schedules": { "nightly": { "cron": "17 3 * * *" } },
+            })
+            .to_string(),
+        );
+        sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+        let log = |run: RunView| {
+            let id = run.groups[0].tasks[0].id.clone();
+            let client = client.clone();
+            async move {
+                client
+                    .get_text(&format!("/api/tasks/{id}/log"))
+                    .await
+                    .unwrap()
+            }
+        };
+        let scheduled = || async {
+            let repo = app.db.repos().unwrap()[0].name.clone();
+            let started: serde_json::Value = client
+                .post(
+                    "/api/schedules/run",
+                    &serde_json::json!({ "name": "nightly", "repo": repo }),
+                )
+                .await
+                .unwrap();
+            pit::cli::wait(&client, started["id"].as_str().unwrap(), |_| {})
+                .await
+                .unwrap()
+        };
+
+        // A branch's run (`pit run`, untrusted) asks for both.
+        let sub = pit::cli::submit(&client, &work, vec![], Default::default())
+            .await
+            .unwrap();
+        let branch = log(pit::cli::wait(&client, &sub.run_id, |_| {}).await.unwrap()).await;
+        assert!(branch.contains("prod=0 npm=1"), "{token:?}: {branch}");
+        assert!(
+            branch.contains("PROD_KEY is for trusted runs only"),
+            "{branch}"
+        );
+
+        let main = log(scheduled().await).await;
+        match token {
+            None => assert!(main.contains("prod=12 npm=1"), "{main}"),
+            Some(_) => {
+                // A repo anyone with the token could register: withheld.
+                assert!(main.contains("prod=0 npm=1"), "{main}");
+                // The same repo once the GitHub webhook vouches for it.
+                let r = app.db.repos().unwrap()[0].clone();
+                app.db
+                    .upsert_repo(&r.name, Some(&r.url), Some("acme/web"))
+                    .unwrap();
+                let main = log(scheduled().await).await;
+                assert!(main.contains("prod=12 npm=1"), "{main}");
+            }
+        }
+    }
+}
