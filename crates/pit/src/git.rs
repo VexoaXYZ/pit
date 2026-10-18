@@ -118,16 +118,20 @@ pub async fn has_commit(repo: &Path, sha: &str) -> bool {
     git_ok(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).await
 }
 
-/// Refspecs a Pit mirror tracks: branches, Pit queue candidates, GitHub PRs.
+/// Refspecs a Pit mirror tracks: branches, Pit queue candidates, GitHub PRs,
+/// and tags (`git describe`, version-from-tag tools; moved tags follow).
 pub const FETCH_REFSPECS: &[&str] = &[
     "+refs/heads/*:refs/heads/*",
     "+refs/pit/*:refs/pit/*",
     "+refs/pull/*/head:refs/pull/*/head",
+    "+refs/tags/*:refs/tags/*",
 ];
 
 /// Creates or updates a bare mirror of `url` at `dir`. It is a plain bare clone
 /// with explicit refspecs, never `--mirror`, so pushes from it are explicit.
-pub async fn ensure_mirror(dir: &Path, url: &str) -> Result<()> {
+/// True when it gained refspecs (an older mirror), so it needs a fetch even
+/// if it has the commit.
+pub async fn ensure_mirror(dir: &Path, url: &str) -> Result<bool> {
     if !dir.join("HEAD").exists() {
         std::fs::create_dir_all(dir)?;
         git(dir, &["init", "--bare", "-q"]).await?;
@@ -142,8 +146,19 @@ pub async fn ensure_mirror(dir: &Path, url: &str) -> Result<()> {
         if current.trim() != url {
             git(dir, &["remote", "set-url", "origin", url]).await?;
         }
+        let have = git(dir, &["config", "--get-all", "remote.origin.fetch"])
+            .await
+            .unwrap_or_default();
+        let mut added = false;
+        for spec in FETCH_REFSPECS {
+            if !have.lines().any(|l| l.trim() == *spec) {
+                git(dir, &["config", "--add", "remote.origin.fetch", spec]).await?;
+                added = true;
+            }
+        }
+        return Ok(added);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Fetches from origin, retrying a failed fetch after 0.5 s, 1 s and 2 s, so
@@ -177,8 +192,8 @@ where
 
 /// Makes sure the mirror has `sha`, fetching only when it does not.
 pub async fn ensure_commit(dir: &Path, url: &str, sha: &str) -> Result<()> {
-    ensure_mirror(dir, url).await?;
-    if has_commit(dir, sha).await {
+    let gained = ensure_mirror(dir, url).await?;
+    if has_commit(dir, sha).await && !gained {
         return Ok(());
     }
     fetch(dir).await?;

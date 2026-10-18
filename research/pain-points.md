@@ -4940,3 +4940,59 @@ On the old code the webhook was ignored and the assertion fails.
   hasn't run yet follows the older setting.
 - No independent review: it only cancels the PR's own runs, on a signed webhook, when the PR's
   own config asks for it.
+
+## P78. `git describe` fails in CI: no tags in the checkout
+
+**The pain.** Versioning tools and release builds read tags (`git describe --tags`, semantic
+version actions), and CI checkouts often have none. `actions/checkout` fetches one commit with no
+tags by default, so `git describe` fails with "fatal: No names found, cannot describe anything"
+until the workflow sets `fetch-depth: 0`:
+- [dev.to: "fetch-depth: 1 made my CI skip tests"](https://dev.to/ji_ai/github-actions-fetch-depth-1-made-my-ci-skip-tests-for-41-prs-ebc),
+  whose table maps `git describe --tags` to exactly that error;
+- [actions/checkout#250](https://github.com/actions/checkout/issues/250);
+- [PaulHatch/semantic-version#41](https://github.com/PaulHatch/semantic-version/issues/41);
+- a matterbridge commit changing `fetch-depth` to 0, "to fetch all tags"
+  ([commit](https://git.linux.ucla.edu/uwaru/matterbridge/commit/f70d1c897a2f999675c24a1f477e890a094e8793)).
+
+**Reproduction** (`/tmp/painhunt/p78`): a repo with an annotated tag `v1.4.0` one commit back,
+pushed with `--tags`, and a task running `git describe --tags`:
+```
+locally: v1.4.0-1-g63c83ed
+version │ version=63c83ed
+version │ fatal: No names found, cannot describe anything.
+failed in 1.9s
+```
+Pit's mirrors fetched with `--no-tags` and only branch, queue and PR refspecs, so no tag ever
+reached a workspace. Even with tags in the mirror, a warm workspace is cloned once and never
+fetched from the mirror again, so tags pushed later would never appear.
+
+**Fix.**
+- **The mirrors track tags.** `+refs/tags/*:refs/tags/*` is added, so moved tags follow. An
+  older mirror gains the refspec and fetches once, even when it already has the commit.
+- **Every job brings its workspace's tags in line with the worker's mirror**, after checkout,
+  with a local `git fetch --prune`; the objects are shared, so it's quick.
+- **A build that embeds the version** lists `git describe --tags` in `runtime`, so a new tag is
+  part of the cache key.
+
+**After** (same repro and server, the existing worker mirror):
+```
+same commit:                          version │ v1.4.0-1-g63c83ed       passed
+new tag v1.5.0 + commit, warm ws:     version │ v1.5.0-1-g95f270a       passed (matches local)
+```
+The e2e test `tasks_see_tags_including_new_ones` covers three things:
+- a task sees `v1.0.0`;
+- the same commit is cached;
+- after a new commit and tag `v1.1.0` are pushed, the warm workspace's task sees `v1.1.0`.
+
+On the old code it fails with "No names found".
+
+**Verdict: SOLVED.** Limits:
+- **Tags on an already-fetched commit.** A tag added to a commit the mirror already has (`git tag`
+  on HEAD, then `pit run`) appears only at the mirror's next fetch, which happens when a new
+  commit arrives. The worker doesn't fetch on every job.
+- **Tags must be pushed.** Tags exist only if they're pushed to the origin Pit fetches from; a
+  local-only tag isn't part of a `pit run` overlay.
+- **No independent review.** Tags come only from the repo's configured origin, which a fork can't
+  push to. The merge queue pushes explicit refs, never tags. The new host-side `git fetch` runs in
+  `prepare`, before any of the job's containers start, as `checkout` already does; confined jobs
+  get fresh workspaces (P70).

@@ -818,6 +818,22 @@ impl Worker {
             git::git(ws, &["config", "lfs.storage", &storage.to_string_lossy()]).await?;
         }
         git_writable(ws, &["checkout", "-q", "--force", "--detach", &job.sha]).await?;
+        // The mirror's tags, as they are now: a warm workspace was cloned
+        // once, and `git describe` must see tags pushed since. Local, and the
+        // objects are shared, so it is quick.
+        git::git(
+            ws,
+            &[
+                "fetch",
+                "-q",
+                "--no-tags",
+                "--prune",
+                "origin",
+                "+refs/tags/*:refs/tags/*",
+            ],
+        )
+        .await
+        .context("updating tags from the mirror")?;
         // Untracked files go, ignored ones (dependencies, build dirs) stay warm.
         git_writable(ws, &["clean", "-q", "-ffd"]).await?;
         if ws.join(".gitmodules").exists() {

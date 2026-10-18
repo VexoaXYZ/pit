@@ -5479,3 +5479,48 @@ async fn tasks_get_one_time_zone_and_locale_on_every_worker() {
         assert!(log.contains("lc=C.UTF-8"), "{log}");
     }
 }
+
+/// Tasks see the repository's tags (`git describe`, version-from-tag tools),
+/// including tags pushed after a warm workspace was first cloned; with
+/// `runtime: ["git describe --tags"]` the tag is part of the cache key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tasks_see_tags_including_new_ones() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    write(
+        &work,
+        "pit.config.json",
+        r#"{"tasks":{"version":{"run":"git describe --tags > version.txt; cat version.txt","outputs":["version.txt"],"runtime":["git describe --tags"]}}}"#,
+    );
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git tag -a v1.0.0 -m v1 && git remote add origin ../origin.git && git push -q origin main --tags");
+    let log = |v: RunView| {
+        let t = v.groups[0].tasks[0].clone();
+        let client = pit.client.clone();
+        async move {
+            let text = client
+                .get_text(&format!("/api/tasks/{}/log", t.id))
+                .await
+                .unwrap();
+            (t.status, text)
+        }
+    };
+    let (status, text) = log(run(&pit, &work).await).await;
+    assert_eq!(status, Status::Passed, "{text}");
+    assert!(text.contains("v1.0.0"), "{text}");
+    // The same commit again: cached.
+    assert_eq!(
+        run(&pit, &work).await.groups[0].tasks[0].status,
+        Status::Cached
+    );
+
+    // A release tag on a new commit, pushed after the workspace was cloned:
+    // the warm workspace sees it, and the key changes with it.
+    sh(&work, "echo n > n.txt && git add -A && git commit -qm next && git tag -a v1.1.0 -m v1.1 && git push -q origin main --tags");
+    let (status, text) = log(run(&pit, &work).await).await;
+    assert_eq!(status, Status::Passed, "{text}");
+    assert!(text.contains("v1.1.0"), "{text}");
+}
