@@ -5173,3 +5173,64 @@ Limits:
 - **Windows** is unchanged.
 - **No independent review.** It changes only how the task process is started, and the
   process-group kill and cancel tests still pass.
+
+## P82. A test leaves a server running, and the next job on that runner finds the port taken
+
+**The pain.** Integration tests often start something in the background (a dev server,
+`redis-server --daemonize yes`, `pg_ctl start`) and never stop it. On a persistent runner it
+outlives the job and holds ports, files and memory for the next one. GitHub's runner handles this
+at the end of a job: it tags every process it starts with `RUNNER_TRACKING_ID` and kills whatever
+still carries the tag ("Cleaning up orphan processes"). That's also why the known way to keep a
+process alive past a job is starting it with `RUNNER_TRACKING_ID=""`. P50, P54 and P59 already
+deal with what jobs leave behind on disk; this is the same problem with processes.
+
+**Reproduction** (`/tmp/painhunt/p82`). Pit already killed a task's process group when it ended,
+so a plain `cmd &` died with the task. A daemon that leaves the session escaped. The task ran
+`setsid -f sleep 7771; sleep 7772 &`:
+```
+passed in 4.4s
+--- still running after the run finished:
+2049981 2049981 2049981 sleep 7771      (the background `sleep 7772` was killed)
+```
+
+**Fix.**
+- **A tracking id.** Each task gets a unique `PIT_TRACKING_ID` (48 random bits) that every
+  process it starts inherits, a daemon in its own session included.
+- **The sweep.** When the task ends, after the group kill, the worker (Linux, through `/proc`)
+  stops whatever still carries it. The task's own group is left to the group kill, so it isn't
+  counted.
+- **Robust.** The scan runs off the async threads with a 5 s limit; it reads `environ`, which can
+  block on a hung mount. It repeats up to three times for a process forked mid-scan, and counts
+  each process once.
+- **Logged.** The log says "stopped N process(es) the task left running".
+- **Opting out.** A build daemon meant to stay warm (Bazel, Gradle, sccache) is started with
+  `PIT_TRACKING_ID=`. Something later tasks need belongs in `services`.
+
+**After** (same repro):
+```
+integration │ started a daemon and a background job; tests pass
+passed in 4.7s; nothing left running
+stored log: [pit: stopped 1 process(es) the task left running]
+```
+The unit test `a_daemon_a_task_leaves_is_stopped` (Linux) runs three processes:
+- a `setsid` daemon, which is stopped;
+- a plain `&` job, which is stopped by the group kill and not counted;
+- a `PIT_TRACKING_ID= setsid` daemon, which survives.
+
+It checks for exactly "stopped 1" and fails without the fix. It passed 3/3 after the last change.
+
+**Review.** Two independent rounds:
+1. **Round 1: APPROVE, no security hole.** A task can only tag processes it starts itself, and
+   ids are 48-bit random. Its shoulds are fixed: the blocking `/proc` scan moved off the async
+   threads with a limit, and the opt-out for build daemons is documented, with an honest GitHub
+   comparison. So are two nits: don't count the group's own processes, and rescan.
+2. **Round 2: APPROVE.** Its nits are fixed too: count a process asleep under SIGKILL once, and a
+   comment.
+
+**Verdict: SOLVED** on Linux. Limits:
+- **macOS and Windows** keep only the process-group kill.
+- **Containers through dockerd.** Containers or compose stacks a host task starts through dockerd
+  aren't tracked. A `docker` task's own container dies with it.
+- **Build daemons.** Kept warm before, they're now stopped after every task unless started with
+  `PIT_TRACKING_ID=`. Faster builds that relied on them need that one change.
+- **The escape hatch.** A task that unsets the variable keeps its daemon, as on GitHub.

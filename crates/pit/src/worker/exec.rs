@@ -551,46 +551,52 @@ fn kill_tracked(tracking: &str, group: Option<u32>) -> usize {
     {
         let needle = format!("{TRACKING_ENV}={tracking}");
         let me = std::process::id();
-        let mut total = 0;
+        // A process killed but not yet gone (asleep on a slow mount) still
+        // shows its environment: counted once.
+        let mut killed = std::collections::HashSet::new();
         for _ in 0..3 {
             let Ok(entries) = std::fs::read_dir("/proc") else {
                 break;
             };
-            let mut n = 0;
+            let before = killed.len();
             for e in entries.flatten() {
                 let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
                     continue;
                 };
-                if pid == me {
-                    continue;
-                }
-                // The process group: the fourth field after the command name,
-                // which may itself hold spaces and parentheses.
-                let pgid = std::fs::read_to_string(e.path().join("stat"))
-                    .ok()
-                    .and_then(|s| {
-                        let rest = s.rsplit_once(')')?.1.to_string();
-                        rest.split_whitespace().nth(2)?.parse::<u32>().ok()
-                    });
-                if pgid.is_some() && pgid == group {
+                if pid == me || killed.contains(&pid) {
                     continue;
                 }
                 let Ok(environ) = std::fs::read(e.path().join("environ")) else {
                     continue;
                 };
-                if environ.split(|b| *b == 0).any(|v| v == needle.as_bytes()) {
-                    // SAFETY: plain syscall on a pid that carries this task's id.
-                    if unsafe { libc_kill(pid as i32, 9) } == 0 {
-                        n += 1;
-                    }
+                if !environ.split(|b| *b == 0).any(|v| v == needle.as_bytes()) {
+                    continue;
+                }
+                // Its process group: the third field after the command name,
+                // which may itself hold spaces and parentheses.
+                let pgid = std::fs::read_to_string(e.path().join("stat"))
+                    .ok()
+                    .and_then(|s| {
+                        s.rsplit_once(')')?
+                            .1
+                            .split_whitespace()
+                            .nth(2)?
+                            .parse::<u32>()
+                            .ok()
+                    });
+                if pgid.is_some() && pgid == group {
+                    continue;
+                }
+                // SAFETY: plain syscall on a pid that carries this task's id.
+                if unsafe { libc_kill(pid as i32, 9) } == 0 {
+                    killed.insert(pid);
                 }
             }
-            total += n;
-            if n == 0 {
+            if killed.len() == before {
                 break;
             }
         }
-        total
+        killed.len()
     }
     #[cfg(not(target_os = "linux"))]
     {
