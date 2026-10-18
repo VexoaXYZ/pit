@@ -980,8 +980,11 @@ impl Db {
         // the queue cannot hide a compatible one behind them.
         //
         // Merge queue runs go first: every change waiting to land waits on
-        // them. Then other trusted runs (main, post-merge), then the rest,
-        // each oldest first.
+        // them. Then other trusted runs (main, post-merge), then the rest.
+        // Within each, the run with the fewest groups running now goes first,
+        // then the oldest group: a run that fans out into many groups shares
+        // the workers with the runs queued after it rather than holding all
+        // of them until it is done (one agent's run stalling everyone else's).
         let pick = {
             let mut st = tx.prepare(
                 "SELECT groups_.id, groups_.run_id, groups_.os, groups_.backends, groups_.created_at,
@@ -1023,6 +1026,8 @@ impl Db {
                        AND (CASE WHEN planning.trigger = 'queue' THEN 0 WHEN planning.trusted = 1 THEN 1 ELSE 2 END)
                          <= (CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END))))
                  ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
+                   (SELECT COUNT(*) FROM groups_ busy
+                     WHERE busy.run_id = groups_.run_id AND busy.status = 'running'),
                    groups_.created_at",
             )?;
             let mut rows = st.query_map(params![worker.os, now], |r| {
@@ -2606,6 +2611,51 @@ mod tests {
         assert_eq!(job.group_id, linux);
         assert!(db.heartbeat_group(&job.group_id, Some(&job.lease)).unwrap());
         assert!(!db.heartbeat_group(&job.group_id, Some("stale")).unwrap());
+    }
+
+    #[test]
+    fn a_run_that_fans_out_shares_workers_with_later_runs() {
+        let db = Db::memory().unwrap();
+        let repo = db.upsert_repo("r", Some("/tmp/r"), None).unwrap();
+        let task = vec![(
+            "t".to_string(),
+            TaskDef {
+                run: "true".into(),
+                ..Default::default()
+            },
+        )];
+        let run = |trigger: &str| {
+            db.insert_run(&repo.id, "sha", None, None, 0, trigger, false, None, false)
+                .unwrap()
+        };
+        let big = run("local");
+        let big_groups: Vec<String> = (0..4)
+            .map(|i| {
+                db.insert_group(&big, &format!("g{i}"), "linux", &[], &task)
+                    .unwrap()
+            })
+            .collect();
+        let worker = WorkerInfo {
+            name: "w".into(),
+            os: "linux".into(),
+            arch: "x".into(),
+            cpus: 1,
+            backends: vec![Backend::Host],
+            kvm: false,
+        };
+        let claim = || db.claim_group(&worker).unwrap().0.unwrap().group_id;
+        assert_eq!(claim(), big_groups[0]);
+        // Another agent's one-group run, queued behind the big run's other
+        // three groups, goes next; a merge queue run still goes before both.
+        let small = run("local");
+        let small_group = db.insert_group(&small, "s", "linux", &[], &task).unwrap();
+        let queue = run("queue");
+        let queue_group = db.insert_group(&queue, "q", "linux", &[], &task).unwrap();
+        assert_eq!(claim(), queue_group);
+        assert_eq!(claim(), small_group);
+        // Then the big run's groups, oldest first.
+        assert_eq!(claim(), big_groups[1]);
+        assert_eq!(claim(), big_groups[2]);
     }
 
     #[test]
