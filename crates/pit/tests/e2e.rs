@@ -5250,3 +5250,28 @@ async fn trusted_secrets_reach_only_trusted_runs() {
         }
     }
 }
+
+/// A task that leaves a read-only tree in its workspace (Go's module
+/// cache) does not break the next run there: a worker that is not root
+/// could not clean it ("Permission denied") and every later run failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_only_leftovers_do_not_break_the_next_run() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    write(
+        dir,
+        "pit.config.json",
+        r#"{"tasks":{"build":{"run":"mkdir -p modcache/x@v1 && echo pkg > modcache/x@v1/doc.go && chmod -R a-w modcache","cache":false}}}"#,
+    );
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    for i in 0..3 {
+        write(dir, "n.txt", &i.to_string());
+        sh(dir, &format!("git add -A && git commit -qm n{i}"));
+        let v = run(&pit, dir).await;
+        assert_eq!(v.status, Status::Passed, "run {i}: {v:?}");
+    }
+}

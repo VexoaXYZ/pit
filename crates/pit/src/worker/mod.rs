@@ -466,7 +466,7 @@ impl Worker {
         let root = self.data_dir.join("workspaces");
         let trash = root.join(".trash");
         // Left over from a cleanup that was interrupted.
-        let _ = std::fs::remove_dir_all(&trash);
+        let _ = disk::remove_tree(&trash);
         let found = disk::scan(&root);
         let now = std::time::SystemTime::now();
         let mut doomed = Vec::new();
@@ -503,7 +503,11 @@ impl Worker {
                 path.strip_prefix(&root).unwrap_or(&path).display(),
                 bytes as f64 / 1e9,
             );
-            std::fs::remove_dir_all(&dest)?;
+            // One that cannot be removed must not stop the rest (the homes).
+            if let Err(e) = disk::remove_tree(&dest) {
+                tracing::warn!("removing {}: {e}", dest.display());
+                continue;
+            }
             freed += bytes;
         }
         if freed > 0 {
@@ -557,7 +561,7 @@ impl Worker {
                     continue;
                 }
                 disk::remove_meta(&path);
-                let _ = std::fs::remove_dir_all(&dest);
+                let _ = disk::remove_tree(&dest);
             }
             tracing::info!(
                 "removed container home {} ({:.1} GB)",
@@ -710,7 +714,7 @@ impl Worker {
                 w.release_workspace(&pool, &ws, fresh);
                 if fresh {
                     disk::remove_meta(&ws);
-                    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws)).await;
+                    let _ = tokio::task::spawn_blocking(move || disk::remove_tree(&ws)).await;
                 }
             });
         } else {
@@ -725,7 +729,11 @@ impl Worker {
             if fresh {
                 let ws = ws.clone();
                 disk::remove_meta(&ws);
-                tokio::task::spawn_blocking(move || std::fs::remove_dir_all(ws));
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = disk::remove_tree(&ws) {
+                        tracing::warn!("removing workspace {}: {e}", ws.display());
+                    }
+                });
             }
         }
         let prefix = format!("{}\0", job.group_id);
@@ -809,9 +817,9 @@ impl Worker {
             git::git(ws, &["lfs", "install", "--local", "--skip-repo"]).await?;
             git::git(ws, &["config", "lfs.storage", &storage.to_string_lossy()]).await?;
         }
-        git::git(ws, &["checkout", "-q", "--force", "--detach", &job.sha]).await?;
+        git_writable(ws, &["checkout", "-q", "--force", "--detach", &job.sha]).await?;
         // Untracked files go, ignored ones (dependencies, build dirs) stay warm.
-        git::git(ws, &["clean", "-q", "-ffd"]).await?;
+        git_writable(ws, &["clean", "-q", "-ffd"]).await?;
         if ws.join(".gitmodules").exists() {
             if job.no_secrets {
                 // A fork's `.gitmodules` could point at another repo's mirror
@@ -952,7 +960,7 @@ impl Worker {
                 )
                 .await?;
                 let sub = ws.join(&path);
-                git::git(&sub, &["clean", "-q", "-ffd"]).await?;
+                git_writable(&sub, &["clean", "-q", "-ffd"]).await?;
                 self.prepare_submodules(&sub, &resolved, depth + 1).await?;
             }
             Ok(())
@@ -2289,6 +2297,23 @@ async fn image_id(image: &str) -> String {
         .output()
         .await;
     inspect().await.unwrap_or_else(|| "unavailable".into())
+}
+
+/// A git command that rewrites the work tree (`checkout`, `clean`), retried
+/// once with the tree's directories made writable: a run that left a
+/// read-only tree (Go's module cache) would otherwise break every later run
+/// of that workspace with "Permission denied".
+async fn git_writable(ws: &Path, args: &[&str]) -> Result<String> {
+    match git::git(ws, args).await {
+        Ok(out) => Ok(out),
+        Err(first) => {
+            let dir = ws.to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || disk::make_dirs_writable(&dir)).await;
+            git::git(ws, args)
+                .await
+                .map_err(|e| e.context(format!("after making it writable; first: {first:#}")))
+        }
+    }
 }
 
 impl Worker {

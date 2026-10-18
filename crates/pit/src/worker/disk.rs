@@ -119,6 +119,54 @@ fn last_used(ws: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+/// Gives every directory under `root` (and `root`) its owner's write and
+/// search bits back, without following symlinks. Tasks leave read-only trees
+/// behind (Go's module cache, `chmod -R a-w`), and the worker, not running
+/// as root, then cannot clean or delete them: every later run of that
+/// workspace would fail.
+pub fn make_dirs_writable(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let mode = meta.permissions().mode();
+            if mode & 0o700 != 0o700 {
+                let _ =
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode | 0o700));
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(e.path());
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+}
+
+/// `remove_dir_all`, which also removes read-only trees a task left (see
+/// `make_dirs_writable`). Never follows symlinks.
+pub fn remove_tree(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            make_dirs_writable(path);
+            std::fs::remove_dir_all(path)
+        }
+        r => r,
+    }
+}
+
 /// Space used on disk, without following symlinks.
 pub fn dir_size(path: &Path) -> u64 {
     let mut total = 0;
@@ -188,6 +236,45 @@ mod tests {
             bytes: gb << 30,
             last_used: SystemTime::now() - Duration::from_secs(days_ago * 24 * 3600),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_trees_are_cleaned_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("modcache");
+        let pkg = tree.join("golang.org/x/text@v0.14.0");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("doc.go"), "package text").unwrap();
+        // A symlink to a directory outside is never followed.
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        for d in [
+            &pkg,
+            &tree.join("golang.org/x"),
+            &tree.join("golang.org"),
+            &tree,
+        ] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        make_dirs_writable(&tree);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&pkg), 0o755);
+        assert_eq!(mode(&tree), 0o755);
+        assert_eq!(mode(&outside), 0o500, "followed a symlink");
+        for d in [&pkg, &tree] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        remove_tree(&tree).unwrap();
+        assert!(!tree.exists());
+        assert!(outside.exists());
+        assert!(
+            remove_tree(&tree).is_err(),
+            "a missing tree is still an error"
+        );
     }
 
     #[test]

@@ -4523,3 +4523,70 @@ being trusted-only.
 - **Undeletable workspaces.** A confined job can make its throwaway workspace undeletable
   (`chmod 000`), so it leaks until the workspace GC, which hits the same error. A slow disk-filling
   path, no worse than before; not fixed.
+
+## P71. One job leaves read-only files, and every later job on that runner fails
+
+**The pain.** Self-hosted runners keep their workspace between jobs, so whatever a job leaves
+there, the next one has to clean up, as a user that isn't root. When a job leaves files that user
+can't delete, the next checkout fails, and so does every job after it, until someone logs in:
+- Root-owned files from Docker steps ("Error: File was unable to be removed Error: EACCES:
+  permission denied, rmdir"):
+  [actions/runner#434](https://github.com/actions/runner/issues/434),
+  [actions/runner#2278](https://github.com/actions/runner/issues/2278),
+  [armbian/actions#23](https://github.com/armbian/actions/pull/23), which adds a pre-checkout
+  `chown` step.
+- Go's module cache, which Go writes read-only on purpose, inside the build folder: "removing the
+  folder failed with permission denied… the fix was `chmod -R u+w`"
+  ([shep-kelpie#375](https://github.com/shep-pm/shep-kelpie/issues/375)).
+
+Pit runs container tasks as the worker's user (so no root-owned files), but read-only trees hit
+it the same way.
+
+**Reproduction** (`/tmp/painhunt/p71`). This box runs Pit as root, and root ignores permission
+bits, so a second server (port 7373) and a worker run as `nobody` via `setpriv`. A task leaves an
+untracked `modcache/golang.org/x/text@v0.14.0/doc.go`, then `chmod -R a-w modcache`, as Go does:
+```
+run 1   passed in 1.8s
+run 2   failed in 1.6s   error preparing workspace: git clean -q -ffd failed in …/default~untrusted/0:
+                         warning: failed to remove modcache/golang.org/x/text@v0.14.0/doc.go: Permission denied
+run 3   failed in 461ms
+```
+That warm workspace is dead for good. The same cause made a throwaway workspace undeletable
+(P70's S14), and the workspace GC stopped its whole pass, container homes included, at the first
+tree it couldn't remove.
+
+**Fix.**
+- `disk::make_dirs_writable` gives every directory in a tree its owner's write and search bits
+  back, never following symlinks. Only directories need write permission for their files to be
+  deleted.
+- **Checkout and clean** (`git checkout --force` and `git clean`, submodules included) retry once
+  after that on failure.
+- **Removal.** `disk::remove_tree`, which does the same on a second try, removes throwaway
+  workspaces, the GC's trash and stale workspaces. A tree that still can't be removed is logged,
+  and the GC carries on instead of stopping.
+
+**After** (same non-root worker; the dead workspace still holds `dr-xr-xr-x modcache`):
+```
+run 9    passed in 2.4s
+run 10   passed in 640ms
+run 11   passed in 754ms
+pit run --fresh  passed; ~fresh pool empty afterwards
+```
+Tests:
+- The unit test `read_only_trees_are_cleaned_up` checks that `0555` directories become `0755` and
+  are removed, and that a symlink to an outside directory is never followed (its `0500` stays).
+- The e2e test `read_only_leftovers_do_not_break_the_next_run` makes three runs that each leave a
+  read-only tree. It can only fail where the tests run as a non-root user, as GitHub's runners do
+  in CI; on this box, as root, it passes either way. The non-root reproduction above is the
+  evidence here.
+
+**Not reviewed independently.** The host-side `chmod` only adds owner bits, only on paths a
+no-follow stat calls directories, and only while none of the job's containers run (before its
+tasks, or after its last one). A symlink swapped in at that moment can at most add owner bits to
+a file the worker already owns.
+
+**Verdict: SOLVED** for read-only trees. Limits:
+- Files owned by another user (a root container step on a worker with a different setup) still
+  can't be removed; Pit doesn't run containers as root.
+- An ignored read-only tree (a Go module cache listed in `.gitignore`) stays warm on purpose.
+  Only `git clean`'s untracked files are removed.
