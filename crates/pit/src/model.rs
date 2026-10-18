@@ -62,6 +62,10 @@ pub struct GroupDef {
     /// per entry, as for `os`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch: Vec<String>,
+    /// The fewest CPUs a worker must have to run this group, so a heavy
+    /// group goes to a big worker instead of whichever asks first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
     /// Default execution backend for tasks in this group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<Backend>,

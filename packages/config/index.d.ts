@@ -122,6 +122,11 @@ export interface GroupDef {
    * any. With several OSes too, each copy is named `group@os-arch`.
    */
   arch?: ("x86_64" | "amd64" | "aarch64" | "arm64" | (string & {}))[];
+  /**
+   * The fewest CPUs a worker must have to run the group, so a heavy group
+   * goes to a big worker rather than whichever asks first. Default: any.
+   */
+  cpus?: number;
   backend?: Backend;
   image?: string;
   /**

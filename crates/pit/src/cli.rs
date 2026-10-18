@@ -26,6 +26,8 @@ pub struct UpOpts {
     pub worker_token: Option<String>,
     pub notify_url: Option<String>,
     pub secrets_file: Option<PathBuf>,
+    /// For links; the built-in worker still uses `addr`.
+    pub public_url: Option<String>,
 }
 
 /// Server and worker in one process.
@@ -41,6 +43,7 @@ pub async fn up(opts: UpOpts) -> Result<()> {
         worker_token,
         notify_url,
         secrets_file,
+        public_url,
     } = opts;
     // The built-in worker always proves itself; other workers need the same
     // PIT_WORKER_TOKEN to join.
@@ -54,7 +57,11 @@ pub async fn up(opts: UpOpts) -> Result<()> {
         crate::worker::parse_secrets(&text)
             .with_context(|| format!("reading secrets file {}", p.display()))?;
     }
-    let app = crate::server::App::new(&data.join("server"), token.clone(), public.clone())?;
+    let links = public_url
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| public.clone());
+    let app = crate::server::App::new(&data.join("server"), token.clone(), links)?;
     app.cache_max_bytes
         .store(cache_max_bytes, std::sync::atomic::Ordering::Relaxed);
     *app.worker_token.lock() = Some(worker_token.clone());

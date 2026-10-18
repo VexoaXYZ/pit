@@ -61,6 +61,10 @@ enum Command {
         /// incoming webhook works as is).
         #[arg(long, env = "PIT_NOTIFY_URL")]
         notify_url: Option<String>,
+        /// URL used in links (GitHub checks, CLI output), when the server is
+        /// reached through another address than `--addr` (a proxy, a domain).
+        #[arg(long, env = "PIT_PUBLIC_URL")]
+        public_url: Option<String>,
     },
     /// Run the control plane.
     Server {
@@ -360,6 +364,7 @@ async fn run(cli: Cli) -> Result<i32> {
             worker_token,
             notify_url,
             secrets_file,
+            public_url,
         } => {
             let data = data_root(data);
             cli::up(cli::UpOpts {
@@ -373,6 +378,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 worker_token,
                 notify_url,
                 secrets_file,
+                public_url,
             })
             .await?;
             Ok(0)

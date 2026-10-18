@@ -50,6 +50,7 @@ export default {
 | `shardFiles` | Globs of the files to split (`["e2e/**/*.spec.ts"]`). Pit deals them out longest first from recorded durations and gives each shard its list in `PIT_SHARD_FILES`, one per line (`playwright test $PIT_SHARD_FILES`; `xargs -d '\n'` for names with spaces), and always in the file `PIT_SHARD_FILES_LIST` (`.pit/shards/<task>`), since a very long list is left out of the environment. One shard does not get all the slow files. Needs `shards` of 2 or more; globs that match no files fail the run, and a shard dealt nothing passes without running. |
 | `retries` | Extra attempts after a failure. A pass on a retry is reported as `flaky:` and is not cached. |
 | `arch` (group) | CPU architectures to run the group on: `x86_64` (or `amd64`), `aarch64` (or `arm64`). One copy of the group per entry (`build@aarch64`), as with `os`, claimed only by a worker with that architecture. Default: any. |
+| `cpus` (group) | The fewest CPUs a worker must have to run the group (`cpus: 8`), so a heavy group goes to a big worker rather than whichever asks first. Waits, saying so, while no online worker has that many. |
 | `quarantine` | `true`: the task still runs and reports, but its failure does not fail the run or eject a queued change. For a known-flaky task while it is fixed; `pit flaky` finds them. |
 
 ### Monorepos: one task per package
