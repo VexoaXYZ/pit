@@ -4164,3 +4164,81 @@ the Turborepo/Bazel caches, so it is the next iteration (P66), not this one.
 
 **Verdict: PARTIAL.** Host evaluation of `.ts` configs is closed for API runs, overlays,
 API-registered repos and the queue. The cross-repo trusted cache (S7) is still open.
+
+## P66. One repo poisons another: warm workspaces and trusted results shared across repos
+
+**How it was found.** The fourth review round of P65 raised it (its S7). Checking it turned up a
+second, simpler case.
+
+**1. Warm workspaces were shared by repos whose names fold together.** A workspace's directory was
+`workspaces/<safe_name(repo)>/<group>~<pool>`, and `safe_name` turns every character outside
+`[A-Za-z0-9.-]` into `_`. So `acme/web`, `acme:web` and `acme_web` used one directory. Warm
+workspaces keep ignored files on purpose, so one repo's tasks ran on the other's `node_modules`.
+Repo names are directory names for `pit run`, and any string through the API.
+
+Reproduction (`/tmp/painhunt/p66`): two repos, `p66:web` and `p66_web`. The first writes an
+ignored `node_modules/lodash/index.js`; the second only reads it.
+```
+    t │ /tmp/pitbench/worker/workspaces/p66_web/default~untrusted/0      (p66:web)
+    t │ /tmp/pitbench/worker/workspaces/p66_web/default~untrusted/0      (p66_web)
+    t │ left by p66:web
+```
+The trusted pool is keyed the same way. A repo named to fold onto a GitHub repo's name, which
+anyone with the API token can register, would share that repo's trusted workspace for main.
+
+**2. Trusted results were one namespace for every repo.** Action keys hold no repo. On a shared
+server, a repo registered through the API still gets trusted runs (its own default branch, queue
+and schedules), and those wrote results a GitHub repo's trusted runs read. The key covers declared
+inputs only, so a task could plant output under a key another repo's main computes. This is cache
+poisoning, the threat P20 guards against between branches, here between repos.
+
+**Fix.**
+- **Per-repo directories.** Warm and fresh workspaces, container homes and worker git mirrors are
+  named `safe_name(repo)-<128-bit hash of the name>`:
+  ```
+  t │ /tmp/pitbench/worker/workspaces/p66_web-a06aa93c…/default~untrusted/0   (p66:web)
+  t │ /tmp/pitbench/worker/workspaces/p66_web-917b53f6…/default~untrusted/0   (p66_web)
+  t │ clean workspace
+  ```
+- **Cache scopes.** `CacheScope` decides where a run's results go and which it may read. On a
+  server with an API token, a non-GitHub repo's trusted runs write `r:<repo id>:<key>`. Its runs
+  read that plus the shared trusted results; no other repo reads it, and a trusted run never reads
+  `u:` (branch) results. GitHub repos, and every repo on a tokenless server, are unchanged. The API
+  cache handlers and the server's own answering of fully cached groups use the same scope.
+- **Digest keys only.** Cache routes accept only 64-hex keys, so a request can't name a prefixed
+  row of another scope.
+- **One-time demotion.** On a shared server, trusted results stored before this version are
+  demoted to untrusted at startup, once, including any `r:` row a caller named directly before keys
+  were checked. A later start without a token re-arms the step. Each repo pays one cold trusted
+  run.
+
+Tests:
+- e2e `api_registered_repos_never_write_the_shared_trusted_cache`: a scheduled (trusted) run of an
+  API repo on a token server stores `r:<repo>:<key>`, while a tokenless server stores the shared
+  key. It fails with "wrote the shared trusted cache" when the rule is reverted.
+- e2e `cache_routes_refuse_keys_that_are_not_digests` and
+  `repos_whose_names_fold_together_get_separate_workspaces`.
+- Unit `untrusted_results_are_never_served_to_trusted_runs`, extended with the per-repo scope, and
+  `shared_trusted_results_are_demoted_once`: a planted `r:` row, once only, re-armed after a
+  tokenless start.
+
+**Review.** Three independent rounds:
+1. **Round 1** found four problems:
+   - the first 32-bit hash suffix could be brute-forced into a chosen collision (now 128 bits);
+   - with trust simply switched off for these repos, their trusted runs read branch results;
+     fixed by the per-repo namespace instead;
+   - results planted before the upgrade stayed trusted; fixed by the demotion;
+   - two repos with folding names shared a worker mirror under different locks.
+2. **Round 2** found the demotion skipped `r:` rows a caller could have written directly, and
+   asked for digest-only keys and re-arming after a tokenless period. All fixed.
+3. **Round 3: APPROVE.** Declined nits:
+   - after a tokenless spell, a repo's own `r:` results are demoted too and go cold;
+   - any token holder can repoint another repo's `last/<scope>` pointer, which only changes the
+     text that explains a cache miss.
+
+**Verdict: SOLVED** for the action cache, warm workspaces, container homes and mirrors.
+Limits:
+- The Turborepo and Bazel remote caches are still not split by trust or repo, as the README has
+  said since P20.
+- Upgrading costs one cold trusted run per repo and, on shared servers, cold workspaces and
+  mirrors. Old directories age out through the workspace GC.

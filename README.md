@@ -315,7 +315,7 @@ reads them, and its trusted runs still never read a branch's. Warm workspaces, c
 and worker mirrors are per repo, with a hash of the full name, so `acme/web` and `acme_web`
 never share one.
 
-Upgrading a shared server to this version does three things once:
+Upgrading a shared server to this version (stop the old server first) does three things once:
 - Trusted results stored before are demoted to untrusted, so every repo's next trusted run
   rebuilds them.
 - Every warm workspace and worker mirror starts cold.

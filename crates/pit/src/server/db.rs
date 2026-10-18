@@ -2410,8 +2410,9 @@ impl Db {
             return Ok(false);
         }
         // `OR REPLACE`: an untrusted result under the same key gives way;
-        // both are untrusted now. `r:` rows included: none existed before
-        // this step, so any is one a caller named directly.
+        // both are untrusted now. `r:` rows included: the first time, any is
+        // one a caller named directly (keys were not checked yet); after a
+        // tokenless spell, repos' own results go cold too, which is safe.
         tx.execute(
             "UPDATE OR REPLACE cache SET action_key = 'u:' || action_key
              WHERE substr(action_key, 1, 2) <> 'u:'",
