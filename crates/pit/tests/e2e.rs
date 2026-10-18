@@ -4699,33 +4699,63 @@ async fn api_cannot_queue_into_a_github_repo_on_a_shared_server() {
 /// entries and runs would become the GitHub repo's, trusted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webhooks_do_not_adopt_api_registered_repos_on_a_shared_server() {
+    use hmac::Mac;
     let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
     let app = pit::server::App::with_github(
         &data.path().join("server"),
         Some("tok".into()),
-        "http://x".into(),
-        None,
+        base.clone(),
+        Some(
+            pit::server::github::GitHub::with_token(
+                "http://127.0.0.1:9",
+                "t",
+                Some("s3cret".into()),
+            )
+            .unwrap(),
+        ),
     )
     .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let url = "https://github.com/acme/web.git";
+    // An API caller registers the GitHub URL first.
     let api = app.db.upsert_repo("x", Some(url), None).unwrap();
+    // Then GitHub's first webhook for it (a re-run of a commit Pit never
+    // ran: it registers the repo and does nothing else).
+    let webhook = || async {
+        let body = serde_json::json!({ "action": "rerequested",
+            "repository": { "full_name": "acme/web", "clone_url": url },
+            "check_run": { "head_sha": "0000000000000000000000000000000000000000", "external_id": "" } })
+        .to_string();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+        mac.update(body.as_bytes());
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        reqwest::Client::new()
+            .post(format!("{base}/webhooks/github"))
+            .header("x-github-event", "check_run")
+            .header("x-hub-signature-256", sig)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    };
+    webhook().await;
     let gh = app
         .db
-        .insert_github_repo("acme/web", url, "acme/web")
-        .unwrap();
-    assert_ne!(gh.id, api.id);
+        .repo_by_github("acme/web")
+        .unwrap()
+        .expect("registered");
+    assert_ne!(gh.id, api.id, "the API caller's row was adopted");
     assert_eq!(app.db.repo(&api.id).unwrap().github, None);
+    // Later webhooks find the same row.
+    webhook().await;
     assert_eq!(
         app.db.repo_by_github("acme/web").unwrap().unwrap().id,
         gh.id
     );
-    // A second webhook finds the same row.
-    let again = app
-        .db
-        .insert_github_repo("acme/web", url, "acme/web")
-        .unwrap();
-    assert_eq!(again.id, gh.id);
-    // A name in use gets a suffix.
+    // A name already in use gets a suffix.
     app.db
         .upsert_repo("acme/api", Some("/elsewhere"), None)
         .unwrap();

@@ -347,7 +347,11 @@ branch, merge queue, schedule) of a repo the GitHub webhook registered. Everythi
 the container: pull requests (same-repo ones too), pushes to other branches, GitHub "Re-run"
 and `/retest`, `pit run` and other API runs, uploaded overlays, and schedules and queues of
 repos registered through the API. On such a server, a GitHub repo's merge queue is entered only
-through the `pit:merge` label; `pit queue add` is refused for it. Any API token holder can send any of those, and a config
+through the `pit:merge` label; `pit queue add` is refused for it. The first webhook for a repo
+always registers it anew, so a repo an API caller registered with the same URL earlier stays
+theirs, sandboxed (if it took the name, the GitHub repo gets a suffix: check `/api/repos`).
+Servers upgraded from before this check should look over `pit queue list` and `/api/repos` for
+entries queued through the API on GitHub repos, and repos adopted by a webhook. Any API token holder can send any of those, and a config
 evaluated on the server could read the server's files. So a shared server needs Docker on it for
 those `.ts` configs; `pit.config.json` needs nothing. A local `pit up` without a token
 evaluates on the host as before: its one user already runs the server.

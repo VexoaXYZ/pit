@@ -4078,3 +4078,89 @@ The review also found a hole outside this diff, recorded as P65 below.
 **Verdict: SOLVED.** Limits:
 - No "Run" button on the dashboard yet.
 - Missed slots while the server is down are still not replayed (P26).
+
+## P65. The API token was a server shell: `pit.config.ts` from any API run evaluated on the host
+
+**How it was found.** The independent review of P64 found it, outside that diff. It is the
+self-hosted version of a known CI risk: evaluating code from a run decides who can read the
+server's keys. P31 already sandboxed forks' configs for this reason.
+
+**The bug.** `plan_run` evaluated `pit.config.ts` in the sandbox only when `no_secrets` was set,
+and the server sets that only for fork pull requests. On a shared server (one with `PIT_TOKEN`),
+anyone holding the API token could send a `.ts` config through `POST /api/runs`, including an
+uncommitted overlay. Node then evaluated it on the server, as the server's user. That reaches
+everything the server can read: the OIDC signing key, the GitHub App key, the database.
+
+`PIT_WORKER_TOKEN` exists so API token holders can't act as trusted workers, and `--oidc` asks
+for "a server host no task can read". This hole bypassed both.
+
+**Reproduction** (`/tmp/painhunt/p65`): `pit server --oidc` with `PIT_TOKEN` and
+`PIT_WORKER_TOKEN`, and a worker. The client holds only the API token. A harmless config writes
+a marker file where it is evaluated:
+```
+fs.writeFileSync("/tmp/painhunt/p65/marker-" + process.pid, `evaluated as uid ${os.userInfo().uid} …`)
+$ PIT_TOKEN=apitok pit run --server http://127.0.0.1:7272
+passed in 364ms · 1 ran, 0 cached
+$ cat /tmp/painhunt/p65/marker-868650
+evaluated as uid 0 on vmi3566801
+```
+
+**Fix.** On a server with an API token, a `pit.config.ts` is evaluated on the host only for a
+**trusted run of a repo the GitHub webhook registered**: default-branch pushes, the merge queue,
+schedules. Everything else goes to the fork sandbox (`node:22-alpine`, no network, no
+capabilities, read-only, only the config mounted):
+- pull requests, same-repo ones included;
+- pushes to other branches, Re-run and `/retest`;
+- `pit run` and other API runs, and overlays;
+- schedules and queues of repos registered through the API.
+
+A local `pit up` without a token is unchanged: its one user already runs the server. A tokenless
+server listening beyond loopback now warns at startup. `pit.config.json` is never evaluated, so
+it needs nothing.
+
+**Measured, after:**
+```
+$ PIT_TOKEN=apitok pit run --server http://127.0.0.1:7272
+error in 1.0s · evaluating pit.config.ts in node:22-alpine failed:
+Error: ENOENT: no such file or directory, open '/tmp/painhunt/p65/marker-1'
+$ ls /tmp/painhunt/p65/marker-*        → nothing on the host
+plain .ts config, same server          → passed in 890ms (evaluated in the sandbox)
+local pit up, no token                 → passed; marker written on the host, as before
+```
+Tests:
+- the unit test `shared_servers_evaluate_only_trusted_github_configs_on_the_host`;
+- the e2e test `api_cannot_queue_into_a_github_repo_on_a_shared_server`: refused by name, and by
+  a new name with the GitHub URL;
+- the e2e test `webhooks_do_not_adopt_api_registered_repos_on_a_shared_server`, which sends
+  signed webhooks. It fails with "the API caller's row was adopted" when the token check in
+  `register()` is inverted.
+
+**Review.** Four independent rounds. Each round found something real:
+1. **Round 1, the merge queue.** `POST /api/queue` could queue any pull request, a fork's
+   included (the mirror fetches `refs/pull/*/head`), into a GitHub repo's queue. The queue
+   evaluates the merged config on the host and runs it as trusted. On a shared server the API
+   now can't queue into GitHub repos; the `pit:merge` label a maintainer applies is the only way
+   in. Same round, also fixed: the README didn't say pull requests and re-runs now need Docker
+   for `.ts` configs, and the Docker-missing error blamed forks only.
+2. **Round 2, a bypass.** A new repo name plus the GitHub repo's URL got past the name check,
+   because repos are matched by URL first. The check now runs on the repo the request resolves
+   to.
+3. **Round 3, an ordering attack.** An API caller registers the GitHub clone URL before the first
+   webhook and queues a fork's pull request on that row. The webhook then adopted the row as the
+   GitHub repo, and the pending entry became trusted. On a shared server, a webhook now always
+   registers a new row (race-safe, with a suffix if the name is taken) and never adopts one.
+4. **Round 4: APPROVE.**
+
+The review's declined point: a fork commit labelled `pit:merge` is still evaluated on the host.
+The label is a maintainer's approval of that exact commit, and once it lands on the default
+branch every trusted push evaluates it there anyway.
+
+**Open, not fixed** (round 4's S7, which predates this change). The trusted action cache is one
+namespace for every repo. On a shared server, a repo registered through the API still gets
+trusted runs (its own default branch, queue, schedules), and those write results that a GitHub
+repo's trusted runs read. The key covers declared inputs only, so a task can plant output under a
+key the GitHub repo will compute. The fix touches the cache namespace, warm workspace pools and
+the Turborepo/Bazel caches, so it is the next iteration (P66), not this one.
+
+**Verdict: PARTIAL.** Host evaluation of `.ts` configs is closed for API runs, overlays,
+API-registered repos and the queue. The cross-repo trusted cache (S7) is still open.
