@@ -6536,3 +6536,80 @@ async fn following_a_run_survives_a_dropped_stream() {
     .unwrap();
     assert_eq!(v.status, Status::Passed, "{v:?}");
 }
+
+/// A GitHub repo whose commits carry no config runs with the operator's
+/// file for it (`PIT_CONFIG_<OWNER>_<NAME>`), so Pit can be tried on a repo
+/// without changing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_operator_config_runs_a_repo_that_has_none() {
+    use hmac::Mac;
+    let data = tempfile::tempdir().unwrap();
+    let config = data.path().join("noconf.json");
+    std::fs::write(
+        &config,
+        r#"{"tasks":{"from-operator":{"run":"echo operator config","cache":false}}}"#,
+    )
+    .unwrap();
+    // A name no other test uses: the variable is process-wide.
+    std::env::set_var("PIT_CONFIG_ACME_NO_CONF", &config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github =
+        pit::server::github::GitHub::with_token("http://127.0.0.1:9", "t", Some("s3cret".into()))
+            .unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app, listener));
+    tokio::spawn(pit::worker::run(pit::worker::WorkerOpts {
+        server: base.clone(),
+        token: None,
+        name: Some("operator".into()),
+        data_dir: data.path().join("worker"),
+        slots: 1,
+        parallelism: 1,
+        workspace_max_bytes: 0,
+        worker_token: None,
+        secrets_file: None,
+    }));
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    write(dir, "README.md", "no pit config here\n");
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let sha = sh(dir, "git rev-parse HEAD").trim().to_string();
+    let body = serde_json::json!({ "ref": "refs/heads/main", "after": sha,
+        "repository": { "full_name": "acme/no-conf", "clone_url": dir.to_string_lossy(), "default_branch": "main" } })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "push")
+        .header("x-hub-signature-256", sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = resp["run"].as_str().expect("a run").to_string();
+    let client = Client::new(&base, None).unwrap();
+    let v = tokio::time::timeout(
+        Duration::from_secs(60),
+        pit::cli::wait(&client, &id, |_| {}),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    assert_eq!(v.groups[0].tasks[0].name, "from-operator");
+}

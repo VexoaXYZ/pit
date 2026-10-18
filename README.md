@@ -337,6 +337,7 @@ Point a GitHub App (or a token) and a webhook at the server:
 | `PIT_GITHUB_WEBHOOK_SECRET` | Required. Webhooks are verified with HMAC-SHA256. |
 | `PIT_PUBLIC_URL` | Link target for checks. |
 | `PIT_REPO_<OWNER>_<NAME>` | Optional clone URL override (a local mirror, for example). |
+| `PIT_CONFIG_<OWNER>_<NAME>` | Optional path to a `pit.config.json` on the server, used for commits of that repo that carry no config: try Pit on a repo without changing it. |
 
 Webhook URL: `<server>/webhooks/github`, events `push`, `pull_request`, `check_run`,
 `issue_comment`. Pushes and pull requests start runs; "Re-run" on a check reruns; adding the

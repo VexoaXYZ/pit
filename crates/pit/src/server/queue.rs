@@ -706,6 +706,7 @@ impl Queue<'_> {
             let config = match self
                 .app
                 .load_config(
+                    self.repo,
                     &self.mirror,
                     &merged,
                     None,

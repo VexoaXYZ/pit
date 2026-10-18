@@ -114,7 +114,7 @@ async fn declared(app: &Arc<App>, repo: &super::db::Repo) -> Result<Option<Decla
                 return Ok(None);
             }
             let c = app
-                .load_config(&mirror, &tip, None, app.config_sandboxed(repo, true))
+                .load_config(repo, &mirror, &tip, None, app.config_sandboxed(repo, true))
                 .await
                 .with_context(|| format!("reading the config at {tip}"))?;
             read_cache()

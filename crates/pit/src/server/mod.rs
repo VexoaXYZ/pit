@@ -203,6 +203,7 @@ impl App {
     /// Loads the config for a commit, preferring a version from the overlay.
     pub async fn load_config(
         &self,
+        repo: &db::Repo,
         mirror: &Path,
         sha: &str,
         overlay: Option<&Overlay>,
@@ -228,6 +229,20 @@ impl App {
                 Default::default()
             };
             return crate::config::parse(name, &src, &scratch, &ctx, untrusted_code).await;
+        }
+        // The operator's config for a GitHub repo whose commits carry none,
+        // so Pit can be tried on a repo without changing it.
+        if let Some(path) = repo.github.as_deref().and_then(operator_config) {
+            let src =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            return crate::config::parse(
+                crate::config::CONFIG_JSON,
+                &src,
+                &scratch,
+                &Default::default(),
+                untrusted_code,
+            )
+            .await;
         }
         bail!("no {} at {sha}", crate::config::CONFIG_TS)
     }
@@ -477,6 +492,7 @@ impl App {
             .transpose()?;
         let config = self
             .load_config(
+                repo,
                 &mirror,
                 &req.sha,
                 overlay.as_ref(),
@@ -914,6 +930,16 @@ fn skip_marker(message: &str) -> Option<&'static str> {
     ];
     let lower = message.to_ascii_lowercase();
     MARKERS.iter().copied().find(|m| lower.contains(m))
+}
+
+/// `PIT_CONFIG_<OWNER>_<NAME>`: a `pit.config.json` on the server for that
+/// GitHub repo, used when a commit has no config of its own.
+pub fn operator_config(full_name: &str) -> Option<PathBuf> {
+    let key = format!(
+        "PIT_CONFIG_{}",
+        full_name.replace(['/', '-', '.'], "_").to_uppercase()
+    );
+    std::env::var_os(key).map(PathBuf::from)
 }
 
 /// `PIT_HISTORY_DAYS`: how long finished runs are kept (default 90; `0`

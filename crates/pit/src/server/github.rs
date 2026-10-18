@@ -1204,7 +1204,7 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
                 };
                 let sandboxed = fork || app.config_sandboxed(&repo, false);
                 let skips = app
-                    .load_config(&app.mirror_dir(&repo.id), &last.sha, None, sandboxed)
+                    .load_config(&repo, &app.mirror_dir(&repo.id), &last.sha, None, sandboxed)
                     .await
                     .is_ok_and(|c| c.drafts == Some(false));
                 if !skips {
