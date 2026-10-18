@@ -154,15 +154,38 @@ pub async fn wait(
     run_id: &str,
     mut on_event: impl FnMut(&Event),
 ) -> Result<RunView> {
-    client
-        .events(&format!("/api/runs/{run_id}/events"), |e| {
-            on_event(&e);
-            !(e.kind == "run.finished"
-                || (e.kind == "snapshot"
-                    && serde_json::from_value::<RunView>(e.data.clone())
-                        .is_ok_and(|v| v.status.is_done())))
-        })
-        .await?;
+    // A proxy in front of the server (Traefik, a load balancer) can drop a
+    // long-lived stream, or end it on a reload. The run goes on: reconnect,
+    // and the new stream's snapshot fills in what happened meanwhile. Give
+    // up only after a minute without a connection.
+    let mut failing_since: Option<std::time::Instant> = None;
+    loop {
+        let mut done = false;
+        let streamed = client
+            .events(&format!("/api/runs/{run_id}/events"), |e| {
+                on_event(&e);
+                done = e.kind == "run.finished"
+                    || (e.kind == "snapshot"
+                        && serde_json::from_value::<RunView>(e.data.clone())
+                            .is_ok_and(|v| v.status.is_done()));
+                if !done {
+                    failing_since = None;
+                }
+                !done
+            })
+            .await;
+        if done {
+            break;
+        }
+        let since = *failing_since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() > std::time::Duration::from_secs(60) {
+            let e = streamed
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("the stream kept closing"));
+            return Err(e.context(format!("following {run_id} (it may still be running)")));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
     client.get(&format!("/api/runs/{run_id}")).await
 }
 
@@ -266,6 +289,10 @@ pub async fn run(
     // task id -> (group, name)
     let mut names: HashMap<String, (String, String)> = HashMap::new();
     let mut groups: HashMap<String, (String, String)> = HashMap::new();
+    // What was printed, so a reconnect's snapshot (see `wait`) adds only
+    // what was missed: group headers by name, task lines by id.
+    let mut headed: std::collections::HashSet<String> = Default::default();
+    let mut printed: std::collections::HashSet<String> = Default::default();
     let mut stderr = std::io::stderr();
     let watch = wait(client, &sub.run_id, |e| {
         match e.kind.as_str() {
@@ -277,13 +304,18 @@ pub async fn run(
                         // the cache) get no live events; print them now.
                         if !json && g.status.is_done() {
                             let who = g.worker.as_deref().unwrap_or("?");
-                            let _ = writeln!(
-                                stderr,
-                                "  {} {}",
-                                style.paint("1", &g.name),
-                                style.dim(&format!("on {who}"))
-                            );
+                            if headed.insert(g.name.clone()) {
+                                let _ = writeln!(
+                                    stderr,
+                                    "  {} {}",
+                                    style.paint("1", &g.name),
+                                    style.dim(&format!("on {who}"))
+                                );
+                            }
                             for t in &g.tasks {
+                                if !printed.insert(t.id.clone()) {
+                                    continue;
+                                }
                                 let line = task_line(
                                     &style,
                                     t.status,
@@ -304,6 +336,7 @@ pub async fn run(
             "group.started" if !json => {
                 let name = e.data["name"].as_str().unwrap_or_default();
                 let worker = e.data["worker"].as_str().unwrap_or_default();
+                headed.insert(name.to_string());
                 let _ = writeln!(
                     stderr,
                     "  {} {}",
@@ -346,6 +379,9 @@ pub async fn run(
                 }
             }
             "task.finished" if !json => {
+                if let Some(id) = &e.task_id {
+                    printed.insert(id.clone());
+                }
                 let status: Status =
                     serde_json::from_value(e.data["status"].clone()).unwrap_or(Status::Error);
                 let line = task_line(
