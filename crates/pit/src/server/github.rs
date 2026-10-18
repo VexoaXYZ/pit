@@ -1123,7 +1123,8 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
 /// (the down-time case). A later pass only starts a head that was already
 /// missing on the pass before: GitHub's API often shows a new head before
 /// its webhook is handled, and a live webhook must not race this into a
-/// second run (on the default branch, runs are never superseded).
+/// second run (on the default branch, runs are never superseded). Passes on
+/// one App are not meant to overlap: the server runs them one at a time.
 pub async fn reconcile(app: &Arc<App>, at_start: bool) -> Result<usize> {
     let Some(gh) = &app.github else {
         return Ok(0);

@@ -5060,3 +5060,69 @@ Tests:
 - A maintainer's `pit:run` label on a fork commit that says `[skip ci]` also skips; `/retest` runs
   it, keeping the fork's restrictions.
 - In GitHub App mode a skipped commit has no check, so no Re-run button either.
+
+## P80. Webhooks missed while the server was down: those commits never get CI
+
+**The pain.** A self-hosted CI server learns about pushes from webhooks, and GitHub doesn't retry
+them: "if your server is down or takes longer than 10 seconds to respond, GitHub will record the
+delivery as a failure. GitHub does not automatically redeliver failed deliveries", and they can be
+redelivered only within three days, by hand or with a script GitHub suggests running on a
+schedule
+([Handling failed webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries),
+[for a repository webhook](https://docs.github.com/en/webhooks/using-webhooks/automatically-redelivering-failed-deliveries-for-a-repository-webhook),
+[for a GitHub App](https://docs.github.com/en/webhooks/using-webhooks/automatically-redelivering-failed-deliveries-for-a-github-app-webhook),
+[eventdock](https://eventdock.app/webhooks/github-webhook-retry),
+[keel#226](https://github.com/hx-thanadej/keel/issues/226)). A push made while Pit is restarting,
+or while its tunnel is down, gets no run, and its PR waits on required checks with nothing to say
+why.
+
+**Before.** Pit started runs only from webhooks, the API and schedules, so a missed delivery was
+lost.
+
+**Fix.** Ten seconds after start, and every ten minutes, for each GitHub repo Pit has run before,
+Pit asks the API for:
+- the default branch's head, if committed within the window;
+- the open pull requests updated within the window, newest first, so one page covers it.
+
+A head commit without a run gets the run its webhook would have started:
+- a trusted `push` run for the default branch;
+- an untrusted `pr` run for a same-repo PR, with its draft flag.
+
+Fork PRs still wait for the label, and skip markers and drafts apply as usual. The window is
+three days, and never longer than `PIT_HISTORY_DAYS`, so a commit whose run was pruned doesn't
+look unrun.
+- **Repos Pit has never run are left alone**, so installing it doesn't run every open PR.
+- **After start, a head is run only once it has been missing for two passes in a row**, so a
+  webhook that's merely late can't race a pass into a second run. On the default branch, runs
+  are never superseded.
+
+**Proof.** No real GitHub here, so the evidence is the e2e test `missed_webhooks_are_caught_up`,
+with a fake GitHub API and a real server and repo:
+- nothing starts before Pit has run the repo; a first push arrives by signed webhook;
+- after that, main advances and a PR opens with no webhooks;
+- a periodic pass starts nothing on first sight, and the next starts main's head and the
+  same-repo PR, but neither a fork's PR nor a stale one;
+- a further pass starts nothing;
+- an old default-branch head (committed in 2020) isn't run.
+
+**Review.** Three independent rounds:
+1. **Round 1** found no trust problem: forks can't pose as the base repo, and only those who can
+   push to the default branch decide its head. It did find three bugs, all fixed:
+   - a pass could race a late webhook into a duplicate main run, now solved by the two-pass rule;
+   - history pruning could make an old head look unrun and rerun as trusted, now solved by the
+     recency window;
+   - only the 100 newest-created PRs were seen, now solved by sorting by update.
+2. **Round 2** found that the "missing last pass" set was process-wide, so one server's pass
+   could wipe another's, a test flake. It now lives on each server.
+3. **Round 3: APPROVE.**
+
+**Verdict: SOLVED.** Limits:
+- **Missed `ready_for_review`.** A draft marked ready while the server was down isn't caught up;
+  `/retest` runs it.
+- **Old committer dates.** A head with an old committer date (an old commit reset to, or a slow
+  clock), pushed while webhooks were missed, isn't caught up.
+- **Startup race.** A push whose API head shows during the startup pass but whose webhook hasn't
+  been handled yet can still run twice, once per restart at most.
+- **API cost.** Three API calls per repo every ten minutes.
+- **Short history (declined).** Below `PIT_HISTORY_DAYS=3`, a PR touched since its head run was
+  pruned can get one repeated untrusted run.
