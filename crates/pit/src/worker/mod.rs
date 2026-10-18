@@ -140,7 +140,8 @@ pub async fn run(opts: WorkerOpts) -> Result<()> {
     if let Some(path) = &opts.secrets_file {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading secrets file {}", path.display()))?;
-        (worker.secrets, worker.trusted_secrets) = parse_secrets(&text);
+        (worker.secrets, worker.trusted_secrets) = parse_secrets(&text)
+            .with_context(|| format!("reading secrets file {}", path.display()))?;
         tracing::info!(
             "{} secret(s), {} for trusted runs only, from {}",
             worker.secrets.len() + worker.trusted_secrets.len(),
@@ -1257,20 +1258,18 @@ impl Worker {
         // Fork code on the host or in the sandbox would share the worker's
         // filesystem, and with it the secrets file, other workspaces and the
         // worker's own /proc. It runs in a container that sees only its
-        // workspace, or not at all.
-        let backend = if job.no_secrets {
+        // workspace, or not at all. So does any branch's code on a worker
+        // holding `[trusted]` secrets, which it could otherwise read there.
+        let backend = if self.confined(job) {
             if !self.info.backends.contains(&Backend::Docker) {
-                let r = finish(
-                    Status::Error,
-                    None,
-                    0,
-                    None,
-                    Some(
-                        "pull request from a fork: it only runs in the docker backend, \
-                         which this worker does not have"
-                            .into(),
-                    ),
-                );
+                let why = if job.no_secrets {
+                    "pull request from a fork: it only runs in the docker backend, \
+                     which this worker does not have"
+                } else {
+                    "this worker holds secrets for trusted runs only, so other runs' code \
+                     runs only in the docker backend, which this worker does not have"
+                };
+                let r = finish(Status::Error, None, 0, None, Some(why.into()));
                 client
                     .post_empty(&format!("/api/tasks/{}/finish", task.id), &r)
                     .await?;
@@ -1373,6 +1372,9 @@ impl Worker {
                     .get(k)
                     .cloned()
                     .or_else(|| std::env::var(k).ok())
+            } else if self.trusted_secrets.contains_key(k) {
+                // `env: ["PROD_KEY"]`: not through the worker's environment.
+                None
             } else {
                 std::env::var(k).ok()
             };
@@ -1387,8 +1389,13 @@ impl Worker {
         // the stored log.
         let mut preamble = String::new();
         if !withheld.is_empty() {
+            let only = if job.trusted {
+                "for trusted runs of repos the GitHub webhook registered on this server"
+            } else {
+                "for trusted runs only (the default branch, the merge queue, schedules)"
+            };
             preamble.push_str(&format!(
-                "[pit: {} is for trusted runs only (the default branch, the merge queue, schedules); withheld]\n",
+                "[pit: {} is {only}; withheld]\n",
                 withheld.join(", ")
             ));
         }
@@ -1427,7 +1434,12 @@ impl Worker {
             env.extend(s.env(backend));
         }
         let policy = exec::EnvPolicy {
-            hide: self.secrets.keys().cloned().collect(),
+            hide: self
+                .secrets
+                .keys()
+                .chain(self.trusted_secrets.keys())
+                .cloned()
+                .collect(),
             minimal: job.no_secrets,
             docker_network: services.as_ref().map(|s| s.network.clone()),
             summary_dir: Some(summary_dir.clone()),
@@ -2042,12 +2054,13 @@ impl Worker {
         let mut out = HashMap::new();
         // The image a container task runs in is part of its key, by ID: the
         // tag alone can point at different images on different workers.
-        let image = (def.backend == Some(Backend::Docker) || def.image.is_some() || job.no_secrets)
-            .then(|| {
-                def.image
-                    .clone()
-                    .unwrap_or_else(|| exec::DEFAULT_IMAGE.into())
-            });
+        let image =
+            (def.backend == Some(Backend::Docker) || def.image.is_some() || self.confined(job))
+                .then(|| {
+                    def.image
+                        .clone()
+                        .unwrap_or_else(|| exec::DEFAULT_IMAGE.into())
+                });
         if let Some(image) = image {
             let memo_key = format!("{}\0image {image}", job.group_id);
             let cached = self.runtime_memo.lock().get(&memo_key).cloned();
@@ -2102,14 +2115,21 @@ impl Worker {
             // instead of on the worker.
             let mut probe = def.clone();
             probe.run = cmd.clone();
-            let backend = if job.no_secrets {
-                probe.network = Some(false);
+            let backend = if self.confined(job) {
+                if job.no_secrets {
+                    probe.network = Some(false);
+                }
                 Backend::Docker
             } else {
                 Backend::Host
             };
             let policy = exec::EnvPolicy {
-                hide: self.secrets.keys().cloned().collect(),
+                hide: self
+                    .secrets
+                    .keys()
+                    .chain(self.trusted_secrets.keys())
+                    .cloned()
+                    .collect(),
                 minimal: job.no_secrets,
                 docker_network: None,
                 summary_dir: None,
@@ -2259,18 +2279,41 @@ async fn image_id(image: &str) -> String {
 
 /// `KEY=VALUE` lines; blank lines and `#` comments are skipped, and a value
 /// may be wrapped in matching quotes.
+impl Worker {
+    /// Whether this job's code runs only in a container: a fork's always,
+    /// and any other run without `trusted_secrets` on a worker that holds
+    /// `[trusted]` secrets, which code on the host could read.
+    fn confined(&self, job: &Job) -> bool {
+        job.no_secrets || (!self.trusted_secrets.is_empty() && !job.trusted_secrets)
+    }
+}
+
 /// `KEY=VALUE` lines; those after a `[trusted]` line are the second map.
+/// Any other line starting with `[` is an error: a mistyped header must not
+/// turn deploy keys into secrets for every run.
 type Secrets = HashMap<String, String>;
 
-fn parse_secrets(text: &str) -> (Secrets, Secrets) {
+fn parse_secrets(text: &str) -> Result<(Secrets, Secrets)> {
     let (mut all, mut trusted) = (Secrets::new(), Secrets::new());
     let mut in_trusted = false;
-    for l in text.lines().map(str::trim) {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    for (n, l) in text.lines().map(str::trim).enumerate() {
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
-        if l.starts_with('[') && l.ends_with(']') {
-            in_trusted = l == "[trusted]";
+        if l.starts_with('[') {
+            let header = l.split('#').next().unwrap_or_default().trim();
+            let name = header
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .map(str::trim);
+            match name {
+                Some(name) if name.eq_ignore_ascii_case("trusted") => in_trusted = true,
+                _ => anyhow::bail!(
+                    "line {}: {l:?} is not a section this file has (only `[trusted]`)",
+                    n + 1
+                ),
+            }
             continue;
         }
         let Some((k, v)) = l.split_once('=') else {
@@ -2286,7 +2329,7 @@ fn parse_secrets(text: &str) -> (Secrets, Secrets) {
     }
     // A name in both is trusted-only.
     all.retain(|k, _| !trusted.contains_key(k));
-    (all, trusted)
+    Ok((all, trusted))
 }
 
 /// A task's time limits: its own settings, or an hour in total and fifteen
@@ -2353,7 +2396,8 @@ mod secrets_file_tests {
     fn parses_dotenv_style_lines() {
         let (s, trusted) = parse_secrets(
             "# deploy\nDEPLOY_TOKEN=abc=123\n\n NPM_TOKEN = \"q v\" \nBAD LINE\nX='y'\n",
-        );
+        )
+        .unwrap();
         assert_eq!(s["DEPLOY_TOKEN"], "abc=123");
         assert_eq!(s["NPM_TOKEN"], "q v");
         assert_eq!(s["X"], "y");
@@ -2363,15 +2407,28 @@ mod secrets_file_tests {
 
     #[test]
     fn trusted_section_is_kept_apart() {
-        let (s, trusted) = parse_secrets(
-            "NPM_TOKEN=a\nPROD_KEY=early\n[trusted]\nPROD_KEY=p\nAWS=k\n[other]\nX=y\n",
-        );
+        let (s, trusted) =
+            parse_secrets("NPM_TOKEN=a\nPROD_KEY=early\n[trusted]\nPROD_KEY=p\nAWS=k\n").unwrap();
         assert_eq!(trusted["PROD_KEY"], "p");
         assert_eq!(trusted["AWS"], "k");
         assert_eq!(trusted.len(), 2);
-        // A name in both is trusted-only; a later section ends `[trusted]`.
+        // A name in both is trusted-only.
         assert!(!s.contains_key("PROD_KEY"));
         assert_eq!(s["NPM_TOKEN"], "a");
-        assert_eq!(s["X"], "y");
+        // Spellings that mean `[trusted]` do; anything else stops the worker
+        // rather than handing deploy keys to every run.
+        for header in [
+            "[Trusted]",
+            "[ TRUSTED ]",
+            "[trusted] # deploy keys",
+            "\u{feff}[trusted]",
+        ] {
+            let (s, trusted) = parse_secrets(&format!("{header}\nK=v\n")).unwrap();
+            assert_eq!(trusted["K"], "v", "{header}");
+            assert!(s.is_empty(), "{header}");
+        }
+        for bad in ["[trusted", "[prod]", "[trusted]x"] {
+            assert!(parse_secrets(&format!("{bad}\nK=v\n")).is_err(), "{bad}");
+        }
     }
 }

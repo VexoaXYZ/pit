@@ -5076,12 +5076,18 @@ async fn schedules_catch_up_on_slots_missed_while_down() {
 
 /// Secrets in the worker's `[trusted]` section (deploy keys) reach only
 /// trusted runs, whatever a branch's config asks for; on a server with an
-/// API token, only those of repos the GitHub webhook registered.
+/// API token, only those of repos the GitHub webhook registered. On a worker
+/// holding them, other runs' code runs only in a container, where it cannot
+/// read the secrets file (or, without docker, not at all).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trusted_secrets_reach_only_trusted_runs() {
+    let docker = cfg!(target_os = "linux")
+        && pit::worker::exec::detect_backends()
+            .await
+            .contains(&Backend::Docker);
     for token in [None, Some("tok")] {
         let data = tempfile::tempdir().unwrap();
-        let secrets = data.path().join("secrets.env");
+        let secrets = data.path().canonicalize().unwrap().join("secrets.env");
         std::fs::write(&secrets, "NPM_TOKEN=n\n[trusted]\nPROD_KEY=s3cr3t-value\n").unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -5102,7 +5108,7 @@ async fn trusted_secrets_reach_only_trusted_runs() {
             parallelism: 2,
             workspace_max_bytes: 0,
             worker_token: None,
-            secrets_file: Some(secrets),
+            secrets_file: Some(secrets.clone()),
         }));
         let client = Client::new(&base, token.map(String::from)).unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5111,28 +5117,30 @@ async fn trusted_secrets_reach_only_trusted_runs() {
         let work = root.join("work");
         std::fs::create_dir_all(&work).unwrap();
         sh(&root, "git init -q --bare -b main origin.git");
+        let run = format!(
+            "echo \"prod=${{#PROD_KEY}} npm=${{#NPM_TOKEN}}\"; \
+             if [ -r {f} ]; then echo file=readable; else echo file=unreadable; fi",
+            f = secrets.display()
+        );
         write(
             &work,
             "pit.config.json",
             &serde_json::json!({
-                "tasks": { "show": {
-                    "run": "echo \"prod=${#PROD_KEY} npm=${#NPM_TOKEN}\"",
-                    "secrets": ["PROD_KEY", "NPM_TOKEN"],
-                    "cache": false,
-                } },
+                "tasks": { "show": { "run": run, "secrets": ["PROD_KEY", "NPM_TOKEN"], "cache": false } },
                 "schedules": { "nightly": { "cron": "17 3 * * *" } },
             })
             .to_string(),
         );
         sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
         let log = |run: RunView| {
-            let id = run.groups[0].tasks[0].id.clone();
+            let t = run.groups[0].tasks[0].clone();
             let client = client.clone();
             async move {
-                client
-                    .get_text(&format!("/api/tasks/{id}/log"))
+                let text = client
+                    .get_text(&format!("/api/tasks/{}/log", t.id))
                     .await
-                    .unwrap()
+                    .unwrap_or_default();
+                (t.status, t.message.unwrap_or_default(), text)
             }
         };
         let scheduled = || async {
@@ -5148,31 +5156,38 @@ async fn trusted_secrets_reach_only_trusted_runs() {
                 .await
                 .unwrap()
         };
+        // A run without the trusted secrets: in a container, without them
+        // and unable to read the file; or refused on a worker without docker.
+        let confined = |(status, message, text): (Status, String, String)| {
+            if docker {
+                assert!(text.contains("prod=0 npm=1"), "{token:?}: {text}");
+                assert!(text.contains("PROD_KEY is"), "{text}");
+                assert!(text.contains("file=unreadable"), "{text}");
+            } else {
+                assert_eq!(status, Status::Error, "{text}");
+                assert!(message.contains("trusted runs only"), "{message}");
+            }
+        };
 
         // A branch's run (`pit run`, untrusted) asks for both.
         let sub = pit::cli::submit(&client, &work, vec![], Default::default())
             .await
             .unwrap();
-        let branch = log(pit::cli::wait(&client, &sub.run_id, |_| {}).await.unwrap()).await;
-        assert!(branch.contains("prod=0 npm=1"), "{token:?}: {branch}");
-        assert!(
-            branch.contains("PROD_KEY is for trusted runs only"),
-            "{branch}"
-        );
+        confined(log(pit::cli::wait(&client, &sub.run_id, |_| {}).await.unwrap()).await);
 
         let main = log(scheduled().await).await;
         match token {
-            None => assert!(main.contains("prod=12 npm=1"), "{main}"),
+            None => assert!(main.2.contains("prod=12 npm=1"), "{main:?}"),
             Some(_) => {
                 // A repo anyone with the token could register: withheld.
-                assert!(main.contains("prod=0 npm=1"), "{main}");
+                confined(main);
                 // The same repo once the GitHub webhook vouches for it.
                 let r = app.db.repos().unwrap()[0].clone();
                 app.db
                     .upsert_repo(&r.name, Some(&r.url), Some("acme/web"))
                     .unwrap();
                 let main = log(scheduled().await).await;
-                assert!(main.contains("prod=12 npm=1"), "{main}");
+                assert!(main.2.contains("prod=12 npm=1"), "{main:?}");
             }
         }
     }

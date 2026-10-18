@@ -391,8 +391,13 @@ PROD_DEPLOY_KEY=…
 
 These reach only trusted runs: the default branch, the merge queue and schedules. On a server
 with an API token, only those of repos the GitHub webhook registered. The server decides, not
-the config. Anything else that asks gets a note in its log instead, and a branch's run can't
-get them. Don't also export them in the worker's environment, which every task inherits.
+the config. Anything else that asks gets a note in its log instead. GitHub's Re-run and
+`/retest` aren't trusted runs, so to redo a deploy, push again or use `pit schedules run`. On a
+worker holding these secrets, every other run's code runs only in the `docker` backend, as
+forks' do, so it can't read the secrets file or a trusted task's environment on the host. Its
+`runtime` commands run there too. Branch runs fail on such a worker if it has no docker, so
+keep deploy secrets on separate workers if branches need the host. Don't also export them in
+the worker's environment, which every task inherits.
 Upgrade workers before adding a `[trusted]` section: an older worker skips the header and hands
 those secrets to every task that asks. A server older than this version never allows them.
 
