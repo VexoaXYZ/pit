@@ -600,6 +600,7 @@ impl Worker {
             .lock()
             .remove(&job.lease)
             .and_then(|slot| slot.get().and_then(|r| r.as_ref().ok().cloned()));
+        let _ = std::fs::remove_dir_all(self.data_dir.join("summaries").join(&job.lease));
         hb.abort();
         let debug_dir = debug::dir(&self.data_dir, &job.group_id);
         if job.debug && debug::has_scripts(&debug_dir) {
@@ -1220,10 +1221,16 @@ impl Worker {
         // `$PIT_SUMMARY`, also as `$GITHUB_STEP_SUMMARY`: markdown the task
         // appends to (tools that write Actions job summaries work as is),
         // shown on its check. A path the task can open, host or container.
-        let summary_rel = format!(".pit/summary/{}.md", safe_task_file(&task.name));
-        let summary_path = files::safe_join(ws, &summary_rel)?;
+        // Outside the workspace, in a directory of the worker's own: a task
+        // (a fork's, in a container) controls everything in the workspace,
+        // and a symlink there could aim the worker's reads and writes at
+        // other files. Named by task id, which is unique.
+        let summary_dir = self.data_dir.join("summaries").join(&job.lease);
+        std::fs::create_dir_all(&summary_dir)?;
+        let summary_file = format!("{}.md", task.id);
+        let summary_path = summary_dir.join(&summary_file);
         let summary_env = if backend == Backend::Docker {
-            format!("/workspace/{summary_rel}")
+            format!("{}/{summary_file}", exec::SUMMARY_MOUNT)
         } else {
             summary_path.to_string_lossy().into_owned()
         };
@@ -1306,6 +1313,7 @@ impl Worker {
             hide: self.secrets.keys().cloned().collect(),
             minimal: job.no_secrets,
             docker_network: services.as_ref().map(|s| s.network.clone()),
+            summary_dir: Some(summary_dir.clone()),
         };
         // Secrets never reach the server's logs, live or stored.
         let masker = Arc::new(mask::Masker::new(secret_values));
@@ -1614,17 +1622,31 @@ impl Worker {
                 None => how,
             });
         }
-        if let Some(md) =
-            files::read_task_file(&summary_path, crate::server::api::MAX_SUMMARY_BYTES as u64)
-                .filter(|m| !m.trim().is_empty())
-        {
+        // Posted even when empty: it replaces what an earlier attempt of this
+        // task (requeued) left.
+        let cap = crate::server::api::MAX_SUMMARY_BYTES as u64;
+        let too_big = std::fs::symlink_metadata(&summary_path).is_ok_and(|m| m.len() > cap);
+        let md = if too_big {
+            let note = format!("\n[pit: summary over {} KiB left out]\n", cap >> 10);
             let _ = client
                 .post_empty(
-                    &format!("/api/tasks/{}/summary", task.id),
-                    &serde_json::json!({ "markdown": masker.mask(&md) }),
+                    &format!("/api/tasks/{}/log", task.id),
+                    &LogChunk { text: note },
                 )
                 .await;
-        }
+            String::new()
+        } else {
+            files::read_task_file(&summary_path, cap)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        let _ = client
+            .post_empty(
+                &format!("/api/tasks/{}/summary", task.id),
+                &serde_json::json!({ "markdown": masker.mask(&md) }),
+            )
+            .await;
+        let _ = std::fs::remove_file(&summary_path);
         let message = message.map(|m| masker.mask(&m));
         let status = if ok { Status::Passed } else { Status::Failed };
         let r = finish(
@@ -1826,6 +1848,7 @@ impl Worker {
                 hide: self.secrets.keys().cloned().collect(),
                 minimal: job.no_secrets,
                 docker_network: None,
+                summary_dir: None,
             };
             let exec::TaskCommand {
                 cmd: mut command,

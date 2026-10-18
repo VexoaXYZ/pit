@@ -3516,15 +3516,17 @@ Directory nonexistent` and exits 2, failing the task. Nothing reached the check 
 
 **Fix.**
 - **Every task gets a summary file.** `$PIT_SUMMARY` and the same path as `$GITHUB_STEP_SUMMARY`
-  point at `.pit/summary/<task>.md` in the workspace: an absolute host path for host and sandbox
-  tasks, `/workspace/…` in containers. So a task that `cd`s elsewhere still finds it.
+  point at a file named by the task's id, in a directory of the worker's own outside the workspace:
+  an absolute path on the host, mounted at `/pit-summary/…` in containers. So a task that `cd`s
+  elsewhere still finds it, and the checkout stays clean.
 - **It's emptied before each attempt**, so the last attempt's summary counts.
 - **The worker reads it after the task**, without following symlinks, regular files only, up to
-  1 MiB (GitHub's own limit), masked like logs. It posts it (`POST /api/tasks/{id}/summary`,
-  lease-checked).
+  64 KiB (more is left out with a log line), masked like logs. It always posts it, even empty, so
+  a requeued attempt's summary is replaced (`POST /api/tasks/{id}/summary`, lease-checked).
 - **It's shown in three places:**
   - the group's GitHub check, under `### <task>` after the task table, within the check summary's
-    size limit (beyond it, a note points at the run);
+    size limit (beyond it, a note per task points at `GET /api/runs/<id>`). A fork's markdown is
+    fenced, so it can't pose as Pit's text or swallow what follows;
   - the end of `pit run`;
   - the API (`TaskView.summary`).
 
@@ -3537,7 +3539,66 @@ Directory nonexistent` and exits 2, failing the task. Nothing reached the check 
 - A unit test checks the summary's placement and that a 70 KB summary is left out with a note,
   keeping the check under 65,535 characters.
 
+**Review fixes.** The first version kept the file at `.pit/summary/<task>.md` in the workspace,
+and an independent review found:
+- a fork container could symlink `.pit` or `.pit/summary` and make the worker read a host file
+  onto the public check, or empty one on a retry;
+- every checkout gained an untracked `.pit/`, failing "clean tree" checks;
+- sanitised names collided;
+- a requeue could keep a stale summary;
+- the "see the run" note pointed at a page that doesn't show it.
+
+All are fixed as described above. e2e `summaries_live_outside_the_workspace` checks the path is
+outside the workspace and `git status` stays clean. A unit test checks the fork fence. JUnit
+reports are again skipped unless valid UTF-8.
+
 **Verdict: SOLVED.** Limits:
 - One summary per task, not per step.
 - A cache hit shows no summary (the task didn't run).
+- With a plain token (commit statuses), there's no summary on GitHub.
 - No dashboard rendering yet: the API carries the summary.
+
+## P58. Concurrency queues cancel waiting deploys (and Pit's lock ran them out of order)
+
+**The pain.** In GitHub Actions a concurrency group holds one pending run: a newer one *cancels*
+the one waiting, even with `cancel-in-progress: false`.
+
+> there can be only one pending job … the previous pending jobs will still be cancelled. Wish
+> this was indicated somewhere as it took me forever to debug this.
+
+[community #32376](https://github.com/orgs/community/discussions/32376); also
+[#63136](https://github.com/orgs/community/discussions/63136) ("I never want to cancel a pending
+job in this group. Just line them up"), [#69704](https://github.com/orgs/community/discussions/69704).
+
+Deploys of intermediate commits vanish, and serial tests against a shared resource are skipped.
+GitHub added `queue: max` (up to 100 pending) in May 2026
+([docs](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency),
+[laplusda](https://laplusda.com/en/posts/github-actions-concurrency-pending-cancelled/),
+[ittrip](https://en.ittrip.xyz/windows/troubleshooting/github-actions-concurrency),
+[starsling](https://starsling.dev/best-practices/github-actions/cut-queue-time)); older guides
+still describe one-pending ([RunsOn](https://runs-on.com/github-actions/concurrency/)).
+
+**Reproduction.** Pit's `lock` (P29) never cancels: waiting groups stay queued without a limit. The
+new e2e `every_deploy_runs_in_order_under_a_lock` makes four quick pushes to a default branch named
+`develop`, each deploying under `lock: "prod"`. Two problems turned up:
+1. **Superseding cancelled the deploys.** The supersede rule (P9) exempted only branches named
+   `main`, `master` or `trunk`, so the first three `develop` runs were cancelled ("superseded by
+   run_…"), on the old code, measured.
+2. **The lock wasn't first come, first served.** With superseding fixed, the four deploys all ran,
+   one at a time, but not always in push order: the first two swapped in 2 of 3 runs. Production
+   would briefly get the older commit last. Groups were claimed in the order they were *planned*,
+   and runs plan concurrently.
+
+**Fix.**
+- Trusted runs (pushes to the default branch, whatever its name) never supersede each other.
+- A locked group can't be claimed before:
+  - an older run's group waiting for the same lock, or
+  - an older run of the same repo that is still being planned (capped at a minute).
+
+**Measured.** The e2e passed 5 of 5 after the fix (1 of 3 before), with `start/end` lines strictly
+in push order and no run cancelled. The old supersede rule fails the same test (checked by putting
+it back). The P29 lock tests and the rest of the suite pass, twice.
+
+**Verdict: SOLVED.** Pit had "no limit, no cancellations" but not ordering, and default branches
+not named main were superseded. Both are fixed. Limit: while a locked group waits behind an older
+one, its waiting message doesn't name that run.

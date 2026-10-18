@@ -878,9 +878,22 @@ impl Db {
                  JOIN runs ON runs.id = groups_.run_id
                  WHERE groups_.status = 'queued' AND runs.status IN ('queued', 'running')
                    AND (groups_.os = 'any' OR groups_.os = ?1)
-                   AND (groups_.lock_name IS NULL OR NOT EXISTS (
+                   AND (groups_.lock_name IS NULL OR (NOT EXISTS (
                      SELECT 1 FROM groups_ held WHERE held.lock_name = groups_.lock_name
-                       AND (held.status = 'running' OR held.lock_until > ?2)))
+                       AND (held.status = 'running' OR held.lock_until > ?2))
+                   -- A lock is taken in the order runs were created (a deploy of
+                   -- every commit, in push order): not before an older run's
+                   -- group waiting for it, nor while an older run of the repo is
+                   -- still being planned (for a minute at most).
+                   AND NOT EXISTS (
+                     SELECT 1 FROM groups_ earlier JOIN runs er ON er.id = earlier.run_id
+                     WHERE earlier.lock_name = groups_.lock_name AND earlier.status = 'queued'
+                       AND er.status IN ('queued', 'running') AND er.created_at < runs.created_at)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM runs planning WHERE planning.repo_id = runs.repo_id
+                       AND planning.status = 'queued' AND planning.created_at < runs.created_at
+                       AND planning.created_at > ?2 - 60000
+                       AND NOT EXISTS (SELECT 1 FROM groups_ pg WHERE pg.run_id = planning.id))))
                  ORDER BY CASE WHEN runs.trigger = 'queue' THEN 0 WHEN runs.trusted = 1 THEN 1 ELSE 2 END,
                    groups_.created_at",
             )?;

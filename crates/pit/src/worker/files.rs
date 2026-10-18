@@ -43,7 +43,7 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
 
 /// A file a task wrote, read without following a symlink (a task can swap
 /// one in for `/dev/zero`), regular files only, at most `max` bytes.
-pub fn read_task_file(path: &Path, max: u64) -> Option<String> {
+pub fn read_task_file(path: &Path, max: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
@@ -59,7 +59,7 @@ pub fn read_task_file(path: &Path, max: u64) -> Option<String> {
     }
     let mut bytes = Vec::new();
     file.take(max).read_to_end(&mut bytes).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(bytes)
 }
 
 pub fn write_file(dest: &Path, bytes: &[u8], executable: bool) -> Result<()> {

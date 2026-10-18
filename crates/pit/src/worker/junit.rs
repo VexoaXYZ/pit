@@ -328,7 +328,9 @@ fn record(
 pub fn summarize(files: &[impl AsRef<Path>]) -> Option<Summary> {
     let mut total: Option<Summary> = None;
     for f in files {
-        let Some(xml) = super::files::read_task_file(f.as_ref(), MAX_REPORT_BYTES) else {
+        let Some(xml) = super::files::read_task_file(f.as_ref(), MAX_REPORT_BYTES)
+            .and_then(|b| String::from_utf8(b).ok())
+        else {
             continue;
         };
         total

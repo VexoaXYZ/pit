@@ -248,7 +248,7 @@ impl GitHub {
                 .await;
         }
         for g in &view.groups {
-            let summary = summarize(g);
+            let summary = summarize(g, run_id, run.no_secrets);
             // Left out of this kind of run (`on`): reported "skipped", which
             // GitHub counts as passing for a required check, as for a job an
             // `if:` skips. Unless another run of this commit really runs that
@@ -461,7 +461,7 @@ impl GitHub {
     }
 }
 
-fn summarize(g: &GroupView) -> String {
+fn summarize(g: &GroupView, run_id: &str, untrusted: bool) -> String {
     let done = g.tasks.iter().filter(|t| t.status.is_done()).count();
     let cached = g
         .tasks
@@ -486,21 +486,29 @@ fn summarize(g: &GroupView) -> String {
             note(t)
         ));
     }
-    // What tasks wrote to `$PIT_SUMMARY` / `$GITHUB_STEP_SUMMARY`.
+    // What tasks wrote to `$PIT_SUMMARY` / `$GITHUB_STEP_SUMMARY`. A fork's
+    // markdown goes in a fence: shown, but unable to pose as Pit's own text
+    // or swallow what follows.
     for t in &g.tasks {
         let Some(md) = t.summary.as_deref().filter(|m| !m.trim().is_empty()) else {
             continue;
         };
-        let room = CHECK_SUMMARY_ROOM.saturating_sub(s.len());
-        let block = format!("\n### {}\n\n{}\n", t.name, md.trim_end());
-        if block.len() <= room {
+        let body = if untrusted {
+            format!(
+                "~~~~~~~~text\n{}\n~~~~~~~~",
+                md.trim_end().replace("~~~~~~~~", "~~~~ ~~~~")
+            )
+        } else {
+            md.trim_end().to_string()
+        };
+        let block = format!("\n### {}\n\n{body}\n", t.name);
+        if block.len() <= CHECK_SUMMARY_ROOM.saturating_sub(s.len()) {
             s.push_str(&block);
         } else {
             s.push_str(&format!(
-                "\n### {}\n\n_(summary left out: the check's summary is full; see the run)_\n",
+                "\n### {}\n\n_(summary too long for the check: `GET /api/runs/{run_id}` on the Pit server has it)_\n",
                 t.name
             ));
-            break;
         }
     }
     s
@@ -903,7 +911,7 @@ mod tests {
             ],
             ..g
         };
-        let table = summarize(&g);
+        let table = summarize(&g, "run_1", false);
         assert!(
             table.contains("| lint | passed | 4.0s | slow: took 4.0s, usually 1.0s |"),
             "{table}"
@@ -917,12 +925,18 @@ mod tests {
         let mut g = g;
         g.tasks[0].summary = Some("## Coverage\n91%".into());
         g.tasks[1].summary = Some("x".repeat(70_000));
-        let text = summarize(&g);
+        let text = summarize(&g, "run_1", false);
         assert!(text.contains("### lint\n\n## Coverage\n91%"), "{text}");
         assert!(
-            text.contains("### test\n\n_(summary left out"),
+            text.contains("### test\n\n_(summary too long for the check: `GET /api/runs/run_1`"),
             "{}",
             &text[..200]
+        );
+        // A fork's markdown is fenced.
+        let fork = summarize(&g, "run_1", true);
+        assert!(
+            fork.contains("### lint\n\n~~~~~~~~text\n## Coverage\n91%\n~~~~~~~~"),
+            "{fork}"
         );
         assert!(text.len() < 65_535);
     }

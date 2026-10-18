@@ -99,7 +99,13 @@ pub struct EnvPolicy {
     pub minimal: bool,
     /// The network a `docker` task joins: its group's services'.
     pub docker_network: Option<String>,
+    /// A worker-owned directory a `docker` task sees at `SUMMARY_MOUNT`
+    /// (`$PIT_SUMMARY` lives there, outside the workspace).
+    pub summary_dir: Option<std::path::PathBuf>,
 }
+
+/// Where a container sees `EnvPolicy::summary_dir`.
+pub const SUMMARY_MOUNT: &str = "/pit-summary";
 
 /// What a task gets under `EnvPolicy::minimal`: enough to find tools and a
 /// temp dir, nothing an operator would put a credential in.
@@ -192,6 +198,9 @@ pub fn command_with(
                 "-w".into(),
                 "/workspace".into(),
             ];
+            if let Some(d) = &policy.summary_dir {
+                a.extend(["-v".into(), format!("{}:{SUMMARY_MOUNT}", d.display())]);
+            }
             if !network {
                 a.extend(["--network".into(), "none".into()]);
             } else if let Some(n) = &policy.docker_network {

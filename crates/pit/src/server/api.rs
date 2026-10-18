@@ -431,8 +431,9 @@ async fn append_log(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The most of a task summary kept: GitHub's own limit for one.
-pub const MAX_SUMMARY_BYTES: usize = 1 << 20;
+/// The most of a task summary kept: a check shows about 60 KB, and every
+/// run view carries it.
+pub const MAX_SUMMARY_BYTES: usize = 64 << 10;
 
 #[derive(Deserialize)]
 struct SummaryBody {

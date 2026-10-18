@@ -1081,8 +1081,17 @@ async fn newer_pushes_supersede_and_stop_older_runs() {
             "superseded run {old} kept running to the end"
         );
     }
-    // Pushes to main are never superseded.
-    assert!(!pit::server::App::supersedes_for_test("push", "main"));
+    // Pushes to main, or to a default branch with any other name (trusted),
+    // are never superseded.
+    assert!(!pit::server::App::supersedes_for_test(
+        "push", "main", false
+    ));
+    assert!(!pit::server::App::supersedes_for_test(
+        "push", "develop", true
+    ));
+    assert!(pit::server::App::supersedes_for_test(
+        "push", "feature", false
+    ));
 }
 
 /// A run whose every task is cached does not wait for a worker: with every
@@ -3901,4 +3910,99 @@ async fn a_real_check_is_reposted_over_a_newer_left_out_one() {
         .find(|(how, b)| how.starts_with("POST") && b["name"] == "pit / lint")
         .unwrap_or_else(|| panic!("the real check was not posted anew: {sent:?}"));
     assert_eq!(reposted.1["conclusion"], "failure");
+}
+
+/// Four quick pushes to a default branch called `develop`, each deploying
+/// under one lock: all four run, one at a time, in order. None is cancelled,
+/// which GitHub's default concurrency queue does to the waiting ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_deploy_runs_in_order_under_a_lock() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(tmp.path(), "git init -q --bare -b develop origin.git");
+    let log = tmp.path().join("deploys.log");
+    let config = serde_json::json!({ "groups": { "deploy": { "lock": "prod", "tasks": { "ship": {
+        "run": format!("echo start $PIT_SHA >> {l}; sleep 1; echo end $PIT_SHA >> {l}", l = log.display()),
+        "cache": false,
+    } } } } });
+    write(&work, "pit.config.json", &config.to_string());
+    sh(&work, "git init -q -b develop && git add -A && git commit -qm c0 && git remote add origin ../origin.git && git push -q origin develop");
+    let url = tmp.path().join("origin.git").to_string_lossy().to_string();
+    let mut shas = vec![];
+    let mut ids = vec![];
+    for i in 1..=4 {
+        sh(
+            &work,
+            &format!("git commit -q --allow-empty -m c{i} && git push -q origin develop"),
+        );
+        let sha = sh(&work, "git rev-parse HEAD").trim().to_string();
+        let id = pit
+            .app
+            .create_run(
+                CreateRun {
+                    repo: "deploys".into(),
+                    url: Some(url.clone()),
+                    sha: sha.clone(),
+                    overlay: None,
+                    tasks: vec![],
+                    trigger: Some("push".into()),
+                    git_ref: Some("develop".into()),
+                    no_cache: false,
+                    fresh: false,
+                    debug: false,
+                    counts_as: None,
+                    no_secrets: false,
+                    trusted: true,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        shas.push(sha);
+        ids.push(id);
+    }
+    for id in &ids {
+        let v = tokio::time::timeout(
+            Duration::from_secs(60),
+            pit::cli::wait(&pit.client, id, |_| {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(v.status, Status::Passed, "{v:?}");
+    }
+    let lines: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect();
+    let expected: Vec<String> = shas
+        .iter()
+        .flat_map(|s| [format!("start {s}"), format!("end {s}")])
+        .collect();
+    assert_eq!(lines, expected, "one at a time, in push order");
+}
+
+/// `$PIT_SUMMARY` lives outside the workspace: the checkout stays clean
+/// (`git status` checks keep passing) and nothing a task puts in the
+/// workspace can point the worker's summary reads elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn summaries_live_outside_the_workspace() {
+    let pit = start().await;
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    let config = serde_json::json!({ "tasks": { "t": {
+        "run": "case \"$PIT_SUMMARY\" in \"$PWD\"*) exit 3;; esac; [ \"$GITHUB_STEP_SUMMARY\" = \"$PIT_SUMMARY\" ] || exit 4; echo '## hi' >> $PIT_SUMMARY; test -z \"$(git status --porcelain)\"",
+        "cache": false,
+    } } });
+    write(dir, "pit.config.json", &config.to_string());
+    sh(
+        dir,
+        "git init -q -b main && git add -A && git commit -qm init",
+    );
+    let view = run(&pit, dir).await;
+    assert_eq!(view.status, Status::Passed, "{view:?}");
+    assert_eq!(view.groups[0].tasks[0].summary.as_deref(), Some("## hi\n"));
 }

@@ -314,7 +314,11 @@ impl App {
         // A newer push to a branch, PR update or local run makes the older
         // ones pointless: stop them instead of finishing them. Main-branch
         // pushes, merge queue and post-merge runs always finish.
-        if let Some(git_ref) = req.git_ref.as_deref().filter(|r| supersedes(&trigger, r)) {
+        if let Some(git_ref) = req
+            .git_ref
+            .as_deref()
+            .filter(|r| supersedes(&trigger, r, trusted))
+        {
             for old in self
                 .db
                 .superseded_runs(&repo.id, &trigger, git_ref, &run_id)?
@@ -663,8 +667,8 @@ impl App {
 
 impl App {
     #[doc(hidden)]
-    pub fn supersedes_for_test(trigger: &str, git_ref: &str) -> bool {
-        supersedes(trigger, git_ref)
+    pub fn supersedes_for_test(trigger: &str, git_ref: &str, trusted: bool) -> bool {
+        supersedes(trigger, git_ref, trusted)
     }
 }
 
@@ -684,10 +688,13 @@ pub fn trusted_branch(branch: &str, default_branch: Option<&str>) -> bool {
 }
 
 /// Whether a new run with this trigger and ref replaces older ones.
-fn supersedes(trigger: &str, git_ref: &str) -> bool {
+/// Whether a newer run of this ref cancels the older ones. Never for
+/// trusted runs (default-branch pushes, whatever the branch is called: a
+/// deploy of every commit must run, one after another under a `lock`).
+fn supersedes(trigger: &str, git_ref: &str, trusted: bool) -> bool {
     match trigger {
         "pr" | "local" => true,
-        "push" => !matches!(git_ref, "main" | "master" | "trunk"),
+        "push" => !trusted && !matches!(git_ref, "main" | "master" | "trunk"),
         _ => false,
     }
 }
