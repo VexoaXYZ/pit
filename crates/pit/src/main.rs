@@ -234,10 +234,30 @@ enum Command {
         #[command(flatten)]
         conn: Conn,
     },
+    /// Scheduled runs (`schedules` on each repo's default branch): when each
+    /// fires next and how its last run went.
+    Schedules {
+        #[command(subcommand)]
+        command: Option<SchedulesCmd>,
+        #[command(flatten)]
+        conn: Conn,
+    },
     /// Cache and run statistics.
     Stats {
         #[command(flatten)]
         conn: Conn,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchedulesCmd {
+    /// Start a schedule now, as its cron would (the default branch's tip),
+    /// to try it without waiting.
+    Run {
+        name: String,
+        /// The repo, when more than one has a schedule by that name.
+        #[arg(long)]
+        repo: Option<String>,
     },
 }
 
@@ -498,6 +518,15 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Mcp { conn } => {
             pit::mcp::serve(cli::client(&conn.server, conn.token)?).await?;
             Ok(0)
+        }
+        Command::Schedules { command, conn } => {
+            let client = cli::client(&conn.server, conn.token)?;
+            match command {
+                None => cli::schedules(&client).await,
+                Some(SchedulesCmd::Run { name, repo }) => {
+                    cli::schedule_run(&client, &name, repo.as_deref()).await
+                }
+            }
         }
         Command::Stats { conn } => cli::stats(&cli::client(&conn.server, conn.token)?).await,
     }

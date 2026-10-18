@@ -2284,6 +2284,22 @@ impl Db {
         Ok(())
     }
 
+    /// The newest run of a repo started by `trigger`: id, status, created at.
+    pub fn latest_run_by_trigger(
+        &self,
+        repo_id: &str,
+        trigger: &str,
+    ) -> Result<Option<(String, String, i64)>> {
+        let c = self.conn.lock();
+        Ok(c.query_row(
+            "SELECT id, status, created_at FROM runs WHERE repo_id = ?1 AND trigger = ?2
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![repo_id, trigger],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?)
+    }
+
     /// Claims a schedule slot. False if this minute already fired.
     pub fn claim_schedule_slot(&self, key: &str, minute: i64) -> Result<bool> {
         let n = self.conn.lock().execute(

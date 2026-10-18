@@ -5,11 +5,13 @@
 //! disabled after 60 days without activity. These run on the server's own
 //! clock: each slot fires once, on the branch tip at that moment, as a trusted
 //! run. A slot missed while the server was down is skipped, not replayed.
+//! `pit schedules` lists them with their next and last runs, and
+//! `pit schedules run` starts one now, to try it without waiting.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::Mutex;
 
 use super::App;
@@ -46,17 +48,28 @@ pub async fn tick(app: &Arc<App>, now_ms: i64) -> Result<()> {
     Ok(())
 }
 
-async fn repo_tick(app: &Arc<App>, repo: &super::db::Repo, first: i64, now: i64) -> Result<()> {
+/// A repo's default branch and the schedules its tip's config declares.
+struct Declared {
+    mirror: std::path::PathBuf,
+    branch: String,
+    tip: String,
+    schedules: BTreeMap<String, Schedule>,
+}
+
+/// `Ok(None)` when the repo has no default branch to read yet (never
+/// fetched, or empty) or no config on it; `Err` when its config does not
+/// load.
+async fn declared(app: &Arc<App>, repo: &super::db::Repo) -> Result<Option<Declared>> {
     let mirror = app.mirror_dir(&repo.id);
     if !mirror.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let Ok(branch) = super::queue::default_branch(&mirror).await else {
-        return Ok(());
+        return Ok(None);
     };
     let head = format!("refs/heads/{branch}");
     let Some(tip) = crate::git::rev_parse(&mirror, &head).await? else {
-        return Ok(());
+        return Ok(None);
     };
     let cached = read_cache()
         .lock()
@@ -64,26 +77,48 @@ async fn repo_tick(app: &Arc<App>, repo: &super::db::Repo, first: i64, now: i64)
         .filter(|(at, _)| *at == tip)
         .map(|(_, s)| s.clone());
     let schedules = match cached {
+        Some(s) if s.is_empty() => return Ok(None),
         Some(s) => s,
         // Errors are not cached: a timeout under load must not switch the
         // schedules off until the next commit.
-        None => match app.load_config(&mirror, &tip, None, false).await {
-            Ok(c) => {
+        None => {
+            // No config on the branch at all: no schedules, not an error.
+            let mut any = false;
+            for name in crate::config::CONFIG_FILES {
+                if crate::git::show_file(&mirror, &tip, name).await?.is_some() {
+                    any = true;
+                    break;
+                }
+            }
+            if !any {
                 read_cache()
                     .lock()
-                    .insert(repo.id.clone(), (tip.clone(), c.schedules.clone()));
-                c.schedules
+                    .insert(repo.id.clone(), (tip.clone(), BTreeMap::new()));
+                return Ok(None);
             }
-            Err(e) => {
-                tracing::warn!(
-                    "schedules of {}: reading the config at {tip}: {e:#}",
-                    repo.name
-                );
-                return Ok(());
-            }
-        },
+            let c = app
+                .load_config(&mirror, &tip, None, false)
+                .await
+                .with_context(|| format!("reading the config at {tip}"))?;
+            read_cache()
+                .lock()
+                .insert(repo.id.clone(), (tip.clone(), c.schedules.clone()));
+            c.schedules
+        }
     };
-    for (name, s) in &schedules {
+    Ok(Some(Declared {
+        mirror,
+        branch,
+        tip,
+        schedules,
+    }))
+}
+
+async fn repo_tick(app: &Arc<App>, repo: &super::db::Repo, first: i64, now: i64) -> Result<()> {
+    let Some(d) = declared(app, repo).await? else {
+        return Ok(());
+    };
+    for (name, s) in &d.schedules {
         let Ok(cron) = crate::cron::Schedule::parse(&s.cron, s.timezone.as_deref()) else {
             continue;
         };
@@ -96,11 +131,95 @@ async fn repo_tick(app: &Arc<App>, repo: &super::db::Repo, first: i64, now: i64)
         {
             continue;
         }
-        if let Err(e) = start(app, repo, &mirror, &branch, &tip, name, s).await {
+        if let Err(e) = start(app, repo, &d.mirror, &d.branch, &d.tip, name, s).await {
             tracing::warn!("schedule {name} on {}: {e:#}", repo.name);
         }
     }
     Ok(())
+}
+
+/// Every repo's schedules, when each fires next and how its last run went,
+/// so a schedule that never runs says why instead of staying silent.
+pub async fn list(app: &Arc<App>, now_ms: i64) -> Result<Vec<serde_json::Value>> {
+    let now = now_ms.div_euclid(60_000);
+    let mut out = Vec::new();
+    for repo in app.db.repos()? {
+        let d = match declared(app, &repo).await {
+            Ok(Some(d)) => d,
+            Ok(None) => continue,
+            Err(e) => {
+                out.push(serde_json::json!({ "repo": repo.name, "error": format!("{e:#}") }));
+                continue;
+            }
+        };
+        for (name, s) in &d.schedules {
+            let next = crate::cron::Schedule::parse(&s.cron, s.timezone.as_deref())
+                .ok()
+                .and_then(|c| c.next_after(now))
+                .map(|m| m * 60_000);
+            let last = app
+                .db
+                .latest_run_by_trigger(&repo.id, &format!("schedule:{name}"))?
+                .map(|(id, status, created_at)| {
+                    serde_json::json!({ "id": id, "status": status, "createdAt": created_at })
+                });
+            out.push(serde_json::json!({
+                "repo": repo.name,
+                "branch": d.branch,
+                "tip": d.tip,
+                "name": name,
+                "cron": s.cron,
+                "timezone": s.timezone,
+                "nextAt": next,
+                "lastRun": last,
+            }));
+        }
+    }
+    Ok(out)
+}
+
+/// Starts a schedule now, exactly as its cron would: the default branch's
+/// tip, as a trusted `schedule:<name>` run. The caller picks only which
+/// declared schedule, never the code. Does not use up the next slot.
+pub async fn run_now(app: &Arc<App>, repo_name: Option<&str>, name: &str) -> Result<String> {
+    let mut found = Vec::new();
+    for repo in app.db.repos()? {
+        if repo_name.is_some_and(|r| r != repo.name) {
+            continue;
+        }
+        // A schedule just pushed is what people try first. Only a named
+        // repo is fetched: fetching every repo for a typo takes minutes.
+        if repo_name.is_some() {
+            if let Err(e) = app.fetch_mirror(&repo).await {
+                tracing::warn!("schedules of {}: fetching {}: {e:#}", repo.name, repo.url);
+            }
+        }
+        let Ok(Some(d)) = declared(app, &repo).await else {
+            continue;
+        };
+        if let Some(s) = d.schedules.get(name).cloned() {
+            found.push((repo, d, s));
+        }
+    }
+    let (repo, d, s) = match found.len() {
+        0 => match repo_name {
+            Some(r) => anyhow::bail!("no schedule {name:?} on {r}'s default branch"),
+            None => anyhow::bail!(
+                "no schedule {name:?} on the default branch of any repo, as last fetched; \
+                 pushed it just now? --repo <name> fetches that repo first"
+            ),
+        },
+        1 => found.remove(0),
+        _ => anyhow::bail!(
+            "schedule {name:?} is on {}; say which with --repo",
+            found
+                .iter()
+                .map(|(r, ..)| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    start(app, &repo, &d.mirror, &d.branch, &d.tip, name, &s).await
 }
 
 async fn start(
@@ -111,7 +230,7 @@ async fn start(
     tip: &str,
     name: &str,
     s: &Schedule,
-) -> Result<()> {
+) -> Result<String> {
     let head = format!("refs/heads/{branch}");
     // Run what is on the branch now, not what the mirror last saw.
     let sha = match app.fetch_mirror(repo).await {
@@ -144,5 +263,5 @@ async fn start(
         )
         .await?;
     tracing::info!("schedule {name} on {}: started {id}", repo.name);
-    Ok(())
+    Ok(id)
 }

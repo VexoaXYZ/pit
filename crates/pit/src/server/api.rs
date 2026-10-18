@@ -84,6 +84,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/gc", post(gc_now))
         .route("/api/cas/missing", post(cas_missing))
         .route("/api/cas/{digest}", get(cas_get).put(cas_put))
+        .route("/api/schedules", get(list_schedules))
+        .route("/api/schedules/run", post(run_schedule))
         .route("/api/queue", get(queue_list).post(queue_add))
         .route("/api/queue/{key}", axum::routing::delete(queue_remove))
         .merge(super::remote_cache::routes())
@@ -291,6 +293,28 @@ async fn get_run(State(app): State<Arc<App>>, Path(id): Path<String>) -> ApiResu
         .run_view(&id)
         .map(Json)
         .map_err(|_| not_found(format!("run {id}")))
+}
+
+async fn list_schedules(State(app): State<Arc<App>>) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    Ok(Json(
+        super::schedule::list(&app, crate::model::now_ms()).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct RunSchedule {
+    name: String,
+    repo: Option<String>,
+}
+
+/// `POST /api/schedules/run`: start a schedule now, as its cron would.
+async fn run_schedule(
+    State(app): State<Arc<App>>,
+    Json(req): Json<RunSchedule>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = super::schedule::run_now(&app, req.repo.as_deref(), &req.name).await?;
+    let url = format!("{}/runs/{id}", app.public_url);
+    Ok(Json(serde_json::json!({ "id": id, "url": url })))
 }
 
 async fn cancel_run(

@@ -140,6 +140,12 @@ impl Schedule {
         }
         w > prev + 1 && (prev + 1..w).any(|m| self.cron.matches(m))
     }
+
+    /// The first minute after `epoch_minute` it fires in, looking a year
+    /// ahead (`0 0 29 2 *` may not fire in one).
+    pub fn next_after(&self, epoch_minute: i64) -> Option<i64> {
+        (epoch_minute + 1..=epoch_minute + 366 * 24 * 60).find(|m| self.fires(*m))
+    }
 }
 
 /// A UTC calendar time, without a date library.
@@ -180,6 +186,19 @@ mod tests {
 
     // 2026-10-16 03:07 UTC is a Friday.
     const FRI_0307: i64 = 1_792_120_020 / 60;
+
+    #[test]
+    fn next_fire_follows_the_zone_and_looks_a_year_ahead() {
+        // 03:17 in London is 02:17 UTC in summer time (Friday 2026-10-16).
+        let s = Schedule::parse("17 3 * * *", Some("Europe/London")).unwrap();
+        assert_eq!(s.next_after(FRI_0307), Some(FRI_0307 + 23 * 60 + 10));
+        // After the clocks go back (2026-10-25), 03:17 is 03:17 UTC.
+        let s = Schedule::parse("17 3 26 10 *", Some("Europe/London")).unwrap();
+        assert_eq!(s.next_after(FRI_0307), Some(FRI_0307 + 10 * 1440 + 10));
+        // The next 29 February is more than a year off.
+        let s = Schedule::parse("0 0 29 2 *", None).unwrap();
+        assert_eq!(s.next_after(FRI_0307), None);
+    }
 
     #[test]
     fn calendar_is_right() {

@@ -747,6 +747,92 @@ pub async fn queue_list(client: &Client) -> Result<i32> {
     Ok(0)
 }
 
+/// A time in a zone (the machine's when `None`), with how far off it is.
+fn local_time(ms: i64, now_ms: i64, zone: Option<&str>) -> String {
+    let tz = zone
+        .and_then(|z| jiff::tz::TimeZone::get(z).ok())
+        .unwrap_or_else(jiff::tz::TimeZone::system);
+    let at = jiff::Timestamp::from_millisecond(ms)
+        .map(|t| t.to_zoned(tz).strftime("%Y-%m-%d %H:%M %Z").to_string())
+        .unwrap_or_default();
+    let mins = (ms - now_ms).abs() / 60_000;
+    let span = match mins {
+        0 => "now".to_string(),
+        m if m < 60 => format!("{m}m"),
+        m if m < 48 * 60 => format!("{}h {}m", m / 60, m % 60),
+        m => format!("{}d", m / (24 * 60)),
+    };
+    match (mins, ms > now_ms) {
+        (0, _) => format!("{at} (now)"),
+        (_, true) => format!("{at} (in {span})"),
+        (_, false) => format!("{at} ({span} ago)"),
+    }
+}
+
+pub async fn schedules(client: &Client) -> Result<i32> {
+    let list: Vec<serde_json::Value> = client.get("/api/schedules").await?;
+    let now = now_ms();
+    let mut broken = false;
+    if list.is_empty() {
+        eprintln!("no schedules (the server reads `schedules` from each repo's default branch)");
+    }
+    for s in &list {
+        let repo = s["repo"].as_str().unwrap_or_default();
+        if let Some(e) = s["error"].as_str() {
+            broken = true;
+            println!("{repo}: schedules not read, so none will fire: {e}");
+            continue;
+        }
+        let tz = s["timezone"]
+            .as_str()
+            .map(|t| format!(" {t}"))
+            .unwrap_or_else(|| " UTC".into());
+        println!(
+            "{repo} {} · {}{tz} · on {}",
+            s["name"].as_str().unwrap_or_default(),
+            s["cron"].as_str().unwrap_or_default(),
+            s["branch"].as_str().unwrap_or_default(),
+        );
+        match s["nextAt"].as_i64() {
+            // In the zone the cron is written in.
+            Some(at) => println!(
+                "  next  {}",
+                local_time(at, now, Some(s["timezone"].as_str().unwrap_or("UTC")))
+            ),
+            None => println!("  next  none in the next year"),
+        }
+        match s["lastRun"].as_object() {
+            Some(r) => println!(
+                "  last  {} {} {}",
+                r.get("id").and_then(|v| v.as_str()).unwrap_or_default(),
+                r.get("status").and_then(|v| v.as_str()).unwrap_or_default(),
+                local_time(
+                    r.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0),
+                    now,
+                    None
+                ),
+            ),
+            None => println!("  last  never ran"),
+        }
+    }
+    Ok(i32::from(broken))
+}
+
+pub async fn schedule_run(client: &Client, name: &str, repo: Option<&str>) -> Result<i32> {
+    let v: serde_json::Value = client
+        .post(
+            "/api/schedules/run",
+            &serde_json::json!({ "name": name, "repo": repo }),
+        )
+        .await?;
+    eprintln!(
+        "started {} {}",
+        v["id"].as_str().unwrap_or_default(),
+        v["url"].as_str().unwrap_or_default()
+    );
+    Ok(0)
+}
+
 pub async fn stats(client: &Client) -> Result<i32> {
     let s: serde_json::Value = client.get("/api/stats").await?;
     println!("{}", serde_json::to_string_pretty(&s)?);

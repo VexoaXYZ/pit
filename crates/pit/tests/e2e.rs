@@ -4510,3 +4510,121 @@ async fn interrupting_pit_run_cancels_its_run() {
         .unwrap_err();
     assert!(unknown.to_string().contains("404"), "{unknown:#}");
 }
+
+/// `pit schedules` says when each schedule fires next and how it last ran,
+/// and why none fire when the config does not load; `pit schedules run`
+/// starts one now on the default branch's tip, without using up its slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schedules_are_listed_and_can_run_now() {
+    let pit = start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    let config = |schedules: serde_json::Value| {
+        serde_json::json!({
+            "tasks": { "check": { "run": "echo checked $PIT_SHA", "cache": false } },
+            "schedules": schedules,
+        })
+        .to_string()
+    };
+    write(
+        &work,
+        "pit.config.json",
+        &config(serde_json::json!({ "nightly": { "cron": "17 3 * * *" } })),
+    );
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    assert_eq!(run(&pit, &work).await.status, Status::Passed);
+
+    let list: Vec<serde_json::Value> = pit.client.get("/api/schedules").await.unwrap();
+    assert_eq!(list.len(), 1, "{list:?}");
+    let repo = list[0]["repo"].as_str().unwrap().to_string();
+    assert_eq!(list[0]["name"], "nightly");
+    let next = list[0]["nextAt"].as_i64().unwrap();
+    assert_eq!(next.rem_euclid(86_400_000), (3 * 60 + 17) * 60_000);
+    assert!(next > pit::model::now_ms());
+    assert!(list[0]["lastRun"].is_null());
+
+    // A schedule just pushed: unknown until its repo is fetched.
+    write(
+        &work,
+        "pit.config.json",
+        &config(serde_json::json!({
+            "nightly": { "cron": "17 3 * * *" },
+            "weekly": { "cron": "0 6 * * 1" },
+        })),
+    );
+    sh(&work, "git commit -qam weekly && git push -q origin main");
+    let tip = sh(&work, "git rev-parse HEAD").trim().to_string();
+    let err = pit
+        .client
+        .post::<_, serde_json::Value>(
+            "/api/schedules/run",
+            &serde_json::json!({ "name": "weekly" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("--repo"), "{err:#}");
+    let started: serde_json::Value = pit
+        .client
+        .post(
+            "/api/schedules/run",
+            &serde_json::json!({ "name": "weekly", "repo": repo }),
+        )
+        .await
+        .unwrap();
+    let id = started["id"].as_str().unwrap().to_string();
+    let v = pit::cli::wait(&pit.client, &id, |_| {}).await.unwrap();
+    assert_eq!(v.status, Status::Passed, "{v:?}");
+    assert_eq!(v.trigger, "schedule:weekly");
+    let log = pit
+        .client
+        .get_text(&format!("/api/runs/{id}/tasks/check/log"))
+        .await
+        .unwrap();
+    assert!(log.contains(&format!("checked {tip}")), "{log}");
+
+    let list: Vec<serde_json::Value> = pit.client.get("/api/schedules").await.unwrap();
+    let weekly = list.iter().find(|s| s["name"] == "weekly").unwrap();
+    assert_eq!(weekly["lastRun"]["id"], id.as_str());
+    assert_eq!(weekly["lastRun"]["status"], "passed");
+
+    // Running nightly by hand leaves its slot to fire as usual.
+    let started: serde_json::Value = pit
+        .client
+        .post(
+            "/api/schedules/run",
+            &serde_json::json!({ "name": "nightly", "repo": repo }),
+        )
+        .await
+        .unwrap();
+    pit::cli::wait(&pit.client, started["id"].as_str().unwrap(), |_| {})
+        .await
+        .unwrap();
+    let day = pit::model::now_ms().div_euclid(86_400_000) + 1;
+    pit::server::schedule::tick(&pit.app, (day * 1440 + 3 * 60 + 17) * 60_000)
+        .await
+        .unwrap();
+    assert_eq!(count_trigger(&pit, "nightly").await, 2);
+
+    // A config that does not load is listed as the reason nothing fires.
+    write(&work, "pit.config.json", "{ not json");
+    sh(&work, "git commit -qam broken && git push -q origin main");
+    pit.client
+        .post::<_, serde_json::Value>(
+            "/api/schedules/run",
+            &serde_json::json!({ "name": "nightly", "repo": repo }),
+        )
+        .await
+        .unwrap_err();
+    let list: Vec<serde_json::Value> = pit.client.get("/api/schedules").await.unwrap();
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert!(
+        list[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("pit.config.json"),
+        "{list:?}"
+    );
+}
