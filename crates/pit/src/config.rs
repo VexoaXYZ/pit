@@ -41,7 +41,8 @@ const EVAL_ENV: &[&str] = &[
     "LOCALAPPDATA",
 ];
 
-/// The image an untrusted config (a fork's) is evaluated in, unless
+/// The image an untrusted config (a fork's, or see `App::config_sandboxed`)
+/// is evaluated in, unless
 /// `PIT_CONFIG_IMAGE` names another with Node 22.6+.
 pub const SANDBOX_IMAGE: &str = "node:22-alpine";
 
@@ -53,7 +54,8 @@ fn cache() -> &'static Mutex<HashMap<String, PitConfig>> {
 /// Parses config source. `name` is the file name it came from, which decides
 /// whether it is JSON or TypeScript. A TypeScript config that exports a
 /// function is called with `ctx` (see `workspace`). Results are memoized by
-/// content hash. A `sandboxed` config (a fork's) runs in a container with no
+/// content hash. A `sandboxed` config (a fork's, or see
+/// `App::config_sandboxed`) runs in a container with no
 /// network, no capabilities and nothing of the host but itself: evaluating
 /// it on the server would hand the fork the server's files, signing key
 /// included.
@@ -182,8 +184,9 @@ async fn eval_sandboxed(file: &Path, ctx: &Path) -> Result<PitConfig> {
     let out = match tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => bail!(
-            "a fork's {CONFIG_TS} is evaluated in a container, and docker is not available ({e}); \
-             use {CONFIG_JSON} for fork pull requests"
+            "this run's {CONFIG_TS} is evaluated in a container (a fork's, or any untrusted run \
+             on a server with an API token), and docker is not available ({e}); install docker \
+             on the server, or use {CONFIG_JSON}"
         ),
         Err(_) => {
             let _ = tokio::process::Command::new("docker")

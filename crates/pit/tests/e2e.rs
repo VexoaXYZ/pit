@@ -4641,3 +4641,46 @@ async fn schedules_are_listed_and_can_run_now() {
         "{list:?}"
     );
 }
+
+/// On a server with an API token, a GitHub repo's merge queue is entered
+/// only through the `pit:merge` label: the queue runs a change as trusted,
+/// its config included, and the API could name any pull request, a fork's
+/// too. Repos registered through the API can still be queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_cannot_queue_into_a_github_repo_on_a_shared_server() {
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        Some("tok".into()),
+        base.clone(),
+        None,
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    app.db
+        .upsert_repo(
+            "web",
+            Some("https://github.com/acme/web.git"),
+            Some("acme/web"),
+        )
+        .unwrap();
+    let client = Client::new(&base, Some("tok".into())).unwrap();
+    let err = client
+        .post::<_, serde_json::Value>("/api/queue", &serde_json::json!({ "repo": "web", "pr": 7 }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("403"), "{err:#}");
+    assert!(err.to_string().contains("pit:merge"), "{err:#}");
+    // Not refused for being a GitHub repo (it fails later: nothing to fetch).
+    let err = client
+        .post::<_, serde_json::Value>(
+            "/api/queue",
+            &serde_json::json!({ "repo": "local", "url": "/nonexistent/repo", "branch": "x" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(!err.to_string().contains("403"), "{err:#}");
+}

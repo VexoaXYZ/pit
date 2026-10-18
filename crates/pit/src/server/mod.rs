@@ -723,6 +723,13 @@ pub async fn serve(opts: ServerOpts) -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("http://{}", opts.addr));
     let app = App::new(&opts.data_dir, opts.token.clone(), public_url)?;
+    if opts.token.is_none() && !opts.addr.ip().is_loopback() {
+        tracing::warn!(
+            "listening on {} without PIT_TOKEN: anyone who can reach it can start runs, \
+             and their pit.config.ts is evaluated on this host; set PIT_TOKEN",
+            opts.addr
+        );
+    }
     *app.worker_token.lock() = opts.worker_token.clone();
     *app.notify_url.lock() = opts.notify_url.clone();
     app.cache_max_bytes
