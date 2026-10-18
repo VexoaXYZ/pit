@@ -5303,13 +5303,16 @@ have no automated test.
 
 ## P84. An outdated runner keeps taking jobs it no longer understands
 
-**The pain.** Self-hosted fleets drift: a server is upgraded and some runners aren't. CI systems
-handle this with explicit version gates:
-- GitHub refuses jobs to self-hosted runners older than a minimum version, and runners
-  auto-update.
-- Jenkins agents need a compatible remoting version.
+**The pain.** Self-hosted fleets drift: a server is upgraded and some runners aren't. GitHub
+gates on it: a self-hosted runner must install each release within 30 days, and GitHub "can pause
+job queuing to a runner until [a critical security] update is installed"; below 2.329.0 it can't
+even register
+([GitHub changelog](https://github.blog/changelog/2026-06-12-github-actions-minimum-version-enforcement-timeline-for-self-hosted-runners/),
+[devops.com](https://devops.com/github-actions-gets-serious-about-self-hosted-runner-versions)).
+Its rough edge is that a too-old runner's jobs "just sit in 'Queued' indefinitely", with no error
+in the workflow ([DEV](https://dev.to/devopsdaily/github-started-enforcing-self-hosted-runner-versions-we-tested-what-happens-3nm8)).
 
-Pit had none. P70 recorded the consequence as a limit: "an older worker skips the `[trusted]`
+Pit had no gate at all. P70 recorded the consequence as a limit: "an older worker skips the `[trusted]`
 header and hands those secrets to every task that asks".
 
 **Reproduction** (`/tmp/painhunt/p84`). A worker built from before P70 (`edb84b1`, in a temporary
