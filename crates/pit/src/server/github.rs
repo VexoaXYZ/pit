@@ -230,14 +230,14 @@ impl GitHub {
         body: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let token = self.token_for(full_name).await?;
-        let resp = self
+        let req = self
             .http
             .request(method, format!("{}{path}", self.api))
             .bearer_auth(token)
-            .header("accept", "application/vnd.github+json")
-            .json(&body)
-            .send()
-            .await?;
+            .header("accept", "application/vnd.github+json");
+        // A GET carries no body.
+        let req = if body.is_null() { req } else { req.json(&body) };
+        let resp = req.send().await?;
         let status = resp.status();
         let retry_after = resp
             .headers()
@@ -1109,6 +1109,139 @@ async fn handle_event(app: &Arc<App>, event: &str, body: &[u8]) -> Result<serde_
         }
         other => Ok(serde_json::json!({ "ignored": other })),
     }
+}
+
+/// Pushes and pull requests whose webhook never arrived (the server was down
+/// or unreachable, and GitHub does not redeliver): for each GitHub repo Pit
+/// has run before, the default branch's head and the head of each open,
+/// same-repo pull request updated in the last three days get a run if they
+/// have none, as their webhook would have started. Forks still wait for the
+/// label; drafts and skip markers apply as usual. Returns how many runs.
+pub async fn reconcile(app: &Arc<App>) -> Result<usize> {
+    let Some(gh) = &app.github else {
+        return Ok(0);
+    };
+    let mut started = 0;
+    for repo in app.db.repos()? {
+        let Some(full) = repo.github.clone() else {
+            continue;
+        };
+        // A repo Pit never ran: installing Pit does not run every open PR.
+        if !app.db.repo_has_runs(&repo.id)? {
+            continue;
+        }
+        match reconcile_repo(app, gh, &repo, &full).await {
+            Ok(n) => started += n,
+            Err(e) => tracing::warn!("catching up on {full}: {e:#}"),
+        }
+    }
+    Ok(started)
+}
+
+async fn reconcile_repo(
+    app: &Arc<App>,
+    gh: &GitHub,
+    repo: &super::db::Repo,
+    full: &str,
+) -> Result<usize> {
+    let get = reqwest::Method::GET;
+    let none = serde_json::Value::Null;
+    let mut started = 0;
+    let info = gh
+        .call(full, get.clone(), &format!("/repos/{full}"), none.clone())
+        .await?;
+    let default = info["default_branch"]
+        .as_str()
+        .unwrap_or("main")
+        .to_string();
+    let branch = gh
+        .call(
+            full,
+            get.clone(),
+            &format!("/repos/{full}/branches/{default}"),
+            none.clone(),
+        )
+        .await?;
+    if let Some(sha) = branch["commit"]["sha"].as_str() {
+        if !app.db.has_run(&repo.id, sha, &default)? {
+            let id = app
+                .create_run(
+                    CreateRun {
+                        repo: repo.name.clone(),
+                        url: None,
+                        sha: sha.to_string(),
+                        overlay: None,
+                        tasks: vec![],
+                        trigger: Some("push".into()),
+                        trusted: super::trusted_branch(&default, Some(&default)),
+                        git_ref: Some(default.clone()),
+                        no_cache: false,
+                        fresh: false,
+                        debug: false,
+                        counts_as: None,
+                        no_secrets: false,
+                        draft: false,
+                    },
+                    None,
+                )
+                .await?;
+            tracing::info!("{full}: {default} at {sha} had no run (missed webhook?): started {id}");
+            started += 1;
+        }
+    }
+    let cutoff = now_ms() - 3 * 86_400_000;
+    let pulls = gh
+        .call(
+            full,
+            get,
+            &format!("/repos/{full}/pulls?state=open&per_page=100"),
+            none,
+        )
+        .await?;
+    for pr in pulls.as_array().into_iter().flatten() {
+        let updated = pr["updated_at"]
+            .as_str()
+            .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+            .map(|t| t.as_millisecond())
+            .unwrap_or(0);
+        let same_repo = pr["head"]["repo"]["full_name"].as_str() == Some(full);
+        let (Some(number), Some(sha)) = (pr["number"].as_u64(), pr["head"]["sha"].as_str()) else {
+            continue;
+        };
+        if updated < cutoff || !same_repo {
+            continue;
+        }
+        let git_ref = format!("pull/{number}");
+        if app.db.has_run(&repo.id, sha, &git_ref)? {
+            continue;
+        }
+        let id = app
+            .create_run(
+                CreateRun {
+                    repo: repo.name.clone(),
+                    url: None,
+                    sha: sha.to_string(),
+                    overlay: None,
+                    tasks: vec![],
+                    trigger: Some("pr".into()),
+                    git_ref: Some(git_ref),
+                    no_cache: false,
+                    fresh: false,
+                    debug: false,
+                    counts_as: None,
+                    no_secrets: false,
+                    trusted: false,
+                    draft: pr["draft"].as_bool().unwrap_or(false),
+                },
+                Some(number),
+            )
+            .await?;
+        tracing::info!(
+            "{full}: pull request #{number} at {sha} had no run (missed webhook?): started {id}"
+        );
+        started += 1;
+    }
+    Ok(started)
 }
 
 /// Finds the repo for a GitHub full name, registering it on first sight.

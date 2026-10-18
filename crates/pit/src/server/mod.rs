@@ -923,6 +923,22 @@ fn prune_history(app: &App) {
 }
 
 pub async fn serve_listener(app: Arc<App>, listener: tokio::net::TcpListener) -> Result<()> {
+    // Webhooks missed while down: caught up shortly after start, then every
+    // ten minutes (for deliveries that failed while it was up).
+    if app.github.is_some() {
+        let app = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            loop {
+                match github::reconcile(&app).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("caught up on {n} missed push(es) and pull request(s)"),
+                    Err(e) => tracing::warn!("catching up on missed webhooks: {e:#}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            }
+        });
+    }
     // Requeue work from workers that went away.
     let reaper = app.clone();
     tokio::spawn(async move {

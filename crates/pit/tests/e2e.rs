@@ -5598,3 +5598,140 @@ async fn skip_ci_skips_pushes_but_not_pit_run() {
     // Asked for explicitly: it runs.
     assert_eq!(run(&pit, &work).await.status, Status::Passed);
 }
+
+/// Pushes and pull requests whose webhook never arrived get their run when
+/// Pit catches up: the default branch's head and each recently updated,
+/// same-repo open pull request without a run. Forks and stale pull requests
+/// are left alone, and catching up twice starts nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missed_webhooks_are_caught_up() {
+    use axum::routing::{get, post};
+    use hmac::Mac;
+    use std::sync::{Arc, Mutex};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    sh(&root, "git init -q --bare -b main origin.git");
+    write(
+        &work,
+        "pit.config.json",
+        r#"{"tasks":{"t":{"run":"true","cache":false}}}"#,
+    );
+    sh(&work, "git init -q -b main && git add -A && git commit -qm init && git remote add origin ../origin.git && git push -q origin main");
+    let first = sh(&work, "git rev-parse HEAD").trim().to_string();
+
+    // What the fake GitHub API answers: the default branch's head and the
+    // open pull requests.
+    let state: Arc<Mutex<(String, serde_json::Value)>> =
+        Arc::new(Mutex::new((first.clone(), serde_json::json!([]))));
+    let (s1, s2) = (state.clone(), state.clone());
+    let gh_api = axum::Router::new()
+        .route(
+            "/repos/{o}/{r}",
+            get(|| async { axum::Json(serde_json::json!({ "default_branch": "main" })) }),
+        )
+        .route(
+            "/repos/{o}/{r}/branches/{b}",
+            get(move || {
+                let s = s1.clone();
+                async move {
+                    let sha = s.lock().unwrap().0.clone();
+                    axum::Json(serde_json::json!({ "commit": { "sha": sha } }))
+                }
+            }),
+        )
+        .route(
+            "/repos/{o}/{r}/pulls",
+            get(move || {
+                let s = s2.clone();
+                async move { axum::Json(s.lock().unwrap().1.clone()) }
+            }),
+        )
+        .route(
+            "/repos/{o}/{r}/statuses/{sha}",
+            post(|| async { axum::Json(serde_json::json!({ "id": 1 })) }),
+        );
+    let gh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gh_url = format!("http://{}", gh_listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(gh_listener, gh_api).await });
+
+    let data = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let github =
+        pit::server::github::GitHub::with_token(&gh_url, "t", Some("s3cret".into())).unwrap();
+    let app = pit::server::App::with_github(
+        &data.path().join("server"),
+        None,
+        base.clone(),
+        Some(github),
+    )
+    .unwrap();
+    tokio::spawn(pit::server::serve_listener(app.clone(), listener));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A catch-up before Pit has run the repo starts nothing.
+    assert_eq!(pit::server::github::reconcile(&app).await.unwrap(), 0);
+
+    // The first push arrives by webhook, registering the repo.
+    let body = serde_json::json!({ "ref": "refs/heads/main", "after": first,
+        "repository": { "full_name": "acme/web", "clone_url": root.join("origin.git").to_string_lossy(), "default_branch": "main" } })
+    .to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"s3cret").unwrap();
+    mac.update(body.as_bytes());
+    let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/webhooks/github"))
+        .header("x-github-event", "push")
+        .header("x-hub-signature-256", sig)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+
+    // Then, with no webhooks: main moves, a pull request opens, and a fork's
+    // and a stale pull request are open too.
+    sh(
+        &work,
+        "echo 2 > two.txt && git add -A && git commit -qm two && git push -q origin main",
+    );
+    let main_head = sh(&work, "git rev-parse HEAD").trim().to_string();
+    sh(&work, "git checkout -q -b feature && echo f > f.txt && git add -A && git commit -qm f && git push -q origin feature && git checkout -q main");
+    let pr_head = sh(&work, "git rev-parse feature").trim().to_string();
+    let now = jiff::Timestamp::now().to_string();
+    let pr = |n: u64, sha: &str, repo: &str, updated: &str| {
+        serde_json::json!({ "number": n, "draft": false, "updated_at": updated,
+            "head": { "sha": sha, "repo": { "full_name": repo } } })
+    };
+    *state.lock().unwrap() = (
+        main_head.clone(),
+        serde_json::json!([
+            pr(7, &pr_head, "acme/web", &now),
+            pr(8, &pr_head, "someone/web", &now),
+            pr(9, &first, "acme/web", "2020-01-01T00:00:00Z"),
+        ]),
+    );
+
+    pit::server::github::reconcile(&app).await.unwrap();
+    let repo = app.db.repos().unwrap()[0].clone();
+    assert!(
+        app.db.has_run(&repo.id, &main_head, "main").unwrap(),
+        "main's head"
+    );
+    assert!(
+        app.db.has_run(&repo.id, &pr_head, "pull/7").unwrap(),
+        "the pull request"
+    );
+    assert!(
+        !app.db.has_run(&repo.id, &pr_head, "pull/8").unwrap(),
+        "a fork's"
+    );
+    assert!(
+        !app.db.has_run(&repo.id, &first, "pull/9").unwrap(),
+        "a stale one"
+    );
+    // Caught up: nothing more.
+    assert_eq!(pit::server::github::reconcile(&app).await.unwrap(), 0);
+}

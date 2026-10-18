@@ -2579,6 +2579,24 @@ impl Db {
         Ok((free * size) as u64)
     }
 
+    /// Whether the repo has any run at all.
+    pub fn repo_has_runs(&self, repo_id: &str) -> Result<bool> {
+        Ok(self.conn.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE repo_id = ?1)",
+            params![repo_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Whether a run of this commit on this ref exists, whatever its state.
+    pub fn has_run(&self, repo_id: &str, sha: &str, git_ref: &str) -> Result<bool> {
+        Ok(self.conn.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE repo_id = ?1 AND sha = ?2 AND ref = ?3)",
+            params![repo_id, sha, git_ref],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Claims a schedule slot. False if this minute already fired.
     pub fn claim_schedule_slot(&self, key: &str, minute: i64) -> Result<bool> {
         let n = self.conn.lock().execute(

@@ -345,6 +345,12 @@ member or collaborator reruns the commit Pit last ran for it, with the same rest
 stays a fork's). Passed tasks come back from the cache, so only what failed runs again. It works
 with a plain token too, where checks have no Re-run button.
 
+**Missed webhooks.** GitHub doesn't redeliver a webhook that failed because the server was down
+or unreachable. So ten seconds after start, and every ten minutes, Pit asks GitHub for the
+default branch's head and each open pull request updated in the last three days. Any head commit
+without a run gets the run its webhook would have started; forks still wait for the label. Repos
+Pit has never run are left alone, so installing it doesn't run every open pull request.
+
 **Skipping.** A pushed commit (or a pull request's head commit) whose message has `[skip ci]`,
 `[ci skip]`, `[no ci]`, `[skip actions]`, `[actions skip]` or `[skip pit]` gets no run, as on
 GitHub: a release bot's version bump doesn't run CI again. As on GitHub, nothing is reported for
